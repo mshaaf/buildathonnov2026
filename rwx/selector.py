@@ -37,6 +37,7 @@ class Map:
         self.masks: list[int] = d["masks"]
         self.lines: dict = d["lines"]
         self.opens: dict = d["opens"]
+        self.arg_missing: dict = d.get("arg_missing", {})
         self.cpu_ms: dict = d.get("cpu_ms", {})
         self.cls_setup_ms: dict = d.get("cls_setup_ms", {})
         self.focus: dict = d.get("focus", {})
@@ -131,6 +132,7 @@ class Analyzer:
 
     def site_mask(self, rel: str, site, why: list) -> int:
         m = self.map
+        self.sites.add((rel, site.code_key))
         if site.kind == "func":
             mask = m.span_mask(rel, site.code_key, *site.lines)
             why.append(f"func {site.code_key} {site.lines} -> {bin(mask).count('1')}")
@@ -180,6 +182,10 @@ class Analyzer:
             if broad:
                 why.append(f"class {ck} broad")
                 return m.file_mask(rel)
+            if site.names == ("arg_types",) and ARG_FLIPS:
+                am = self.arg_flip_mask(rel, site, ck, why)
+                if am is not None:
+                    return am
             # code that names the class (or a subclass) explicitly: Cls.NAME
             recv = {k.rsplit(":", 1)[-1].rsplit(".", 1)[-1] for k in m.class_desc.get(ck, [ck])}
             refs = []
@@ -206,6 +212,75 @@ class Analyzer:
             refs.extend(m.name_refs.get(name, ()))
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
+
+    def arg_flip_mask(self, rel: str, site, ck: str, why: list):
+        """arg_types entries whose truthiness flipped only change required_args, which only
+        error_messages() reads: affected tests validated an affected class with that arg
+        missing. None when the edit is anything else."""
+        m = self.map
+        if not m.arg_missing or not isinstance(site.stmt, ast.Assign) or not isinstance(site.stmt.value, ast.Dict):
+            return None
+        new_src = self.py_changes.get(rel, (None, None))[1]
+        if new_src is None:
+            return None
+        try:
+            new_tree = ast.parse(new_src)
+        except SyntaxError:
+            return None
+        # find the same class (by name path) and its arg_types assignment in the new tree
+        node = new_tree
+        for kind, name, _ in site.scope_path:
+            nxt = None
+            for ch in getattr(node, "body", []):
+                if isinstance(ch, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and ch.name == name:
+                    nxt = ch
+                    break
+            if nxt is None:
+                return None
+            node = nxt
+        new_stmts = [st for st in node.body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                     and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "arg_types"]
+        old_stmts = [st for st in site.scope_node.body if isinstance(st, ast.Assign) and len(st.targets) == 1
+                     and isinstance(st.targets[0], ast.Name) and st.targets[0].id == "arg_types"]
+        if len(new_stmts) != 1 or len(old_stmts) != 1 or not isinstance(new_stmts[0].value, ast.Dict):
+            return None
+        od, nd = old_stmts[0].value, new_stmts[0].value
+        if len(od.keys) != len(nd.keys) or any(
+            (a is None) != (b is None) or (a is not None and ast.dump(a) != ast.dump(b)) for a, b in zip(od.keys, nd.keys)
+        ):
+            return None
+        flipped = []
+        for k, a, b in zip(od.keys, od.values, nd.values):
+            if ast.dump(a) == ast.dump(b):
+                continue
+            if not (isinstance(a, ast.Constant) and isinstance(b, ast.Constant) and isinstance(k, ast.Constant)
+                    and isinstance(k.value, str)):
+                return None
+            if bool(a.value) != bool(b.value):
+                flipped.append(k.value)
+        # affected classes: this one, its subclasses, and classes whose body copies Cls.arg_types
+        affected = set(m.class_desc.get(ck, [ck]))
+        recv = ck.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+        for f, key, kind in m.attr_refs.get((recv, "arg_types"), ()):
+            if kind == "class":
+                other = m.class_by_code.get((f, key))
+                if other is None:
+                    return None
+                affected |= set(m.class_desc.get(other, [other]))
+            elif kind == "module":
+                return None
+        mask = 0
+        for c in affected:
+            for x in flipped:
+                mid = m.arg_missing.get(f"{c}|{x}")
+                if mid is not None:
+                    mask |= m.masks[mid]
+        # test code reading required_args directly
+        for f, key, kind in m.name_refs.get("required_args", ()):
+            if f.startswith("tests/"):
+                mask |= m.code_mask(f, key) if kind == "func" else m.file_mask(f)
+        why.append(f"arg_types flip {flipped} on {len(affected)} classes -> {bin(mask).count('1')}")
+        return mask
 
     def python_file(self, fp, rel: str, why: list) -> int:
         old = self.old_source(rel)
@@ -247,6 +322,7 @@ class Analyzer:
                     continue
                 if site.kind == "func":
                     mask |= self.map.code_mask(rel, site.code_key)
+                    self.sites.add((rel, site.code_key))
                     why.append(f"insert near {ln} in {site.code_key}")
                 else:
                     mask |= self.site_mask(rel, site, why)
@@ -257,6 +333,7 @@ class Analyzer:
         mask = 0
         self.py_changes: dict = {}
         self.data_changes: dict = {}
+        self.sites: set = set()
         for fp in parse_patch(text):
             rel = fp.path
             if fp.binary:
@@ -354,6 +431,8 @@ PROBE_MS = int(os.environ.get("RWX_PROBE_MS", "150"))  # probe budget when there
 USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
 BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
+ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
+PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
@@ -399,7 +478,9 @@ NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
 
 
 PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "250"))
+PROBE_ORDER = os.environ.get("RWX_PROBE_ORDER", "focus")
 RELATED_EVIDENCE_MS = int(os.environ.get("RWX_RELATED_EVIDENCE_MS", "1200"))
+RELATED_ALL_MS = int(os.environ.get("RWX_RELATED_ALL_MS", "4000"))
 MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 
@@ -412,13 +493,13 @@ def _pack_cost(nums) -> int:
     return (max(sum(DUR[n] for n in x) for x in w) + WORKER_MS * len(w)) if w else 0
 
 
-def _probe_order(focus):
-    """Most focused on the changed code first (share of the test's executed lines that lie
-    in the changed files), cheaper first among equals."""
+def _probe_order(score):
+    """Highest score (rare paths through the changed code, see commit_rarity) per unit of
+    CPU first."""
 
     def key(n):
         cost = CLS_SETUP.get(CLS_OF.get(n), 0) + CPU_EST.get(n, DUR[n])
-        return (-round(focus.get(n, 0.0), 2), cost, n)
+        return (-score.get(n, 0.0) / (cost + 20), cost, n)
 
     return key
 
@@ -455,8 +536,8 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
     if not giants:
         return set(C) - passed
-    # Second probe: runnable candidates from each giant's own test file (class setup
-    # budgeted in), then a wider focused spread.
+    # Second probe: ALL runnable candidates from each giant's own test file (when they fit
+    # the budget, class setup included), then a wider spread.
     remaining = [n for n in rest if n not in passed]
     probe2, evidenced = [], set()
     for g in giants:
@@ -464,10 +545,8 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         related = [n for n in remaining if FILE_OF.get(n, "") == gf and n not in set(probe2)]
         if not related:
             continue
-        setup = max((CLS_SETUP.get(CLS_OF.get(n), 0) for n in related), default=0)
-        pick = _spread(related, setup + RELATED_EVIDENCE_MS, 6, focus=focus)
-        if len(pick) >= min(MIN_RELATED, len(related)):
-            probe2 += pick
+        if batch_cost(probe2 + related) - batch_cost(probe2) <= RELATED_ALL_MS:
+            probe2 += related
             evidenced.add(g)
     probe2 += _spread([n for n in remaining if n not in set(probe2)], batch_cost(probe2) + PROBE2_MS, 4, already=probe2, focus=focus)
     if not probe2:
@@ -591,6 +670,26 @@ CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
 
 
+def commit_rarity(cmap, C, sites) -> dict:
+    """Per candidate: sum over lines of the changed code objects it ran of 1/(tests running
+    that line). Tests taking rare paths through the changed code fail most often."""
+    cmask = 0
+    for n in C:
+        cmask |= 1 << n
+    score: dict = {}
+    for rel, key in sites:
+        for mid in cmap.code(rel, key).values():
+            m = cmap.masks[mid]
+            w = 1.0 / max(1, m.bit_count())
+            hit = m & cmask
+            while hit:
+                low = hit & -hit
+                n = low.bit_length() - 1
+                score[n] = score.get(n, 0.0) + w
+                hit ^= low
+    return score
+
+
 def commit_focus(cmap, C, py) -> dict:
     """Per candidate: share of its executed lines that lie in the changed Python files."""
     out = {}
@@ -653,14 +752,22 @@ def main() -> None:
             mid = cmap.opens.get(rel)
             if mid is not None:
                 known |= {n for n in C if cmap.masks[mid] >> n & 1}
-        jobs.append((cid, C, py, data, data_only, commit_focus(cmap, C, py), known))
+        score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
+        jobs.append((cid, C, py, data, data_only, score, known))
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, _, _ in jobs)
     results = {}
     if need_engine:
         try:
             from engine import Engine
 
-            eng = Engine(str(SRC), tests, log=log)
+            exec_cls = "tests/test_executor.py::TestExecutor"
+            runnable_exec = any(
+                CLS_OF.get(n) == exec_cls and n not in NO_RUN and CPU_EST.get(n, dur[n]) <= RUN_MAX_MS
+                for _, C, _, _, data_only, _, _ in jobs if not data_only for n in C
+            )
+            eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else ())
+            if eng.presetup_done:
+                CLS_SETUP[exec_cls] = 0
             log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
             budget = min(150.0, 3.2 * len(jobs) + 10)
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)

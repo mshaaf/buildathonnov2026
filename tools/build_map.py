@@ -87,6 +87,7 @@ def main():
     cov_dir, tests_json, out = sys.argv[1], sys.argv[2], sys.argv[3]
     cls_dir = sys.argv[4] if len(sys.argv) > 4 else None
     src_root = sys.argv[5] if len(sys.argv) > 5 else None
+    args_dir = sys.argv[6] if len(sys.argv) > 6 else None
     tests = json.load(open(tests_json))["tests"]
     acc_lines: dict = {}
     acc_opens: dict = {}
@@ -163,6 +164,15 @@ def main():
         payload["cls_setup_ms"] = setup
         print(f"cpu calibration: {len(body)} tests, {len(setup)} classes; biggest setups "
               f"{sorted(((v, k) for k, v in setup.items()), reverse=True)[:3]}", file=sys.stderr)
+    if args_dir:
+        missing: dict = {}
+        for path in glob.glob(os.path.join(args_dir, "[0-9]*.json")):
+            d = json.load(open(path))
+            bit = 1 << d["number"]
+            for pair in d["missing"]:
+                missing[pair] = missing.get(pair, 0) | bit
+        payload["arg_missing"] = {k: mid(m) for k, m in missing.items()}
+        print(f"arg_missing pairs {len(missing)}", file=sys.stderr)
     if src_root:
         payload["name_refs"], payload["attr_refs"] = build_refs(src_root)
         print(f"name refs {len(payload['name_refs'])}, attr refs {len(payload['attr_refs'])}", file=sys.stderr)

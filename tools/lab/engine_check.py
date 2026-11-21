@@ -17,7 +17,8 @@ dur = {t["number"]: t["seconds"] for t in tests}
 valid = 0
 for n in dur: valid |= 1 << n
 t0 = cpu()
-eng = Engine("/sqlglot", tests, log=lambda *a: print(*a, file=sys.stderr))
+eng = Engine("/sqlglot", tests, log=lambda *a: print(*a, file=sys.stderr),
+             presetup=("tests/test_executor.py::TestExecutor",) if os.environ.get("PRESETUP") == "1" else ())
 print(f"warm cpu {cpu()-t0:.2f}s, warm codes {len(eng.warm_keys)}", flush=True)
 an = sel.Analyzer(sel.Map(sel.MAP), valid)
 import glob

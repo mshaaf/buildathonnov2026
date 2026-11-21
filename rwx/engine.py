@@ -229,23 +229,25 @@ class StreamResult(unittest.TestResult):
 
 
 class Engine:
-    def __init__(self, src_root: str, tests: list[dict], log=None):
+    def __init__(self, src_root: str, tests: list[dict], log=None, presetup=()):
         self.root = src_root.rstrip("/")
         self.log = log or (lambda *a: None)
         self.tests = {t["number"]: t for t in tests}
         self.warm_codes: set = set()
+        self.presetup_done: set = set()
         install_inline_pool()
         if self.root not in sys.path:
             sys.path.insert(0, self.root)
         mods = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests})
-        self._warm(mods)
+        self._warm(mods, presetup)
         self._index_functions()
+        _LazyDuckModule.recording = False
         # Keep forked children from touching (and so copying) every inherited object:
         # the collector ignores frozen objects.
         gc.collect()
         gc.freeze()
 
-    def _warm(self, mods):
+    def _warm(self, mods, presetup=()):
         mon = sys.monitoring
         tool = mon.PROFILER_ID
         root = self.root + "/"
@@ -267,11 +269,39 @@ class Engine:
                     importlib.import_module(m)
                 except Exception as e:  # noqa: BLE001
                     self.log(f"warm import failed {m}: {e!r}")
+            for ref in presetup:
+                try:
+                    self._presetup(ref)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"presetup failed {ref}: {e!r}")
         finally:
             mon.set_events(tool, 0)
             mon.register_callback(tool, mon.events.PY_START, None)
             mon.free_tool_id(tool)
         self.warm_keys = {(c.co_filename, c.co_firstlineno, c.co_qualname) for c in seen}
+
+    def _presetup(self, ref: str):
+        """Run a test class's setUpClass once here, so forked children share its data.
+        Code it runs is recorded as warm-up code: a patch touching it makes the child
+        re-import (and so set up afresh). duckdb connections are made lazy: they record
+        statements here and open for real, replaying them, on first use in a child."""
+        path, cls_name = ref.split("::")
+        mod = importlib.import_module(path[:-3].replace("/", "."))
+        klass = getattr(mod, cls_name)
+        if getattr(klass, "__unittest_skip__", False):
+            return
+        real = getattr(mod, "duckdb", None)
+        if real is not None:
+            mod.duckdb = _LazyDuckModule(real)
+        try:
+            klass.setUpClass()
+        finally:
+            if real is not None:
+                mod.duckdb = real
+        klass.setUpClass = classmethod(lambda cls: None)
+        klass.tearDownClass = classmethod(lambda cls: None)
+        self.presetup_done.add(ref)
+        self.log(f"presetup done: {ref}")
 
     def _index_functions(self):
         root = self.root + "/"
@@ -468,6 +498,45 @@ class Engine:
             unittest.TestSuite([suite]).run(result)
             if stop_first and result.any_bad:
                 return
+
+
+class _LazyConn:
+    """duckdb connection stand-in: records statements until first real use, then opens
+    a real connection (in whichever process uses it) and replays them."""
+
+    def __init__(self, real_module, args, kwargs):
+        self._m, self._a, self._k = real_module, args, kwargs
+        self._log = []
+        self._conn = None
+
+    def _open(self):
+        if self._conn is None:
+            self._conn = self._m.connect(*self._a, **self._k)
+            for q, a, k in self._log:
+                self._conn.execute(q, *a, **k)
+        return self._conn
+
+    def execute(self, q, *a, **k):
+        if self._conn is None and _LazyDuckModule.recording:
+            self._log.append((q, a, k))
+            return self
+        return self._open().execute(q, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._open(), name)
+
+
+class _LazyDuckModule:
+    recording = True
+
+    def __init__(self, real):
+        self._real = real
+
+    def connect(self, *a, **k):
+        return _LazyConn(self._real, a, k)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
 
 
 class Session:

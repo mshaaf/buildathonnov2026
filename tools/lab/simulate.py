@@ -96,7 +96,8 @@ def main():
                 mid = _M.opens.get(rel)
                 if mid is not None:
                     known |= {n for n in C if _M.masks[mid] >> n & 1}
-            out, cpu = replay(C, F, data_only, tests, est, sel.commit_focus(_M, C, an.py_changes), known)
+            score = sel.commit_rarity(_M, C, an.sites) if (C and not data_only and sel.PROBE_ORDER == "rare") else sel.commit_focus(_M, C, an.py_changes)
+            out, cpu = replay(C, F, data_only, tests, est, score, known)
             if cpu:
                 any_engine = True
             miss = bool(F - out)
