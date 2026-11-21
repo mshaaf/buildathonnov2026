@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "rwx"))
 from engine import Engine
+from executor_cases import affected_cases
 from executor_fixture import defer_setup
 from patchlib import ast_equal
 import selector
@@ -116,6 +117,26 @@ class VerificationTests(unittest.TestCase):
         mask, _ = analyzer.analyze("diff --git a/x.py b/x.py\ndeleted file mode 100644\n--- a/x.py\n+++ /dev/null\n")
         self.assertEqual(mask, 7)
         self.assertFalse(analyzer.py_changes)
+
+    def test_tokenizer_readers_only_narrow_an_isolated_literal_flip(self):
+        analyzer = selector.Analyzer(None, 15, lazy_mask=8)
+        analyzer.tokenizer = {"classes": ["sqlglot/demo.py:1:Tokenizer"], "flags": {"FLAG": "0x2"}}
+        base = "class Tokenizer:\n    FLAG = False\n"
+        diff = "diff --git a/sqlglot/demo.py b/sqlglot/demo.py\n@@ -2 +2 @@\n-    FLAG = False\n+    FLAG = "
+        with patch.object(analyzer, "old_source", return_value=base), patch.object(analyzer, "site_mask", return_value=15):
+            self.assertEqual(analyzer.analyze(diff + "True\n")[0], 10)
+            self.assertEqual(analyzer.analyze(diff + "bool(1)\n")[0], 15)
+            self.assertEqual(analyzer.analyze(diff + "True\ndiff --git a/README b/README\n")[0], 15)
+
+    def test_executor_coverage_falls_back_if_shared_code_changed(self):
+        source = "sqlglot/parser.py"
+        changed = [(("/base/" + source, 10, "Parser.parse"), None)]
+        profile = {"coverage": {source + ":10:Parser.parse": "0x6"},
+                   "lines": {source + ":10:Parser.parse": {"20": "0x4"}}, "ms": [20, 30]}
+        self.assertEqual(affected_cases(profile, "/base", changed), [0, 1])
+        self.assertEqual(affected_cases(profile, "/base", changed, (source, "10:parse", (20, 20))), [1])
+        profile["coverage"][source + ":10:Parser.parse"] = "0x7"
+        self.assertIsNone(affected_cases(profile, "/base", changed, (source, "10:parse", (20, 20))))
 
     def test_ast_equality(self):
         self.assertTrue(ast_equal(ast.parse("x = 1"), "# comment\nx=(1)"))

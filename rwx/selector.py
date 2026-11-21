@@ -116,6 +116,8 @@ class Analyzer:
         self.all = all_mask
         self.lazy_mask = lazy_mask
         self._trees: dict = {}
+        profile = SRC / ".rwx-tokenizer.json"
+        self.tokenizer = json.loads(profile.read_text()) if ATTR_NARROW and not BROAD and profile.is_file() else {}
 
     def old_source(self, rel: str) -> str | None:
         p = SRC / rel
@@ -282,7 +284,7 @@ class Analyzer:
         why.append(f"arg_types flip {flipped} on {len(affected)} classes -> {bin(mask).count('1')}")
         return mask
 
-    def python_file(self, fp, rel: str, why: list) -> int:
+    def python_file(self, fp, rel: str, why: list, single_file=False) -> int:
         old = self.old_source(rel)
         if old is None:
             raise ValueError(f"missing base source: {rel}")
@@ -299,13 +301,23 @@ class Analyzer:
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
-        old_changed, _ = changed_lines(fp.hunks)
+        old_changed, added = changed_lines(fp.hunks)
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
                 mask |= self.map.file_mask(rel)
                 continue
-            mask |= self.site_mask(rel, site, why)
+            candidates = self.site_mask(rel, site, why)
+            if single_file and old_changed == added == {ln} and site.kind == "func":
+                self.case_site = rel, site.code_key, site.lines
+            if (single_file and self.tokenizer and old_changed == added == {ln}
+                    and site.kind == "import" and site.class_key(rel) in self.tokenizer["classes"]):
+                name = flipped_bool(site.stmt, old.splitlines()[ln - 1], new.splitlines()[ln - 1])
+                readers = self.tokenizer["flags"].get(name)
+                if readers is not None:
+                    candidates = (candidates & int(readers, 16)) | self.lazy_mask
+                    why.append(f"{name} consumers -> {candidates.bit_count()}")
+            mask |= candidates
         # Pure insertions: use the old lines around each insertion point.
         for anchor in insertion_anchors(fp.hunks):
             for ln in anchor:
@@ -328,13 +340,14 @@ class Analyzer:
         self.py_changes: dict = {}
         self.data_changes: dict = {}
         self.sites: set = set()
+        self.case_site = None
         files = parse_patch(text)
         if any(fp.binary or fp.old_path != fp.new_path for fp in files):
             return self.all, ["file creation, removal, rename or binary change -> ALL"]
         for fp in files:
             rel = fp.path
             if rel.endswith(".py"):
-                mask |= self.python_file(fp, rel, why)
+                mask |= self.python_file(fp, rel, why, single_file=len(files) == 1)
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
                 if old is None:
@@ -353,6 +366,22 @@ class Analyzer:
             else:
                 why.append(f"other file {rel} -> nothing")
         return mask, why
+
+
+def flipped_bool(stmt, before, after):
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.lineno != stmt.end_lineno:
+        return None
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    value = stmt.value
+    if (len(targets) != 1 or not isinstance(targets[0], ast.Name)
+            or not isinstance(value, ast.Constant) or type(value.value) is not bool):
+        return None
+    # AST columns are UTF-8 byte offsets. Match the entire replacement line.
+    line = before.encode()
+    flipped = b"False" if value.value else b"True"
+    if line[:value.col_offset] + flipped + line[value.end_col_offset:] == after.encode():
+        return targets[0].id
+    return None
 
 
 def _base_name(b) -> str:
@@ -623,10 +652,10 @@ class Scheduler:
         import select as _sel
 
         queue = list(jobs)
-        active = []  # [cid, C, gen, session, batch]
+        active = []  # [cid, C, gen, session, batch, selected before executor verification]
         while queue or active:
             while queue and len(active) < self.lanes:
-                cid, C, py, data, data_only, focus, known = queue.pop(0)
+                cid, C, py, data, data_only, focus, known, case_site = queue.pop(0)
                 gen = policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
@@ -637,15 +666,15 @@ class Scheduler:
                     gen.close()
                     yield cid, set(C), "out of time"
                     continue
-                sess = self.engine.session(py, data)
+                sess = self.engine.session(py, data, case_site)
                 sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
-                active.append([cid, C, gen, sess, batch])
+                active.append([cid, C, gen, sess, batch, None])
             if not active:
                 continue
             timeout = max(0.05, min(a[3].deadline for a in active) - time.monotonic())
             ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
             for a in list(active):
-                cid, C, gen, sess, batch = a
+                cid, C, gen, sess, batch, selected = a
                 finished = False
                 if sess in ready:
                     finished = sess.read()
@@ -662,6 +691,14 @@ class Scheduler:
                     # crashed or killed: whatever did not report counts as failing
                     for n in batch:
                         res.setdefault(n, "F")
+                executor = self.engine.executor_test
+                if selected is not None:
+                    if sess.alive and res.get(executor) == "P":
+                        selected = selected - {executor}
+                    sess.close()
+                    active.remove(a)
+                    yield cid, selected, "checked affected TPC-DS queries"
+                    continue
                 try:
                     nxt, stop_first = gen.send(res)
                     if time.monotonic() > self.deadline or not sess.alive:
@@ -669,6 +706,13 @@ class Scheduler:
                     sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
                     a[4] = nxt
                 except StopIteration as e:
+                    if (executor in e.value and sess.executor_ms is not None and sess.alive
+                            and executor not in res and time.monotonic() < self.deadline):
+                        cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                        if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
+                            sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
+                            a[4:] = [[executor], e.value]
+                            continue
                     sess.close()
                     active.remove(a)
                     yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
@@ -755,9 +799,9 @@ def main() -> None:
         cid = patch.stem
         try:
             mask, why = an.analyze(patch.read_text(errors="replace"))
-            py, data = dict(an.py_changes), dict(an.data_changes)
+            py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
         except Exception as e:  # never crash: run everything for this commit
-            mask, why, py, data = valid, [f"analyzer error {e!r} -> ALL"], {}, {}
+            mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
         mask &= valid
         C = [n for n in dur if mask >> n & 1]
         # No patched Python to verify, including analysis failures and unsupported diffs.
@@ -769,8 +813,8 @@ def main() -> None:
             if mid is not None:
                 known |= {n for n in C if cmap.masks[mid] >> n & 1}
         score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
-        jobs.append((cid, C, py, data, data_only, score, known))
-    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, _, _ in jobs)
+        jobs.append((cid, C, py, data, data_only, score, known, case_site))
+    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
         try:
@@ -779,7 +823,7 @@ def main() -> None:
             exec_cls = "tests/test_executor.py::TestExecutor"
             runnable_exec = any(
                 CLS_OF.get(n) == exec_cls and n not in NO_RUN and CPU_EST.get(n, dur[n]) <= RUN_MAX_MS
-                for _, C, _, _, data_only, _, _ in jobs if not data_only for n in C
+                for _, C, _, _, data_only, *_ in jobs if not data_only for n in C
             )
             eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else ())
             if eng.presetup_done:
@@ -794,7 +838,7 @@ def main() -> None:
     total = 0
     diag_min = int(os.environ.get("RWX_DIAG_MIN", "0"))
     diag_max = int(os.environ.get("RWX_DIAG_MAX", "100000"))
-    for cid, C, py, data, data_only, _, _ in jobs:
+    for cid, C, py, data, data_only, *_ in jobs:
         final_set, note = results.get(cid, (set(C), "static"))
         if diag_min and diag_min <= len(C) <= diag_max:
             final_set, note = set(), "diagnostic: printed nothing"

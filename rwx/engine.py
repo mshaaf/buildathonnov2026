@@ -21,6 +21,7 @@ import importlib
 import importlib.abc
 import importlib.util
 import io
+import json
 import os
 import select as _select
 import signal
@@ -28,6 +29,7 @@ import sys
 import time
 import types
 import unittest
+from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 
@@ -232,6 +234,11 @@ class Engine:
         self.root = src_root.rstrip("/")
         self.log = log or (lambda *a: None)
         self.tests = {t["number"]: t for t in tests}
+        from executor_cases import PROFILE, TEST_ID
+
+        self.executor_test = next((n for n, test in self.tests.items() if test["id"] == TEST_ID), None)
+        profile = Path(self.root) / PROFILE
+        self.executor_profile = json.loads(profile.read_text()) if self.executor_test is not None and profile.is_file() else {}
         self.warm_codes: set = set()
         self.presetup_done: set = set()
         install_inline_pool()
@@ -406,10 +413,10 @@ class Engine:
             results.setdefault(n, "F")
         return results, {"mode": mode, "why": swaps if mode == "reimport" else len(swaps), "timeout": timed_out, "crash": crash}
 
-    def session(self, py_changes: dict, data_changes: dict):
-        return Session(self, py_changes, data_changes)
+    def session(self, py_changes: dict, data_changes: dict, case_site=None):
+        return Session(self, py_changes, data_changes, case_site)
 
-    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd):
+    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices):
         self._apply(mode, swaps, py_changes, data_changes)
         rbuf = b""
         while True:
@@ -422,6 +429,10 @@ class Engine:
             parts = line.decode().split()
             if not parts or parts[0] == "Q":
                 return
+            if parts[0] == "E":
+                from executor_cases import install
+
+                install(executor_indices)
             stop_first = parts[0] == "R1"
             self._run_tests([int(x) for x in parts[1:]], wfd, stop_first)
             os.write(wfd, b"D\n")
@@ -558,9 +569,22 @@ class _LazyDuckModule:
 class Session:
     """One forked child holding one commit's patched tree; runs test batches on request."""
 
-    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict):
+    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None):
         self.mode, swaps = engine.plan(py_changes)
         self.info = swaps if self.mode == "reimport" else len(swaps)
+        executor_indices = None
+        self.executor_ms = None
+        if (engine.executor_profile and not data_changes and len(py_changes) == 1
+                and self.mode == "swap" and swaps
+                and next(iter(py_changes)).startswith("sqlglot/")):
+            from executor_cases import affected_cases
+
+            case_indices = affected_cases(engine.executor_profile, engine.root, swaps, case_site)
+            if case_indices is not None:
+                case_ms = sum(engine.executor_profile["ms"][i] for i in case_indices)
+                if case_ms <= 5000:
+                    executor_indices = case_indices
+                    self.executor_ms = case_ms
         cmd_r, cmd_w = os.pipe()
         res_r, res_w = os.pipe()
         pid = os.fork()
@@ -569,7 +593,7 @@ class Session:
             os.close(res_r)
             code = 0
             try:
-                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w)
+                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w, executor_indices)
             except BaseException as e:  # noqa: BLE001
                 try:
                     os.write(res_w, f"X {e!r}\n".encode())
@@ -595,14 +619,15 @@ class Session:
     def fileno(self):
         return self.res
 
-    def submit(self, numbers, timeout: float, stop_first: bool = False):
+    def submit(self, numbers, timeout: float, stop_first: bool = False, executor_only: bool = False):
         self.pending = list(numbers)
         self.results = {}
         self.deadline = time.monotonic() + timeout
         if not self.alive:
             return
         try:
-            os.write(self.cmd, (("R1 " if stop_first else "R ") + " ".join(map(str, numbers)) + "\n").encode())
+            command = "E" if executor_only else "R1" if stop_first else "R"
+            os.write(self.cmd, (command + " " + " ".join(map(str, numbers)) + "\n").encode())
         except OSError:
             self._dead()
 
