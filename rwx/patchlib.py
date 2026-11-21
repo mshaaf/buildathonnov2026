@@ -163,6 +163,18 @@ class Site:
     class_line: int | None = None  # enclosing ClassDef line when kind == 'import' in a class body
     names: tuple = ()  # names assigned by an import-time statement
     stmt: ast.AST | None = None
+    scope_node: ast.AST | None = None
+
+    def class_key(self, rel: str) -> str | None:
+        """'relpath:firstlineno:qualname' of the innermost enclosing class, as recorded at runtime."""
+        if not self.scope_path or self.scope_path[-1][0] != "class":
+            return None
+        parts = []
+        for kind, name, _ in self.scope_path:
+            parts.append(name)
+            if kind == "def":
+                parts.append("<locals>")
+        return f"{rel}:{self.scope_path[-1][2]}:{'.'.join(parts)}"
 
 
 def _code_key(node) -> str:
@@ -236,7 +248,7 @@ class Locator:
                 if first <= line <= hdr_end:
                     # decorators/signature/bases: evaluated in the enclosing scope
                     break
-                scope_path.append(("class" if isinstance(nxt, ast.ClassDef) else "def", nxt.name, nxt.lineno))
+                scope_path.append(("class" if isinstance(nxt, ast.ClassDef) else "def", nxt.name, first))
                 scope = nxt
                 node = nxt
                 stmt_found = None
@@ -292,6 +304,7 @@ class Locator:
             class_line=scope.lineno if isinstance(scope, ast.ClassDef) else None,
             names=tuple(names),
             stmt=stmt_found,
+            scope_node=scope,
         )
 
 
