@@ -42,7 +42,9 @@ score       = middle of 3 runs
 | v1 | `e4989ca` | 284.6 | 1.0 | 285.6 | static coverage lookup only, never runs tests |
 | v2 | `fa10564` | 179.3 | 13.0 | 192.3 | runtime engine verifies cheap candidates |
 | v2.2 | `21cf8f8` | 172.5 | 16.0 | 188.5 | class-attribute reader narrowing |
-| v3 | `760cde2` | 172.6 | 10.2 | **182.8** | focus-ranked probes, gc.freeze, evidence-gated giants |
+| v3 | `760cde2` | 172.6 | 10.2 | 182.8 | focus-ranked probes, gc.freeze, evidence-gated giants |
+| v3 (resubmitted) | `760cde2` | 172.6 | 8.4 | 181.0 | same code, their CPU varies |
+| **v4** | `7d6929b` | not yet scored | | | exact `arg_types` flips, shared executor setup; samples 112.2 + 8.0 CPU (v3: 112.3 + 14.0) |
 
 Zero misses on every board run. Leader at the time of writing: **126.1**. The team goal
 is roughly 20 s better than 182.8.
@@ -112,6 +114,19 @@ RWXblast-radius-sample/    the starter kit: 30 sample commits + answers, score.p
      "giants" (recorded >= 6 s), but only those whose own test file had runnable tests run
      clean (class setup budgeted in), or that have no runnable relatives at all.
    - Tests reading an edited fixture are printed without running (they always fail).
+   - A giant is dropped only when *all* runnable candidates from its own test file ran
+     clean (budget `RWX_RELATED_ALL_MS`, 4 s). A 3-test sample was not enough: it only
+     avoided a lab miss by luck of ordering.
+   - **`arg_types` flips (v4):** a class-body `arg_types` edit that only flips the
+     truthiness of entries changes nothing but `required_args`, read only by
+     `error_messages()`. Candidates = tests that validated an affected class (the class,
+     its subclasses, classes copying its `arg_types`) with that argument missing. This is
+     a per-test profile recorded by `tools/lab/argrun.py` (`arg_missing` in the map).
+     In the lab it turns 1,617 candidates into exactly the failing set.
+   - **Shared executor setup (v4):** `TestExecutor.setUpClass` runs once in the warm
+     parent (under the warm-up monitor, so patches touching code it ran force a
+     re-import). duckdb connections are lazy proxies that replay their statements in the
+     child on first use. This saves about 1.5 s per session that runs executor tests.
 4. **Scheduler:** two sessions at a time (2 cores), global wall-clock guard falls back
    to the static set if time runs short.
 5. **Packing:** LPT over k = 1..8, keeps the k with the smallest busiest-load + 2k.
@@ -135,6 +150,16 @@ The simulated gap is almost entirely two commits:
 | fixture edits, empty, comment-only | about 40% | about 0 | already at the floor |
 
 **Measured facts (do not re-derive):**
+- Probe detection curve (lab, commits too big to run fully, live among runnable):
+  ordered by rarity per CPU, 1 s of probing catches 81%, 4 s 93%, 8 s 96%, 16 s 98%.
+  After a clean 4 s probe about 20% are still live, so "clean after probe" bets lose
+  about 60 s each in expectation.
+- Call-level selection (only the `validate_*` calls / pool submissions that reach the
+  changed code): those units are only 20–60% of test CPU, total saving about 15%
+  (`tools/lab/unitpot.py`). Not worth its complexity.
+- Gap by edit kind (lab): function-body edits 68% (`and`/`or` 24%, comparisons 22%,
+  numbers 8%, `is`->`==` 8%, booleans 6%), class attributes 17% (mostly `arg_types`, now
+  handled), default-argument edits 11%.
 - Running *every* non-heavy test costs about 42 s of CPU, so full runs never pay for big sets.
 - Including tests worth S seconds costs about 2·sqrt(2S); running them costs about S of CPU.
   Running wins only below roughly 8 s.
@@ -193,7 +218,15 @@ TOP=10 python3 tools/lab/simulate.py RWXblast-radius-sample/sample LABDIR   # re
 
 ## 8. Ideas, ranked by expected value
 
-1. **Sub-test (call-level) selection.** Dialect tests are long lists of
+Done in v4: exact `arg_types` flips, shared executor setup. Measured and dropped:
+call-level selection (about 15% CPU, see section 5), rarity probe order (raw detection is
+better but the full simulation is slightly worse than focus order).
+
+0. **Value profiles for comparison sites** (`<` vs `<=`, `is` vs `==`): record per test
+   whether operands were ever equal/identical-but-not-equal at each site, so boundary
+   flips select only tests that hit the boundary. Covers part of the 22% comparison
+   slice. `and`/`or` flips cannot use this (short-circuiting hides the other operand).
+1. *(measured, low value)* **Sub-test (call-level) selection.** Dialect tests are long lists of
    `validate_identity`/`validate_all` calls; optimizer tests loop over fixture entries
    through the pool. Record coverage per call/per pool submission, then at runtime run
    only the calls that executed the changed lines and stub the rest. Skipping a call that
@@ -202,7 +235,7 @@ TOP=10 python3 tools/lab/simulate.py RWXblast-radius-sample/sample LABDIR   # re
    mid-size sets (51–500), which carry about 40% of the remaining gap. Watch out for
    chained use of return values (`validate_identity(...).assert_is(...)`) and shared
    state between calls.
-2. **Share expensive class setup across sessions.** `TestExecutor.setUpClass` costs about
+2. *(done in v4)* **Share expensive class setup across sessions.** `TestExecutor.setUpClass` costs about
    1.5 s per session (0.8 s CSV parsing, 0.7 s duckdb). Precompute in the warm parent
    under the warm-up monitor, so changed code that ran during setup still forces a
    re-import. duckdb connections cannot cross `fork`, so make them lazy in the child.
