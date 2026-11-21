@@ -456,6 +456,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
+BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
 
@@ -559,7 +560,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     if failed or len(passed) < len(probe):
         return (yield from _live(C, rest, heavy, passed, failed | (set(probe) - passed - failed)))
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
-    if not giants:
+    if not giants and not BET_CLEAN:
         return set(C) - passed
     # Second probe: ALL runnable candidates from each giant's own test file (when they fit
     # the budget, class setup included), then a wider spread.
@@ -583,6 +584,9 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     passed |= passed2
     if failed2 or len(passed2) < len(probe2):
         return (yield from _live(C, rest, heavy, passed, failed2))
+    if BET_CLEAN:
+        # EXPERIMENT (off by default): both probes passed -> treat the commit as clean.
+        return set(heavy) & NO_RUN
     # A giant goes only when its own test file showed clean evidence (or has no runnable
     # candidates at all, the case the lab saw no failures in).
     has_related = {g for g in giants if any(FILE_OF.get(n, "") == FILE_OF.get(g, "") for n in rest)}
