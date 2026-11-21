@@ -22,8 +22,17 @@ and how to split them over up to 8 workers.
    its tests once; per commit it forks a child that applies the patch (swapping
    function bytecode, or re-importing patched modules when import-time code
    changed) and runs candidate tests with `unittest`. Cheap candidates that pass
-   are dropped; the slowest tests are only left out after every runnable
-   candidate, or two probes of them, passed.
+   are dropped. Larger batches get two focused probes. If both pass and clear
+   an expensive test, the selector checks the remaining runnable tests when
+   their estimated CPU fits within the worker time that a clean run could save.
+   A subsequent failure restores an omitted giant from the same test file or
+   one with no runnable relatives. When a patch can affect a
+   nested function factory, the child reloads the patched module tree.
+   A setup or teardown error keeps every requested test in the affected class.
+   The image build records the source files and class attributes used by the
+   pinned executor fixture. For eligible function-body patches, the child
+   opens the DuckDB connections and loads the CSVs on the first fixture read.
+   Fixture-dependent patches use the original eager setup.
 4. **Packing**: tests are split over the number of workers that minimizes the
    busiest worker plus 2 s per worker.
 

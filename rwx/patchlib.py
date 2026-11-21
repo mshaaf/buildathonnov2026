@@ -308,11 +308,26 @@ class Locator:
         )
 
 
-def ast_equal(a: str, b: str) -> bool | None:
-    """True if two sources have the same AST (comments/whitespace only). None if b does not parse."""
+def _same_syntax(a, b) -> bool:
+    """Compare parsed syntax without source positions or whole-tree string dumps."""
+    if a is b:
+        return True
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for name in a._fields:
+            if not _same_syntax(getattr(a, name), getattr(b, name)):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same_syntax(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def ast_equal(a: str | ast.Module, b: str) -> bool | None:
+    """Compare source syntax, optionally reusing the parsed base. None means invalid new syntax."""
     try:
-        tb = ast.parse(b)
+        patched = ast.parse(b)
     except SyntaxError:
         return None
-    ta = ast.parse(a)
-    return ast.dump(ta) == ast.dump(tb)
+    return _same_syntax(ast.parse(a) if isinstance(a, str) else a, patched)

@@ -28,4 +28,5 @@ RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests > /dev/null || true
 COPY rwx /app/rwx
 RUN python -m compileall -q /app/rwx > /dev/null && chmod -R a+rX /app /sqlglot
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+RUN python /app/rwx/executor_fixture.py /sqlglot && chmod a+r /sqlglot/.rwx-executor.json
 CMD ["python", "/app/rwx/selector.py"]
