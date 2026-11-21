@@ -233,6 +233,8 @@ class Analyzer:
                 mask |= self.map.file_mask(rel)
                 continue
             candidates = self.site_mask(rel, site, why)
+            if single_file and old_changed == added == {ln} and site.kind == "func":
+                self.case_site = rel, site.code_key, site.lines
             if (single_file and self.tokenizer and old_changed == added == {ln}
                     and site.kind == "import" and site.class_key(rel) in self.tokenizer["classes"]):
                 name = flipped_bool(site.stmt, old.splitlines()[ln - 1], new.splitlines()[ln - 1])
@@ -261,6 +263,7 @@ class Analyzer:
         mask = 0
         self.py_changes: dict = {}
         self.data_changes: dict = {}
+        self.case_site = None
         files = parse_patch(text)
         if any(fp.binary or fp.old_path != fp.new_path for fp in files):
             return self.all, ["file creation, removal, rename or binary change -> ALL"]
@@ -568,10 +571,10 @@ class Scheduler:
         import select as _sel
 
         queue = list(jobs)
-        active = []  # [cid, C, gen, session, batch]
+        active = []  # [cid, C, gen, session, batch, selected before executor verification]
         while queue or active:
             while queue and len(active) < self.lanes:
-                cid, C, py, data, data_only, focus, known = queue.pop(0)
+                cid, C, py, data, data_only, focus, known, case_site = queue.pop(0)
                 gen = policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
@@ -582,15 +585,15 @@ class Scheduler:
                     gen.close()
                     yield cid, set(C), "out of time"
                     continue
-                sess = self.engine.session(py, data)
+                sess = self.engine.session(py, data, case_site)
                 sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
-                active.append([cid, C, gen, sess, batch])
+                active.append([cid, C, gen, sess, batch, None])
             if not active:
                 continue
             timeout = max(0.05, min(a[3].deadline for a in active) - time.monotonic())
             ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
             for a in list(active):
-                cid, C, gen, sess, batch = a
+                cid, C, gen, sess, batch, selected = a
                 finished = False
                 if sess in ready:
                     finished = sess.read()
@@ -607,6 +610,14 @@ class Scheduler:
                     # crashed or killed: whatever did not report counts as failing
                     for n in batch:
                         res.setdefault(n, "F")
+                executor = self.engine.executor_test
+                if selected is not None:
+                    if sess.alive and res.get(executor) == "P":
+                        selected = selected - {executor}
+                    sess.close()
+                    active.remove(a)
+                    yield cid, selected, "checked affected TPC-DS queries"
+                    continue
                 try:
                     nxt, stop_first = gen.send(res)
                     if time.monotonic() > self.deadline or not sess.alive:
@@ -614,6 +625,13 @@ class Scheduler:
                     sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
                     a[4] = nxt
                 except StopIteration as e:
+                    if (executor in e.value and sess.executor_ms is not None and sess.alive
+                            and executor not in res and time.monotonic() < self.deadline):
+                        cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                        if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
+                            sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
+                            a[4:] = [[executor], e.value]
+                            continue
                     sess.close()
                     active.remove(a)
                     yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
@@ -680,9 +698,9 @@ def main() -> None:
         cid = patch.stem
         try:
             mask, why = an.analyze(patch.read_text(errors="replace"))
-            py, data = dict(an.py_changes), dict(an.data_changes)
+            py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
         except Exception as e:  # never crash: run everything for this commit
-            mask, why, py, data = valid, [f"analyzer error {e!r} -> ALL"], {}, {}
+            mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
         mask &= valid
         C = [n for n in dur if mask >> n & 1]
         # No patched Python to verify, including analysis failures and unsupported diffs.
@@ -693,8 +711,8 @@ def main() -> None:
             mid = cmap.opens.get(rel)
             if mid is not None:
                 known |= {n for n in C if cmap.masks[mid] >> n & 1}
-        jobs.append((cid, C, py, data, data_only, commit_focus(cmap, C, py), known))
-    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, _, _ in jobs)
+        jobs.append((cid, C, py, data, data_only, commit_focus(cmap, C, py), known, case_site))
+    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
         try:
@@ -709,7 +727,7 @@ def main() -> None:
         except Exception as e:  # engine trouble: fall back to the static sets
             log(f"engine failed: {e!r}")
     total = 0
-    for cid, C, py, data, data_only, _, _ in jobs:
+    for cid, C, py, data, data_only, *_ in jobs:
         final_set, note = results.get(cid, (set(C), "static"))
         nums = sorted(final_set)
         workers = pack(nums, dur)
