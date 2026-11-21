@@ -693,11 +693,20 @@ class Scheduler:
                         res.setdefault(n, "F")
                 executor = self.engine.executor_test
                 if selected is not None:
-                    if sess.alive and res.get(executor) == "P":
-                        selected = selected - {executor}
+                    kind, selected = selected
+                    if kind == "verify":
+                        # every affected query was run: a pass clears TPC-DS
+                        if sess.alive and res.get(executor) == "P":
+                            selected = selected - {executor}
+                        note = "checked affected TPC-DS queries"
+                    else:
+                        # a sample of affected queries gated leaving TPC-DS out
+                        if not (sess.alive and res.get(executor) == "P"):
+                            selected = selected | {executor}
+                        note = f"TPC-DS sample gate {'passed' if executor not in selected else 'FAILED: kept TPC-DS'}"
                     sess.close()
                     active.remove(a)
-                    yield cid, selected, "checked affected TPC-DS queries"
+                    yield cid, selected, note
                     continue
                 try:
                     nxt, stop_first = gen.send(res)
@@ -706,13 +715,20 @@ class Scheduler:
                     sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
                     a[4] = nxt
                 except StopIteration as e:
-                    if (executor in e.value and sess.executor_ms is not None and sess.alive
-                            and executor not in res and time.monotonic() < self.deadline):
+                    if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
+                            and sess.alive and executor not in res and time.monotonic() < self.deadline):
                         cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                         if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
                             sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
-                            a[4:] = [[executor], e.value]
+                            a[4:] = [[executor], ("verify", e.value)]
                             continue
+                    if (executor is not None and executor in C and executor not in e.value
+                            and sess.executor_ms is not None and sess.alive and executor not in res
+                            and time.monotonic() < self.deadline):
+                        cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                        sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
+                        a[4:] = [[executor], ("gate", e.value)]
+                        continue
                     sess.close()
                     active.remove(a)
                     yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"

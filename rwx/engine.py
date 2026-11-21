@@ -32,6 +32,7 @@ import unittest
 from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
+TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
 
 
 class InlinePool:
@@ -574,6 +575,7 @@ class Session:
         self.info = swaps if self.mode == "reimport" else len(swaps)
         executor_indices = None
         self.executor_ms = None
+        self.executor_partial = None
         if (engine.executor_profile and not data_changes and len(py_changes) == 1
                 and self.mode == "swap" and swaps
                 and next(iter(py_changes)).startswith("sqlglot/")):
@@ -581,10 +583,25 @@ class Session:
 
             case_indices = affected_cases(engine.executor_profile, engine.root, swaps, case_site)
             if case_indices is not None:
-                case_ms = sum(engine.executor_profile["ms"][i] for i in case_indices)
+                ms = engine.executor_profile["ms"]
+                case_ms = sum(ms[i] for i in case_indices)
                 if case_ms <= 5000:
                     executor_indices = case_indices
                     self.executor_ms = case_ms
+                    self.executor_partial = False
+                elif case_indices:
+                    # Too many to verify: keep the cheapest affected queries as a gate
+                    # for the case where the policy would leave TPC-DS out unrun.
+                    picked, used = [], 0
+                    for i in sorted(case_indices, key=lambda i: (ms[i], i)):
+                        if used + ms[i] > TPCDS_SAMPLE_MS:
+                            break
+                        picked.append(i)
+                        used += ms[i]
+                    if picked:
+                        executor_indices = sorted(picked)
+                        self.executor_ms = used
+                        self.executor_partial = True
         cmd_r, cmd_w = os.pipe()
         res_r, res_w = os.pipe()
         pid = os.fork()

@@ -298,3 +298,27 @@ tests still have to be printed); stand-ins for the giants (tiny gain).
 - Output must be deterministic; it has been identical across all runs so far.
 - `nanobind: leaked ...` lines on stderr at exit come from duckdb objects kept alive by
   `gc.freeze()`. They are harmless.
+
+## 10. Update: merged branches, the TPC-DS drop risk, GitHub housekeeping
+
+- `rwx` now contains everything: v4 + Astra's `main` work (PR #2) + Astra's
+  `optimize-executor-setup` (per-query TPC-DS verification, tokenizer flag coverage).
+  `main` and `rwx` choose identically on the samples (103.655 s); practice has been at
+  172.56 s simulated for every version since v2.2, so the practice set barely contains
+  the commit types any of these changes target. Always paste the full commit hash on
+  the submit form: an empty box scores the newest commit on `main`.
+- **Known risk (since v3):** when every runnable candidate passes, the policy leaves the
+  21 s `test_execute_tpcds` out unrun. In the lab that happened on 54 commits and was
+  wrong once (`m020156`, a predicate-pushdown change that only breaks complex TPC-DS
+  queries), about 2% per drop. Expected value still favors dropping (about 21 s saved vs
+  about 6 s expected penalty), but expect roughly a 1-in-10 chance of one miss across the
+  final. A gate that runs the cheapest 3 s of affected TPC-DS queries first did not catch
+  it (the failing queries are the expensive ones) and added about 5 s CPU, so it is off
+  (`RWX_TPCDS_SAMPLE_MS=0`).
+- Three lab ground-truth records (`m020156`, `m020229`, `m020302`) were timeouts: tests that
+  did not report were recorded as failing. Treat lab records with `timeout`/`crash` set as
+  unreliable; real pytest on the patched tree is the arbiter.
+- `.github/validation` on branch `validate-tpcds-758caa9` (Astra's amd64 comparison
+  workflow) now measures CPU with `getrusage` when cgroup `cpu.stat` is absent, and finds
+  its marker even when duckdb's leak report (no trailing newline) precedes it. The
+  selector now exits with `os._exit`, so that leak report no longer appears.
