@@ -90,6 +90,8 @@ def main():
     tests = json.load(open(tests_json))["tests"]
     acc_lines: dict = {}
     acc_opens: dict = {}
+    focus: dict = {}  # file -> {test: lines executed in that file}
+    total_lines: dict = {}
     nonpass = {}
     seen = set()
     for path in glob.glob(os.path.join(cov_dir, "*.json")):
@@ -99,6 +101,10 @@ def main():
         bit = 1 << n
         if d["status"] != "ok":
             nonpass[n] = d["status"]
+        for f, keys in d["run"].items():
+            c = sum(len(v) for v in keys.values())
+            focus.setdefault(f[len(ROOT):], {})[n] = c
+            total_lines[n] = total_lines.get(n, 0) + c
         for phase in ("imp", "run"):
             for f, keys in d[phase].items():
                 rel = f[len(ROOT):]
@@ -128,7 +134,8 @@ def main():
 
     lines = {f: {k: {ln: mid(m) for ln, m in lk.items()} for k, lk in fk.items()} for f, fk in acc_lines.items()}
     opens = {f: mid(m) for f, m in acc_opens.items()}
-    payload = {"masks": masks, "lines": lines, "opens": opens, "nonpass": nonpass}
+    payload = {"masks": masks, "lines": lines, "opens": opens, "nonpass": nonpass,
+               "focus": focus, "total_lines": total_lines}
     if cls_dir:
         users: dict = {}
         for path in glob.glob(os.path.join(cls_dir, "[0-9]*.json")):

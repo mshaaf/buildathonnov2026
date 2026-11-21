@@ -39,6 +39,8 @@ class Map:
         self.opens: dict = d["opens"]
         self.cpu_ms: dict = d.get("cpu_ms", {})
         self.cls_setup_ms: dict = d.get("cls_setup_ms", {})
+        self.focus: dict = d.get("focus", {})
+        self.total_lines: dict = d.get("total_lines", {})
         self.class_users: dict = d.get("class_users", {})
         self.class_desc: dict = d.get("class_desc", {})
         self.name_refs: dict = d.get("name_refs", {})
@@ -348,13 +350,13 @@ def pack(numbers: list[int], dur: dict[int, int]) -> list[list[int]]:
 RUN_MAX_MS = int(os.environ.get("RWX_RUN_MAX_MS", "2500"))  # never run a test estimated above this
 SKIP_MIN_MS = int(os.environ.get("RWX_SKIP_MIN_MS", "6000"))  # only tests this slow may be left out unrun
 RUN_LIMIT_MS = int(os.environ.get("RWX_RUN_LIMIT_MS", "4000"))  # run every runnable candidate up to this
-PROBE_MS = int(os.environ.get("RWX_PROBE_MS", "600"))  # probe budget when there are too many to run
+PROBE_MS = int(os.environ.get("RWX_PROBE_MS", "150"))  # probe budget when there are too many to run
 USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
 BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 
 
-def policy(C: list[int], dur: dict, data_only: bool):
+def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
     """Generator: yields (tests, stop_first) batches, receives {n: 'P'|'F'}, returns the final set.
 
     Sound for every test it runs or includes. The one gamble: when every runnable
@@ -364,6 +366,10 @@ def policy(C: list[int], dur: dict, data_only: bool):
         return set()
     if data_only:
         return set(C)  # an edited fixture line almost always breaks the tests reading it
+    if known:
+        # Tests reading an edited data file: included as they are, never run here.
+        rest_gen = policy([n for n in C if n not in known], dur, False, focus, None)
+        return set(known) | (yield from rest_gen)
     heavy = [n for n in C if n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS]
     hs = set(heavy)
     rest = sorted((n for n in C if n not in hs), key=lambda n: (CPU_EST.get(n, dur[n]), n))
@@ -372,16 +378,19 @@ def policy(C: list[int], dur: dict, data_only: bool):
     # Worth spending more CPU when a clean result would let the slowest tests go.
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
     potential = 0
-    if giants:
-        potential = _pack_cost(C) - _pack_cost([n for n in heavy if dur[n] < SKIP_MIN_MS])
+    if heavy:
+        potential = _pack_cost(C) - _pack_cost([n for n in heavy if n in NO_RUN or (dur[n] < SKIP_MIN_MS and not CLEAN_SKIPS_HEAVY)])
     if batch_cost(rest) <= RUN_LIMIT_MS + RUN_FRAC * potential:
         res = yield rest, True
         failed = {n for n, st in res.items() if st == "F"}
         passed = {n for n, st in res.items() if st == "P"}
         if failed:
             return (yield from _live(C, rest, heavy, passed, failed))
+        if CLEAN_SKIPS_HEAVY:
+            # Every runnable candidate passed: in the lab no slow test ever failed then.
+            return {n for n in heavy if n in NO_RUN}
         return {n for n in heavy if dur[n] < SKIP_MIN_MS}
-    return (yield from _probe_then_decide(C, rest, heavy, dur))
+    return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}))
 
 
 FILE_OF: dict = {}
@@ -389,9 +398,12 @@ NO_RUN: set = set()  # tests that start a fresh interpreter: the engine cannot p
 NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
 
 
-PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "2500"))
+PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "250"))
+RELATED_EVIDENCE_MS = int(os.environ.get("RWX_RELATED_EVIDENCE_MS", "1200"))
+MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 
+CLEAN_SKIPS_HEAVY = os.environ.get("RWX_CLEAN_SKIPS_HEAVY", "1") == "1"
 RUN_FRAC = float(os.environ.get("RWX_RUN_FRAC", "0"))
 
 
@@ -400,11 +412,22 @@ def _pack_cost(nums) -> int:
     return (max(sum(DUR[n] for n in x) for x in w) + WORKER_MS * len(w)) if w else 0
 
 
-def _spread(cands, budget, per_file_max, already=()):
+def _probe_order(focus):
+    """Most focused on the changed code first (share of the test's executed lines that lie
+    in the changed files), cheaper first among equals."""
+
+    def key(n):
+        cost = CLS_SETUP.get(CLS_OF.get(n), 0) + CPU_EST.get(n, DUR[n])
+        return (-round(focus.get(n, 0.0), 2), cost, n)
+
+    return key
+
+
+def _spread(cands, budget, per_file_max, already=(), focus=None):
     chosen, per_file = list(already), {}
     for n in chosen:
         per_file[FILE_OF.get(n, "")] = per_file.get(FILE_OF.get(n, ""), 0) + 1
-    for n in sorted(cands, key=lambda n: (CLS_SETUP.get(CLS_OF.get(n), 0) + CPU_EST.get(n, DUR[n]), n)):
+    for n in sorted(cands, key=_probe_order(focus or {})):
         if n in chosen:
             continue
         f = FILE_OF.get(n, "")
@@ -417,8 +440,8 @@ def _spread(cands, budget, per_file_max, already=()):
     return chosen[len(already):]
 
 
-def _probe_then_decide(C, rest, heavy, dur):
-    probe = _spread(rest, PROBE_MS, 2)
+def _probe_then_decide(C, rest, heavy, dur, focus):
+    probe = _spread(rest, PROBE_MS, 2, focus=focus)
     if not probe:
         cheapest = min(rest, key=lambda n: (batch_cost([n]), n))
         probe = [cheapest] if batch_cost([cheapest]) <= RUN_MAX_MS else []
@@ -432,12 +455,21 @@ def _probe_then_decide(C, rest, heavy, dur):
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
     if not giants:
         return set(C) - passed
-    # Second probe: runnable candidates from the giants' own test files, then a wider spread.
-    gfiles = {FILE_OF.get(n, "") for n in giants}
+    # Second probe: runnable candidates from each giant's own test file (class setup
+    # budgeted in), then a wider focused spread.
     remaining = [n for n in rest if n not in passed]
-    related = [n for n in remaining if FILE_OF.get(n, "") in gfiles]
-    probe2 = _spread(related, PROBE2_MS * 0.6, 6)
-    probe2 += _spread([n for n in remaining if n not in set(probe2)], PROBE2_MS, 4, already=probe2)
+    probe2, evidenced = [], set()
+    for g in giants:
+        gf = FILE_OF.get(g, "")
+        related = [n for n in remaining if FILE_OF.get(n, "") == gf and n not in set(probe2)]
+        if not related:
+            continue
+        setup = max((CLS_SETUP.get(CLS_OF.get(n), 0) for n in related), default=0)
+        pick = _spread(related, setup + RELATED_EVIDENCE_MS, 6, focus=focus)
+        if len(pick) >= min(MIN_RELATED, len(related)):
+            probe2 += pick
+            evidenced.add(g)
+    probe2 += _spread([n for n in remaining if n not in set(probe2)], batch_cost(probe2) + PROBE2_MS, 4, already=probe2, focus=focus)
     if not probe2:
         return set(C) - passed
     res2 = yield probe2, True
@@ -446,7 +478,11 @@ def _probe_then_decide(C, rest, heavy, dur):
     passed |= passed2
     if failed2 or len(passed2) < len(probe2):
         return (yield from _live(C, rest, heavy, passed, failed2))
-    return set(C) - passed - set(giants)
+    # A giant goes only when its own test file showed clean evidence (or has no runnable
+    # candidates at all, the case the lab saw no failures in).
+    has_related = {g for g in giants if any(FILE_OF.get(n, "") == FILE_OF.get(g, "") for n in rest)}
+    drop = {g for g in giants if g in evidenced or g not in has_related}
+    return set(C) - passed - drop
 
 
 NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
@@ -496,8 +532,8 @@ class Scheduler:
         active = []  # [cid, C, gen, session, batch]
         while queue or active:
             while queue and len(active) < self.lanes:
-                cid, C, py, data, data_only = queue.pop(0)
-                gen = policy(C, DUR, data_only)
+                cid, C, py, data, data_only, focus, known = queue.pop(0)
+                gen = policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -541,7 +577,7 @@ class Scheduler:
                 except StopIteration as e:
                     sess.close()
                     active.remove(a)
-                    yield cid, e.value, f"ran {sess.mode} cpu {sum(sess.cpu.values()):.2f}s{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
+                    yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
                 except GeneratorExit:
                     gen.close()
                     sess.close()
@@ -553,6 +589,19 @@ DUR: dict = {}
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
+
+
+def commit_focus(cmap, C, py) -> dict:
+    """Per candidate: share of its executed lines that lie in the changed Python files."""
+    out = {}
+    files = [f for f in py]
+    for n in C:
+        tot = cmap.total_lines.get(n, 0)
+        if not tot:
+            continue
+        inside = sum(cmap.focus.get(f, {}).get(n, 0) for f in files)
+        out[n] = inside / tot
+    return out
 
 
 def batch_cost(batch) -> int:
@@ -599,15 +648,20 @@ def main() -> None:
         C = [n for n in dur if mask >> n & 1]
         data_only = bool(data) and not py
         log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
-        jobs.append((cid, C, py, data, data_only))
-    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only in jobs)
+        known = set()
+        for rel in data:
+            mid = cmap.opens.get(rel)
+            if mid is not None:
+                known |= {n for n in C if cmap.masks[mid] >> n & 1}
+        jobs.append((cid, C, py, data, data_only, commit_focus(cmap, C, py), known))
+    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, _, _ in jobs)
     results = {}
     if need_engine:
         try:
             from engine import Engine
 
             eng = Engine(str(SRC), tests, log=log)
-            log(f"engine warm in {time.monotonic() - t0:.1f}s")
+            log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
             budget = min(150.0, 3.2 * len(jobs) + 10)
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)
             for cid, final_set, note in sched.run(jobs):
@@ -615,7 +669,7 @@ def main() -> None:
         except Exception as e:  # engine trouble: fall back to the static sets
             log(f"engine failed: {e!r}")
     total = 0
-    for cid, C, py, data, data_only in jobs:
+    for cid, C, py, data, data_only, _, _ in jobs:
         final_set, note = results.get(cid, (set(C), "static"))
         nums = sorted(final_set)
         workers = pack(nums, dur)

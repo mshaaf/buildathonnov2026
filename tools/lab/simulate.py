@@ -31,8 +31,8 @@ def engine_order(batch, tests):
     return [n for g in groups.values() for n in g]
 
 
-def replay(C, F, data_only, tests, est):
-    gen = sel.policy(C, sel.DUR, data_only)
+def replay(C, F, data_only, tests, est, focus=None, known=None):
+    gen = sel.policy(C, sel.DUR, data_only, focus, known)
     cpu = 0
     sess = False
     try:
@@ -91,7 +91,12 @@ def main():
             mask, why = an.analyze(text)
             C = [n for n in dur if mask >> n & 1]
             data_only = bool(an.data_changes) and not an.py_changes
-            out, cpu = replay(C, F, data_only, tests, est)
+            known = set()
+            for rel in an.data_changes:
+                mid = _M.opens.get(rel)
+                if mid is not None:
+                    known |= {n for n in C if _M.masks[mid] >> n & 1}
+            out, cpu = replay(C, F, data_only, tests, est, sel.commit_focus(_M, C, an.py_changes), known)
             if cpu:
                 any_engine = True
             miss = bool(F - out)

@@ -240,6 +240,10 @@ class Engine:
         mods = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests})
         self._warm(mods)
         self._index_functions()
+        # Keep forked children from touching (and so copying) every inherited object:
+        # the collector ignores frozen objects.
+        gc.collect()
+        gc.freeze()
 
     def _warm(self, mods):
         mon = sys.monitoring
@@ -420,7 +424,6 @@ class Engine:
         difflib.context_diff = lambda *a, **k: iter(())
         if data_changes:
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
-        gc.collect()
 
     def _patch_open(self, files: dict):
         real_open = builtins.open
@@ -502,6 +505,7 @@ class Session:
         self.cpu: dict = {}
         self.deadline = None
         self.crash = None
+        self.total_cpu = 0.0
 
     def fileno(self):
         return self.res
@@ -557,7 +561,8 @@ class Session:
         if self.alive:
             self.alive = False
             try:
-                os.waitpid(self.pid, 0)
+                _, _, ru = os.wait4(self.pid, 0)
+                self.total_cpu = ru.ru_utime + ru.ru_stime
             except ChildProcessError:
                 pass
 
