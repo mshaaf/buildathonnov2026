@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/normalize.py b/sqlglot/optimizer/normalize.py
+--- a/sqlglot/optimizer/normalize.py
++++ b/sqlglot/optimizer/normalize.py
+@@ -132,7 +132,7 @@
+ 
+     (A AND B) OR C -> [2, 2] because len(A OR C), len(B OR C).
+     """
+-    if depth > max_:
++    if depth >= max_:
+         yield depth
+         return
+ 

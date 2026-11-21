@@ -1,0 +1,12 @@
+diff --git a/sqlglot/generators/duckdb.py b/sqlglot/generators/duckdb.py
+--- a/sqlglot/generators/duckdb.py
++++ b/sqlglot/generators/duckdb.py
+@@ -4846,7 +4846,7 @@
+         decimals = expression.args.get("decimals")
+         truncate = expression.args.get("truncate")
+ 
+-        if decimals is not None and expression.args.get("negative_decimals_are_zero"):
++        if decimals is not None or expression.args.get("negative_decimals_are_zero"):
+             if decimals.is_int:
+                 decimals = exp.Literal.number(max(0, decimals.to_py()))
+             else:

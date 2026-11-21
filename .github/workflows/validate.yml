@@ -1,0 +1,17 @@
+name: Validate the TPC-DS submission
+on:
+  push:
+    branches: [validate-tpcds-758caa9]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build exact commits and score both batches
+        run: bash .github/validation/validate.sh

@@ -1,0 +1,12 @@
+diff --git a/sqlglot/optimizer/unnest_subqueries.py b/sqlglot/optimizer/unnest_subqueries.py
+--- a/sqlglot/optimizer/unnest_subqueries.py
++++ b/sqlglot/optimizer/unnest_subqueries.py
+@@ -269,7 +269,7 @@
+         and on_clause_ancestor.args.get("on")
+         and not on_clause_ancestor.side
+         and on_clause_ancestor.kind in ("", "INNER")
+-        and not on_clause_ancestor.method
++        and on_clause_ancestor.method
+         and not on_clause_ancestor.args.get("match_condition")
+     ):
+         parent_from = parent_select.args.get("from_")
