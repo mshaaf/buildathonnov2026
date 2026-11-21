@@ -810,3 +810,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    # Skip interpreter teardown: freeing the frozen warm-up heap costs CPU, and duckdb's
+    # nanobind prints leak reports for objects gc.freeze() kept alive.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
