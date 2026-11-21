@@ -1,0 +1,7 @@
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+COPY requirements.lock /lab/requirements.lock
+COPY ca.crt /lab/ca.crt
+RUN PIP_CERT=/lab/ca.crt pip install --no-cache-dir -r /lab/requirements.lock coverage==7.10.7
+COPY sqlglot /sqlglot
+ENV PYTHONPATH=/sqlglot SKIP_INTEGRATION=0
+WORKDIR /sqlglot
