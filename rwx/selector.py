@@ -776,8 +776,12 @@ def main() -> None:
         except Exception as e:  # engine trouble: fall back to the static sets
             log(f"engine failed: {e!r}")
     total = 0
+    diag_min = int(os.environ.get("RWX_DIAG_MIN", "0"))
+    diag_max = int(os.environ.get("RWX_DIAG_MAX", "100000"))
     for cid, C, py, data, data_only, _, _ in jobs:
         final_set, note = results.get(cid, (set(C), "static"))
+        if diag_min and diag_min <= len(C) <= diag_max:
+            final_set, note = set(), "diagnostic: printed nothing"
         nums = sorted(final_set)
         workers = pack(nums, dur)
         cost = (max(sum(dur[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
