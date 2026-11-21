@@ -184,6 +184,7 @@ class StreamResult(unittest.TestResult):
         self.fd = fd
         self.ids = ids  # str(test.id()) -> number
         self.cur_bad = False
+        self.fixture_error = False
         self.any_bad = False
         self.stop_first = False
 
@@ -198,7 +199,8 @@ class StreamResult(unittest.TestResult):
     def addError(self, test, err):
         super().addError(test, err)
         self.cur_bad = True
-        self._class_level_error(test)
+        if self._num(test) is None:
+            self.fixture_error = True
 
     def addFailure(self, test, err):
         super().addFailure(test, err)
@@ -213,9 +215,6 @@ class StreamResult(unittest.TestResult):
     def addUnexpectedSuccess(self, test):
         super().addUnexpectedSuccess(test)
         self.cur_bad = True
-
-    def _class_level_error(self, test):
-        pass
 
     def stopTest(self, test):
         super().stopTest(test)
@@ -340,6 +339,9 @@ class Engine:
                     return "reimport", f"freevars {oc.co_qualname}"
                 if not loaded:
                     continue  # module not imported yet: the hook serves the patched source
+                if "<locals>" in oc.co_qualname.split(".") or key not in self.funcs:
+                    # A factory could create a fresh function from its old co_consts.
+                    return "reimport", f"cannot replace every instance of {oc.co_qualname}"
                 swaps.append((key, nc))
         return "swap", swaps
 
@@ -454,6 +456,17 @@ class Engine:
         difflib.context_diff = lambda *a, **k: iter(())
         if data_changes:
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
+        elif (
+            mode == "swap"
+            and py_changes
+            and all(rel.startswith("sqlglot/") for rel in py_changes)
+            and "tests/test_executor.py::TestExecutor" not in self.presetup_done
+        ):
+            # Deferred fixture only when the parent did not already share the setup:
+            # wrapping a shared class would replace its data with lazy fields.
+            from executor_fixture import install
+
+            install(self.root, py_changes)
 
     def _patch_open(self, files: dict):
         real_open = builtins.open
@@ -482,11 +495,7 @@ class Engine:
             mod = path[:-3].replace("/", ".")
             by_class.setdefault((mod, cls), []).append(meth)
             ids[f"{mod}.{cls}.{meth}"] = n
-        result = StreamResult(wfd, ids)
-        result.stop_first = stop_first
         for (mod, cls), meths in by_class.items():
-            if stop_first and result.any_bad:
-                return
             try:
                 m = importlib.import_module(mod)
                 klass = getattr(m, cls)
@@ -495,8 +504,15 @@ class Engine:
                     os.write(wfd, f"{ids[f'{mod}.{cls}.{meth}']} F\n".encode())
                 continue
             suite = unittest.TestSuite([klass(meth) for meth in meths])
+            result = StreamResult(wfd, ids)
+            result.stop_first = stop_first
             unittest.TestSuite([suite]).run(result)
-            if stop_first and result.any_bad:
+            if result.fixture_error:
+                # unittest reports setup/teardown errors against a synthetic
+                # holder. A teardown error can arrive after a passing result.
+                for meth in meths:
+                    os.write(wfd, f"{ids[f'{mod}.{cls}.{meth}']} F\n".encode())
+            if stop_first and (result.any_bad or result.fixture_error):
                 return
 
 

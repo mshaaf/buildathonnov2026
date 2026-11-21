@@ -8,6 +8,38 @@ built, what the numbers say, what failed, and what to try next.
 **Branch:** `rwx` of `github.com/mshaaf/buildathonnov2026` (public).
 **Submit:** the repo URL plus a commit hash on the track page (once an hour).
 
+## Local candidate, November 21
+
+The candidate defers the executor fixture and compares parsed syntax directly.
+After two clean probes clear an expensive test, it verifies the remaining
+runnable candidates if their estimated CPU fits within the possible worker
+savings. Class fixture failures retain the affected
+tests. Changes to nested functions reload the patched source, and file creation,
+deletion, renames and binary patches fall back to selecting the full suite.
+
+| Batch | v3 simulated | Candidate simulated | v3 local total | Candidate local total | Candidate misses |
+|---|---:|---:|---:|---:|---:|
+| 30 official samples | 112.254 s | 103.655 s | 121.01 s | 111.45 s | 0 |
+| 60 generated patches, seed 1729 | 198.253 s | 198.253 s | 208.72 s | 206.69 s | 0 |
+| 5 targeted budget cases, seed 1730 | 53.564 s | 45.212 s | 60.37 s | 52.87 s | 0 |
+
+Totals are the median of three interleaved runs on macOS arm64 with Python
+3.13 and the locked dependencies. Each total includes CPU for the selector and
+its children. The sample improvement in simulated time came from one patch.
+The 60-patch batch saved CPU time. For that batch, running the broad reference
+set with forced re-imports reproduced the original reference labels. The
+5 targeted cases were the patches in a pool of 320 that switched initial
+batches when the full-verification budget was raised. Raising that budget
+alone increased their simulated time to 101.816 s, so the candidate retains
+the original probe order. A separate seed (1731) produced two eligible
+cases among 240 mutations. Both passed the cold-reference check with zero
+misses. The historical 601-patch lab corpus is
+outside this repository. The Linux/amd64 practice score for this candidate is
+still unmeasured. Section 2 records the previously submitted versions.
+
+Run `python3 tools/lab/test_verification.py` for the focused regressions and
+`make sample` for the sample under the container limits.
+
 ---
 
 ## 1. The problem in one screen

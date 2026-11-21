@@ -90,7 +90,7 @@ def main():
             text = open(f"{L}/commits/{cid}.patch").read()
             mask, why = an.analyze(text)
             C = [n for n in dur if mask >> n & 1]
-            data_only = bool(an.data_changes) and not an.py_changes
+            data_only = not an.py_changes
             known = set()
             for rel in an.data_changes:
                 mid = _M.opens.get(rel)
