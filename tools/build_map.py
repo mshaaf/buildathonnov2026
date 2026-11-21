@@ -75,6 +75,9 @@ def build_refs(src_root):
                     if isinstance(n.ctx, ast.Load):
                         # module.NAME style access counts as a reference to NAME too
                         name_refs.setdefault(n.attr, set()).add((rel, scope_key, scope_kind))
+                elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier() and len(n.value) > 2:
+                    # getattr(obj, "NAME") / hasattr / setattr style access
+                    name_refs.setdefault(n.value, set()).add((rel, scope_key, scope_kind))
 
             visit(tree, "1:<module>", "module")
     return {k: sorted(v) for k, v in name_refs.items()}, {k: sorted(v) for k, v in attr_refs.items()}

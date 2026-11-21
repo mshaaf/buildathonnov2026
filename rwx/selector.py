@@ -159,6 +159,8 @@ class Analyzer:
     def import_mask(self, rel: str, site, why: list) -> int:
         """Module- or class-body statement: who can observe the names it binds."""
         m = self.map
+        if BROAD:
+            return m.file_mask(rel)
         ck = site.class_key(rel)
         node = site.scope_node
         if ck is not None:
@@ -183,8 +185,14 @@ class Analyzer:
                 for r in recv:
                     refs.extend(m.attr_refs.get((r, name), ()))
             rmask, _ = m.ref_mask(refs)
-            why.append(f"class {ck} users={bin(users).count('1')} refs={bin(rmask).count('1')}")
-            return users | rmask
+            # Of the class's users, only those running code that reads one of the bound names.
+            readers = 0
+            for name in site.names or ():
+                rr, _ = m.ref_mask(m.name_refs.get(name, ()))
+                readers |= rr
+            narrowed = users & readers if (readers and ATTR_NARROW) else users
+            why.append(f"class {ck} users={bin(users).count('1')} readers={bin(narrowed).count('1')} refs={bin(rmask).count('1')}")
+            return narrowed | rmask
         # module level: whoever references the bound names, anywhere
         lazy = self.lazy_mask & m.file_mask(rel)
         if not site.names:
@@ -342,6 +350,8 @@ SKIP_MIN_MS = int(os.environ.get("RWX_SKIP_MIN_MS", "6000"))  # only tests this 
 RUN_LIMIT_MS = int(os.environ.get("RWX_RUN_LIMIT_MS", "4000"))  # run every runnable candidate up to this
 PROBE_MS = int(os.environ.get("RWX_PROBE_MS", "600"))  # probe budget when there are too many to run
 USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
+BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
+ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 
 
 def policy(C: list[int], dur: dict, data_only: bool):
@@ -359,12 +369,17 @@ def policy(C: list[int], dur: dict, data_only: bool):
     rest = sorted((n for n in C if n not in hs), key=lambda n: (CPU_EST.get(n, dur[n]), n))
     if not rest:
         return set(C)
-    if batch_cost(rest) <= RUN_LIMIT_MS:
+    # Worth spending more CPU when a clean result would let the slowest tests go.
+    giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
+    potential = 0
+    if giants:
+        potential = _pack_cost(C) - _pack_cost([n for n in heavy if dur[n] < SKIP_MIN_MS])
+    if batch_cost(rest) <= RUN_LIMIT_MS + RUN_FRAC * potential:
         res = yield rest, True
         failed = {n for n, st in res.items() if st == "F"}
-        unrun = {n for n in rest if n not in res}
+        passed = {n for n, st in res.items() if st == "P"}
         if failed:
-            return failed | unrun | hs
+            return (yield from _live(C, rest, heavy, passed, failed))
         return {n for n in heavy if dur[n] < SKIP_MIN_MS}
     return (yield from _probe_then_decide(C, rest, heavy, dur))
 
@@ -375,6 +390,14 @@ NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
 
 
 PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "2500"))
+
+
+RUN_FRAC = float(os.environ.get("RWX_RUN_FRAC", "0"))
+
+
+def _pack_cost(nums) -> int:
+    w = pack(sorted(nums), DUR)
+    return (max(sum(DUR[n] for n in x) for x in w) + WORKER_MS * len(w)) if w else 0
 
 
 def _spread(cands, budget, per_file_max, already=()):
@@ -397,11 +420,15 @@ def _spread(cands, budget, per_file_max, already=()):
 def _probe_then_decide(C, rest, heavy, dur):
     probe = _spread(rest, PROBE_MS, 2)
     if not probe:
+        cheapest = min(rest, key=lambda n: (batch_cost([n]), n))
+        probe = [cheapest] if batch_cost([cheapest]) <= RUN_MAX_MS else []
+    if not probe:
         return set(C)
     res = yield probe, True
     passed = {n for n, st in res.items() if st == "P"}
-    if len(passed) < len(probe):
-        return set(C) - passed  # live: keep everything not proven passing
+    failed = {n for n, st in res.items() if st == "F"}
+    if failed or len(passed) < len(probe):
+        return (yield from _live(C, rest, heavy, passed, failed | (set(probe) - passed - failed)))
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
     if not giants:
         return set(C) - passed
@@ -415,10 +442,44 @@ def _probe_then_decide(C, rest, heavy, dur):
         return set(C) - passed
     res2 = yield probe2, True
     passed2 = {n for n, st in res2.items() if st == "P"}
+    failed2 = {n for n, st in res2.items() if st == "F"}
     passed |= passed2
-    if len(passed2) < len(probe2):
-        return set(C) - passed
+    if failed2 or len(passed2) < len(probe2):
+        return (yield from _live(C, rest, heavy, passed, failed2))
     return set(C) - passed - set(giants)
+
+
+NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
+BREADTH = float(os.environ.get("RWX_BREADTH", "0.25"))
+RELATED_MS = int(os.environ.get("RWX_RELATED_MS", "2000"))
+NARROW_ON = os.environ.get("RWX_NARROW") == "1"  # experiment: off (cost more than it saved in the lab)
+
+
+def _live(C, rest, heavy, passed, failed):
+    """Something failed. Keep everything not proven passing, except slow tests that a
+    narrow failure (few tests failing, none in the slow test's own file) cannot reach."""
+    dur = DUR
+    skippable = [n for n in heavy if dur[n] >= NARROW_SKIP_MS and n not in NO_RUN]
+    if not NARROW_ON or not skippable:
+        return set(C) - passed
+    done = passed | failed
+    unrun = [n for n in rest if n not in done]
+    gfiles = {FILE_OF.get(n, "") for n in skippable}
+    related = [n for n in unrun if FILE_OF.get(n, "") in gfiles]
+    bp = _spread(related, RELATED_MS, 8)
+    bp += _spread([n for n in unrun if n not in set(bp)], RELATED_MS + PROBE_MS, 2, already=bp)
+    if not bp:
+        return set(C) - passed
+    res = yield bp, False
+    bpass = {n for n, st in res.items() if st == "P"}
+    bfail = {n for n in bp if res.get(n) != "P"}
+    passed = passed | bpass
+    failed = failed | bfail
+    if len(bfail) >= BREADTH * len(bp):
+        return set(C) - passed
+    fail_files = {FILE_OF.get(n, "") for n in failed}
+    drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
+    return set(C) - passed - drop
 
 
 class Scheduler:
