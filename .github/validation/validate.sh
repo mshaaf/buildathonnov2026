@@ -46,7 +46,7 @@ if usec is None:
     # waited on are this process's children.
     r = resource.getrusage(resource.RUSAGE_CHILDREN)
     usec = int((r.ru_utime + r.ru_stime) * 1_000_000)
-print("CPU_USEC", usec, file=sys.stderr)
+print("\nCPU_USEC", usec, file=sys.stderr)
 sys.exit(result.returncode)
 PY
 
@@ -79,7 +79,7 @@ for batch in sample targeted; do
                 docker rm -f "$name" || true
                 exit 1
             fi
-            cpu="$(awk '/^CPU_USEC / {printf "%.6f", $2 / 1000000}' "$prefix.log")"
+            cpu="$(awk 'match($0, /CPU_USEC [0-9]+/) {split(substr($0, RSTART, RLENGTH), a, " "); printf "%.6f", a[2] / 1000000}' "$prefix.log")"
             printf '\n%s %s run %s\n' "$batch" "$label" "$run"
             python3 "$kit/score.py" "$data" "$data/answers.json" "$prefix.jsonl" --cpu-seconds "$cpu" | tee "$prefix.score"
             grep -E 'checked affected TPC-DS' "$prefix.log" || true
