@@ -115,6 +115,8 @@ class Analyzer:
         self.all = all_mask
         self.lazy_mask = lazy_mask
         self._trees: dict = {}
+        profile = SRC / ".rwx-tokenizer.json"
+        self.tokenizer = json.loads(profile.read_text()) if ATTR_NARROW and not BROAD and profile.is_file() else {}
 
     def old_source(self, rel: str) -> str | None:
         p = SRC / rel
@@ -207,7 +209,7 @@ class Analyzer:
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
 
-    def python_file(self, fp, rel: str, why: list) -> int:
+    def python_file(self, fp, rel: str, why: list, single_file=False) -> int:
         old = self.old_source(rel)
         if old is None:
             raise ValueError(f"missing base source: {rel}")
@@ -224,13 +226,21 @@ class Analyzer:
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
-        old_changed, _ = changed_lines(fp.hunks)
+        old_changed, added = changed_lines(fp.hunks)
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
                 mask |= self.map.file_mask(rel)
                 continue
-            mask |= self.site_mask(rel, site, why)
+            candidates = self.site_mask(rel, site, why)
+            if (single_file and self.tokenizer and old_changed == added == {ln}
+                    and site.kind == "import" and site.class_key(rel) in self.tokenizer["classes"]):
+                name = flipped_bool(site.stmt, old.splitlines()[ln - 1], new.splitlines()[ln - 1])
+                readers = self.tokenizer["flags"].get(name)
+                if readers is not None:
+                    candidates = (candidates & int(readers, 16)) | self.lazy_mask
+                    why.append(f"{name} consumers -> {candidates.bit_count()}")
+            mask |= candidates
         # Pure insertions: use the old lines around each insertion point.
         for anchor in insertion_anchors(fp.hunks):
             for ln in anchor:
@@ -257,7 +267,7 @@ class Analyzer:
         for fp in files:
             rel = fp.path
             if rel.endswith(".py"):
-                mask |= self.python_file(fp, rel, why)
+                mask |= self.python_file(fp, rel, why, single_file=len(files) == 1)
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
                 if old is None:
@@ -276,6 +286,22 @@ class Analyzer:
             else:
                 why.append(f"other file {rel} -> nothing")
         return mask, why
+
+
+def flipped_bool(stmt, before, after):
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.lineno != stmt.end_lineno:
+        return None
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    value = stmt.value
+    if (len(targets) != 1 or not isinstance(targets[0], ast.Name)
+            or not isinstance(value, ast.Constant) or type(value.value) is not bool):
+        return None
+    # AST columns are UTF-8 byte offsets. Match the entire replacement line.
+    line = before.encode()
+    flipped = b"False" if value.value else b"True"
+    if line[:value.col_offset] + flipped + line[value.end_col_offset:] == after.encode():
+        return targets[0].id
+    return None
 
 
 def _base_name(b) -> str:
