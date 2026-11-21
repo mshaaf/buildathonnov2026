@@ -29,12 +29,24 @@ import subprocess
 import sys
 from pathlib import Path
 
+import resource
+
 result = subprocess.run([sys.executable, "/app/rwx/selector.py"])
-for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines():
-    key, value = line.split()
-    if key == "usage_usec":
-        print("CPU_USEC", value, file=sys.stderr)
-        break
+usec = None
+try:
+    for line in Path("/sys/fs/cgroup/cpu.stat").read_text().splitlines():
+        key, value = line.split()
+        if key == "usage_usec":
+            usec = int(value)
+            break
+except OSError:
+    pass
+if usec is None:
+    # cgroup v2 file missing (GitHub runners): the selector and every process it
+    # waited on are this process's children.
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    usec = int((r.ru_utime + r.ru_stime) * 1_000_000)
+print("CPU_USEC", usec, file=sys.stderr)
 sys.exit(result.returncode)
 PY
 
@@ -70,9 +82,9 @@ for batch in sample targeted; do
             cpu="$(awk '/^CPU_USEC / {printf "%.6f", $2 / 1000000}' "$prefix.log")"
             printf '\n%s %s run %s\n' "$batch" "$label" "$run"
             python3 "$kit/score.py" "$data" "$data/answers.json" "$prefix.jsonl" --cpu-seconds "$cpu" | tee "$prefix.score"
-            rg 'checked affected TPC-DS' "$prefix.log" || true
+            grep -E 'checked affected TPC-DS' "$prefix.log" || true
             awk -v batch="$batch" -v label="$label" '/^Total:/ {print batch, label, $2}' "$prefix.score" >> "$summary"
-            if ! rg -q '^Misses: +0 ' "$prefix.score"; then
+            if ! grep -qE '^Misses: +0 ' "$prefix.score"; then
                 exit 1
             fi
         done
