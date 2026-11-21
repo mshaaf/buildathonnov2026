@@ -427,6 +427,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
+FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
@@ -544,6 +545,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
             probe2 += related
             evidenced.add(g)
     probe2 += _spread([n for n in remaining if n not in set(probe2)], batch_cost(probe2) + PROBE2_MS, 4, already=probe2, focus=focus)
+    probe2 = list(dict.fromkeys(probe2))
     if not probe2:
         return set(C) - passed
     res2 = yield probe2, True
@@ -562,7 +564,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     remaining = [n for n in rest if n not in passed]
     mandatory = set(heavy) & NO_RUN
     savings = _pack_cost(selected) - _pack_cost(mandatory)
-    if not remaining or batch_cost(remaining) > savings:
+    if not remaining or batch_cost(remaining) > FINAL_FRAC * savings:
         return selected
 
     # Both probes passed. Spend at most the remaining worker cost to finish

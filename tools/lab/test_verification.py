@@ -89,21 +89,24 @@ class VerificationTests(unittest.TestCase):
             self.assertEqual(result.exception.value, {1, 2})
 
     def test_final_batch_uses_the_giants_own_probe_evidence(self):
+        # v4 rule: a giant is cleared only by ALL runnable candidates from its own test
+        # file (here the executor tests 1-4 left after probe 1), then the final batch
+        # checks the rest.
         durations = {n: 1 for n in range(7)} | {7: 9000}
         files = {n: "executor" if n <= 4 or n == 7 else "parser" for n in durations}
         cases = [
-            ({4: "P", 5: "P", 6: "P"}, set()),
-            ({4: "P", 5: "F"}, {5, 6}),
-            ({4: "F"}, {4, 5, 6, 7}),
-            ({}, {4, 5, 6, 7}),
+            ({5: "P", 6: "P"}, set()),
+            ({5: "P", 6: "F"}, {6}),
+            ({5: "F"}, {5, 6}),
+            ({}, {5, 6, 7}),
         ]
         for response, expected in cases:
             with self.subTest(response=response), patch.multiple(selector, DUR=durations, FILE_OF=files):
-                with patch.object(selector, "_spread", side_effect=[[0], [1, 2, 3], []]):
+                with patch.object(selector, "_spread", side_effect=[[0], []]):
                     gen = selector._probe_then_decide(list(durations), list(range(7)), [7], durations, {})
                     self.assertEqual(next(gen), ([0], True))
-                    self.assertEqual(gen.send({0: "P"}), ([1, 2, 3], True))
-                    self.assertEqual(gen.send({1: "P", 2: "P", 3: "P"}), ([4, 5, 6], True))
+                    self.assertEqual(gen.send({0: "P"}), ([1, 2, 3, 4], True))
+                    self.assertEqual(gen.send({1: "P", 2: "P", 3: "P", 4: "P"}), ([5, 6], True))
                     with self.assertRaises(StopIteration) as done:
                         gen.send(response)
                     self.assertEqual(done.exception.value, expected)
