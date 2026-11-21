@@ -210,24 +210,18 @@ class Analyzer:
     def python_file(self, fp, rel: str, why: list) -> int:
         old = self.old_source(rel)
         if old is None:
-            # New module: tests that walk/import its package could see it.
-            pkg = rel.rsplit("/", 1)[0] + "/"
-            why.append(f"new file {rel}")
-            return self.map.prefix_mask(pkg + "__init__.py")
-        if fp.new_path is None:
-            why.append(f"deleted {rel}")
-            return self.map.file_mask(rel) or self.all
+            raise ValueError(f"missing base source: {rel}")
         new = apply_hunks(old, fp.hunks)
-        eq = ast_equal(old, new)
-        if eq is not True:
+        tree = self.tree(rel, old)
+        equal = ast_equal(tree, new)
+        if equal is None:
             self.py_changes[rel] = (old, new)
-        if eq is True:
-            why.append(f"{rel}: AST unchanged")
-            return 0
-        if eq is None:
             why.append(f"{rel}: SYNTAX ERROR -> importers")
             return self.map.file_mask(rel) or self.all
-        tree = self.tree(rel, old)
+        if equal:
+            why.append(f"{rel}: AST unchanged")
+            return 0
+        self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
         old_changed, _ = changed_lines(fp.hunks)
@@ -257,18 +251,18 @@ class Analyzer:
         mask = 0
         self.py_changes: dict = {}
         self.data_changes: dict = {}
-        for fp in parse_patch(text):
+        files = parse_patch(text)
+        if any(fp.binary or fp.old_path != fp.new_path for fp in files):
+            return self.all, ["file creation, removal, rename or binary change -> ALL"]
+        for fp in files:
             rel = fp.path
-            if fp.binary:
-                why.append(f"binary {rel} -> ALL")
-                mask |= self.all
-                continue
             if rel.endswith(".py"):
                 mask |= self.python_file(fp, rel, why)
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
-                if old is not None and fp.new_path is not None:
-                    self.data_changes[rel] = apply_hunks(old, fp.hunks)
+                if old is None:
+                    raise ValueError(f"missing base fixture: {rel}")
+                self.data_changes[rel] = apply_hunks(old, fp.hunks)
                 m = self.map.opens.get(rel)
                 fm = self.map.masks[m] if m is not None else 0
                 if fm == 0 and fp.old_path is not None:
@@ -359,13 +353,12 @@ ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
     """Generator: yields (tests, stop_first) batches, receives {n: 'P'|'F'}, returns the final set.
 
-    Sound for every test it runs or includes. The one gamble: when every runnable
-    candidate ran and passed, the very slow unrunnable ones (>= SKIP_MIN_MS recorded)
-    are left out as well."""
+    Passing probes can clear a giant on evidence from its test file. A clean
+    run of every runnable candidate can also clear the other heavy tests."""
     if not C:
         return set()
     if data_only:
-        return set(C)  # an edited fixture line almost always breaks the tests reading it
+        return set(C)  # Fixture edits and patches the engine cannot apply stay static.
     if known:
         # Tests reading an edited data file: included as they are, never run here.
         rest_gen = policy([n for n in C if n not in known], dur, False, focus, None)
@@ -386,6 +379,8 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         passed = {n for n, st in res.items() if st == "P"}
         if failed:
             return (yield from _live(C, rest, heavy, passed, failed))
+        if len(passed) != len(rest):
+            return set(C) - passed
         if CLEAN_SKIPS_HEAVY:
             # Every runnable candidate passed: in the lab no slow test ever failed then.
             return {n for n in heavy if n in NO_RUN}
@@ -481,8 +476,26 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     # A giant goes only when its own test file showed clean evidence (or has no runnable
     # candidates at all, the case the lab saw no failures in).
     has_related = {g for g in giants if any(FILE_OF.get(n, "") == FILE_OF.get(g, "") for n in rest)}
-    drop = {g for g in giants if g in evidenced or g not in has_related}
-    return set(C) - passed - drop
+    drop = {g for g in giants if g not in NO_RUN and (g in evidenced or g not in has_related)}
+    selected = set(C) - passed - drop
+    if not drop or not CLEAN_SKIPS_HEAVY:
+        return selected
+    remaining = [n for n in rest if n not in passed]
+    mandatory = set(heavy) & NO_RUN
+    savings = _pack_cost(selected) - _pack_cost(mandatory)
+    if not remaining or batch_cost(remaining) > savings:
+        return selected
+
+    # Both probes passed. Spend at most the remaining worker cost to finish
+    # checking the runnable tests, keeping the evidence for each giant's file.
+    final = yield remaining, True
+    clean = {n for n, status in final.items() if status == "P"}
+    if len(clean) == len(remaining):
+        return mandatory
+    failed_files = {FILE_OF[n] for n, status in final.items() if status == "F"}
+    if not failed_files:
+        return set(C) - passed - clean
+    return (selected - clean) | {g for g in drop if g not in has_related or FILE_OF[g] in failed_files}
 
 
 NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
@@ -646,7 +659,8 @@ def main() -> None:
             mask, why, py, data = valid, [f"analyzer error {e!r} -> ALL"], {}, {}
         mask &= valid
         C = [n for n in dur if mask >> n & 1]
-        data_only = bool(data) and not py
+        # No patched Python to verify, including analysis failures and unsupported diffs.
+        data_only = not py
         log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
         known = set()
         for rel in data:
