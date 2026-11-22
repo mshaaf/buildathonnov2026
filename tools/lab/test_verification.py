@@ -125,7 +125,7 @@ class WatchdogTests(unittest.TestCase):
 
         seen = []
 
-        def fake_policy(C, dur, data_only, focus=None, known=None):
+        def fake_policy(C, dur, data_only, focus=None, known=None, **kw):
             res = yield [0, 1, 2, 3], stop_first
             seen.append(dict(res))
             return {n for n, st in res.items() if st == "F"} | (set(C) - set(res))
@@ -165,7 +165,7 @@ class ImportHangTests(unittest.TestCase):
             engine.plan = lambda changes: ("reimport", "test")
             py = {"tests/__init__.py": ("", ""), "tests/zz_hang.py": ("", "while True:\n    pass\n")}
 
-            def fake_policy(C, dur, data_only, focus=None, known=None):
+            def fake_policy(C, dur, data_only, focus=None, known=None, **kw):
                 res = yield [0], True
                 return set(C) - {n for n, st in res.items() if st == "P"}
 
