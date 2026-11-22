@@ -573,13 +573,12 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (10:12 EST):** the page marks BB-1BF787EF, `f3c6e42` (C3, 116.1) as "Entered in
-the final (your pick)" and warns it is not our best score. **Interim recommendation: re-pick
-BB-4199A4AB, `8192e1c` (C7, 111.5).** **Intended final: C10
-`4ab0a81a244120bc747b4c255eb4d98269dea542` (branch `opt-c10`)**, once it has scored with 0
-misses (submitting at 10:25). Lock the pick by 10:50; nothing new after that.
-PLEASE do not use a submission slot before 10:50 without checking with Ali: the four slots
-at 10:25, 10:33, 10:40 and 10:45 are the last ones.
+**FINAL ENTRY (10:38 EST): BB-4B2DCD7C, commit `b52a7d580eea70793b01776946f72b866cb9e778`
+(C14, branch `opt-c14`), 111.2 s = 101.94 simulated + 9.1 to 9.3 CPU, 0 misses.** Picked by hand
+by Ali; the page shows it as "Entered in the final (your pick)". The yellow "not your best
+score" warning refers to the 109.6 diagnostic (`3b7f152`), which misses 2 of the 30 samples:
+do NOT re-pick that one. Fallback if anything is wrong with C14: BB-4199A4AB (`8192e1c`, C7,
+111.5). Do not submit or re-pick anything else before the cutoff without talking to Ali.
 
 ### What the gate is
 
@@ -784,3 +783,32 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
   Expected on practice: about 110.4.
 - A fresh agent is profiling the final build for output-identical CPU cuts (report 10:32);
   anything from it goes in only if trivially safe.
+
+### Update 10:38 EST: final entry
+
+- **C14 `b52a7d5` (branch `opt-c14`) scored 111.2 and is the final entry.** Contents: the
+  TPC-DS evidence gate (500 ms, unguarded) with mshaaf's build-time duckdb answers
+  (`RWX_TPCDS_EXPECTED=1`); the per-query manifest fix; and/or profiles; all eight
+  cloud-review fixes; the non-UTF-8 fixture fix; per-kind probes with the reviewed classifier
+  (small probes for one-token mutations, 1000/2000 ms probes and finishing share 2 for every
+  other kind of edit); `RWX_STRICT_BLIND_GUARD=0`.
+- What went wrong on the way: C11 `6507ffd` scored 130.8 (123.394 simulated, base CPU, 0
+  misses). The gate guard that C8 added for unfamiliar kinds of edit (keep TPC-DS when 4 or
+  more other executor tests fail) blocked the gate on the one practice commit that matters,
+  which is therefore an unfamiliar kind of edit. C14 is C11 with that guard switched off by
+  the ENV line only, which the 111.2 confirms. Lesson already in this file: nothing gets
+  picked before it has scored.
+- Found by a fresh agent sweeping about 40 kinds of commit against the final code: a fixture
+  edit that adds a byte that is not valid UTF-8 (even in a comment) printed nothing, while
+  `tests/helpers` opens fixtures as UTF-8 and the reading test fails. Fixed in `6507ffd`
+  (every reader of such a fixture is selected statically). Nothing else in that sweep printed
+  nothing or a narrow set wrongly. Stress run: 111 commits (81 odd + 30 samples) in one batch,
+  exit 0, 111 valid lines, 27 s wall natively, 360 MB peak; with the scheduler budget forced
+  to 8 s it still exits cleanly with every line (sessions cut, static sets printed).
+- Not taken, on purpose: C13 `0751d97` (C14 with 1000/2000 ms probes on every commit; lab
+  misses 14 instead of 24 over 483 commits; expected about 115.7; never submitted); an
+  InlinePool change that skips re-pickling the TPC tables (`opt-sprint10` aa18d17, about 0.3
+  to 0.6 s on the board); an empty-`conftest.py` narrowing (`opt-simsprint` e479c4d).
+- Lab record of the final entry's settings: 24 misses in 483 synthetic commits (all from the
+  clean bet on one-token mutations, none involving TPC-DS); 0 misses on the 30 samples, on the
+  practice board, and on the 58 commits with answers in the stress run.
