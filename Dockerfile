@@ -30,7 +30,7 @@ COPY --from=sqlglotsrc /sqlglot /sqlglot
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests > /dev/null || true
 COPY rwx /app/rwx
 RUN python -m compileall -q /app/rwx > /dev/null && chmod -R a+rX /app /sqlglot
-ENV RWX_TPCDS_STAGES=1 RWX_MAXNODES_PROXY=1 RWX_BET_CLEAN=1 RWX_NARROW=1 RWX_NARROW_SKIP_MS=1000 RWX_NARROW_CHUNKS=0 RWX_FIXTURE_RUN=1 RWX_PRESETUP_CACHE=1 RWX_LAZY_RUN=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+ENV RWX_DIAG_MODE=tpcds_if RWX_DIAG_PROP=postcode RWX_TPCDS_STAGES=1 RWX_MAXNODES_PROXY=1 RWX_BET_CLEAN=1 RWX_NARROW=1 RWX_NARROW_SKIP_MS=1000 RWX_NARROW_CHUNKS=0 RWX_FIXTURE_RUN=1 RWX_PRESETUP_CACHE=1 RWX_LAZY_RUN=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 RUN python /app/rwx/executor_fixture.py /sqlglot && chmod a+r /sqlglot/.rwx-executor.json
 RUN python /app/rwx/tokenizer_coverage.py /sqlglot && chmod a+r /sqlglot/.rwx-tokenizer.json
 RUN python /app/rwx/executor_cases.py /sqlglot && chmod a+r /sqlglot/.rwx-executor-cases.json
