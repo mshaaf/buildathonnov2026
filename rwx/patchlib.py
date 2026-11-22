@@ -467,11 +467,14 @@ def expr_safe(e, known=frozenset()) -> bool:
 
 
 def _hashable(k) -> bool:
+    """Certainly hashable as a new dict key / set element. A name or attribute may hold a
+    list or dict (TypeError): it is accepted only where the same key or element already
+    appears in the old literal (value_safe checks that before calling this)."""
     if isinstance(k, ast.Constant):
         return True
     if isinstance(k, ast.Tuple):
         return all(_hashable(x) for x in k.elts)
-    return isinstance(k, (ast.Name, ast.Attribute, ast.Lambda))
+    return isinstance(k, ast.Lambda)
 
 
 def dotted(e) -> str | None:
@@ -505,7 +508,9 @@ def value_safe(a, b, known=frozenset()) -> bool:
                 twin = [ov for ok, ov in old if ok is not None and k is not None and _same_syntax(k, ok)]
                 if k is None:
                     return False
-                if not (_hashable(k) and (twin or expr_safe(k, known))):
+                key_form = _hashable(k) or isinstance(k, (ast.Name, ast.Attribute)) or (
+                    isinstance(k, ast.Tuple) and all(_hashable(x) or isinstance(x, (ast.Name, ast.Attribute)) for x in k.elts))
+                if not (key_form and (twin or (_hashable(k) and expr_safe(k, known)))):
                     return False
                 if not (expr_safe(v, known) or any(value_safe(ov, v, known) for ov in twin)):
                     return False
