@@ -568,3 +568,77 @@ after an affected test ran in the same process).
 - Ali's session submits through a Codex agent driving the browser; it only works while the
   Mac screen is unlocked.
 - Cutoff: Sunday 11:00 AM EST.
+
+## 16. Sunday morning (Nov 22, from 08:15 EST): the TPC-DS gate, live status
+
+Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
+
+**FINAL ENTRY, still open at 08:55 EST:** the page still marks `3b7f152` (109.6, the blind
+diagnostic, 2 misses on the 30 samples) as "Entered in the final". Someone has to click
+"Pick as our final entry" on a safe build. Best safe candidate right now: **BB-A0EE91C1,
+`343cf5a1c8044a1d6c6ff463822e1a4815cfe200`, branch `opt-gate-ng`, 113.3**.
+
+### What the gate is
+
+`RWX_TPCDS_BLIND_MS` (branches `opt-gate`, `opt-gate-ng`, both on top of `00762c6`): when the
+policy would print `test_execute_tpcds` unrun and the per-query check does not apply, the
+session runs the cheapest TPC-DS queries up to that budget (ms, estimated) through the real
+test. A pass leaves the test out; a failure stops at the first failing query and keeps it.
+It also covers code + non-TPC-fixture commits and several changed files. When the affected
+queries are known but too many to verify, the cheapest affected ones are used instead. It no
+longer re-checks commits where the policy had already left TPC-DS out (that cost 3 to 5 s).
+Of the 99 queries only 57 are executed by the test (`execute: true`); the other 42 are only
+parsed and cost 3 to 15 ms each, so a 500 ms budget is 42 parsed + 1 executed query, and
+1500 ms is 42 parsed + about 5 executed.
+
+### Board this morning (practice, 3 runs each, all 0 misses)
+
+| Commit (branch) | Simulated | CPU | Score | What |
+|---|---|---|---|---|
+| `c356ee4` | 101.94 | 10.3 to 12.1 | 114.0 | gate, 500 ms, no guard, with the re-check on already-dropped commits |
+| `2a8de13` | 123.394 | 7.2 to 8.0 | 131.0 | gate kept TPC-DS when any other executor test failed: blocks the practice commit |
+| `851cb8d` (opt-gate) | 123.394 | 7.1 to 7.2 | 130.6 | guard at 4 or more other executor failures: still blocks it |
+| **`343cf5a` (opt-gate-ng)** | **101.94** | 11.2 to 11.5 | **113.3** | gate, 1500 ms, no guard, no re-check |
+
+What this says about the one practice commit that costs 21.454 s: it prints TPC-DS plus small
+tests summing to at most 2 s on one worker; at least 4 other tests of `tests/test_executor.py`
+really fail there while TPC-DS passes; the per-query check does not apply to it. The
+`diag-tpcds-*` property diagnostics are not needed any more for `execfail` (answer: yes).
+One gate pass costs about 4 s of board CPU at 1500 ms (about 2.5x the native Mac figure).
+Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
+
+### Lab evidence for the gate
+
+- Samples: output byte-identical to `00762c6` (94.581 s, 0 misses) for every variant; `2jrq`
+  and `3utz` (TPC-DS really fails) keep TPC-DS.
+- Real selector end to end over s1, s2, s3, multi, multix, cmpx, boolx (483 commits with
+  truth; `scratch-lead/e2e/e2e.sh`, `score.py`): the gate adds no miss, with or without a
+  guard, at 500 and 1500 ms. Misses stay at the 28 that `00762c6`'s settings already have
+  there (the known `RWX_BET_CLEAN` misses on synthetic commits). No miss involves TPC-DS.
+- Lab truth, commits where another executor test fails and TPC-DS is a candidate: TPC-DS
+  fails on 27 of 41. Run alone in a fresh session the gate passes on two of those
+  (`s1/m41010113`, `s2/m41020010`); in the real session, after the other candidates ran, it
+  fails or times out on both and TPC-DS stays. So the gate is evidence, not proof.
+- `executor_cases.affected_cases` returns no queries for a code object that is missing from
+  the profile (one-line lambdas have no LINE coverage), so the "verify" passes with zero
+  queries. `s3/l41030000` (`"GTE"` lambda in `executor/env.py`, TPC-DS really fails) is only
+  saved by the import-time rule that prints all importers. Being fixed on `opt-dig2`.
+
+### In progress (not pushed unless listed above)
+
+- `opt-dig2` (agent, local): sound per-query check for one-line code and for several files /
+  non-TPC fixture edits (`RWX_TPCDS_WIDE`), to turn the gate's bet into a proof where possible.
+- `opt-sim` (agent, local): simulated-time experiments behind switches, all off.
+- `opt-final` (local): `opt-gate` + `RWX_FAST_CMP` (faster patch analysis, output identical on
+  every corpus, about 0.1 to 0.2 s on the board).
+- Being measured: larger probes before the clean bet (`RWX_PROBE_MS=1000 RWX_PROBE2_MS=2000`)
+  against the 28 lab misses.
+- CPU: an agent measured the samples natively (parent about 0.9 s, sessions about 2.5 s) and
+  found nothing output-neutral beyond `RWX_FAST_CMP`.
+
+### Operations
+
+- Submissions are a rolling 4 per hour. Ali's session used 4 between 8:24 and 8:44; slots
+  free up at 9:24, 9:31, 9:37 and 9:44. Say so in the team chat before using one.
+- Ali's lab is on his Mac (`blast-lab/`); the previous lead session was lost in a reboot at
+  about 08:08 EST and this section restarts from its files.
