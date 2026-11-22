@@ -456,6 +456,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
+WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
 BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
@@ -691,6 +692,8 @@ class Scheduler:
                 if not sess.alive and sess.crash is None and len(sess.results) < len(batch) and not sess.expired():
                     pass
                 res = dict(sess.results)
+                if any(st == "F" for st in res.values()):
+                    LIVE.add(cid)
                 if not sess.alive:
                     # crashed or killed: whatever did not report counts as failing
                     for n in batch:
@@ -744,6 +747,7 @@ class Scheduler:
 
 
 DUR: dict = {}
+LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
@@ -845,7 +849,10 @@ def main() -> None:
                 CLS_OF.get(n) == exec_cls and n not in NO_RUN and CPU_EST.get(n, dur[n]) <= RUN_MAX_MS
                 for _, C, _, _, data_only, *_ in jobs if not data_only for n in C
             )
-            eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else ())
+            # Warm up only the test modules some commit may actually run.
+            needed = {n for _, C, _, _, data_only, *_ in jobs if not data_only for n in C}
+            eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else (),
+                         needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:
                 CLS_SETUP[exec_cls] = 0
             log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
@@ -862,6 +869,9 @@ def main() -> None:
         final_set, note = results.get(cid, (set(C), "static"))
         if diag_min and diag_min <= len(C) <= diag_max:
             final_set, note = set(), "diagnostic: printed nothing"
+        diag_mode = os.environ.get("RWX_DIAG_MODE", "")
+        if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
+            final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
         nums = sorted(final_set)
         workers = pack(nums, dur)
         cost = (max(sum(dur[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0

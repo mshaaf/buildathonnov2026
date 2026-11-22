@@ -231,7 +231,7 @@ class StreamResult(unittest.TestResult):
 
 
 class Engine:
-    def __init__(self, src_root: str, tests: list[dict], log=None, presetup=()):
+    def __init__(self, src_root: str, tests: list[dict], log=None, presetup=(), needed=None):
         self.root = src_root.rstrip("/")
         self.log = log or (lambda *a: None)
         self.tests = {t["number"]: t for t in tests}
@@ -245,7 +245,8 @@ class Engine:
         install_inline_pool()
         if self.root not in sys.path:
             sys.path.insert(0, self.root)
-        mods = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests})
+        mods = sorted({t["id"].split("::")[0][:-3].replace("/", ".") for t in tests
+                       if needed is None or t["number"] in needed})
         self._warm(mods, presetup)
         self._index_functions()
         _LazyDuckModule.recording = False
