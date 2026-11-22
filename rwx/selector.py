@@ -633,7 +633,13 @@ class Analyzer:
             return mask | self.importers(rel)
         mask |= self.import_blocks(rel, tree, new_tree, hunks, loc, why)
         if flips and (CMP_PROFILE or BOOL_PROFILE) and not BROAD:
-            mask = self.compare_narrow(rel, flips, mask, why)
+            risky = [(ln, c) for ln, c, op, _ in flips if op in ("and", "or") and _bool_rhs_may_raise(tree, ln, c)]
+            if risky and BOOL_RHS_GUARD:
+                # the pinned run evaluating a raising right operand left no profile record,
+                # and the flipped operator would skip it: no narrowing
+                why.append(f"and/or flip at {risky[0][0]}:{risky[0][1]}: right operand may raise, no narrowing")
+            else:
+                mask = self.compare_narrow(rel, flips, mask, why)
         return mask
 
     def lambda_outer(self, rel, loc, site, ln, why, inserted=False) -> int:
@@ -1075,10 +1081,12 @@ def _import_time(site) -> bool:
 
 CMP_PROFILE = os.environ.get("RWX_CMP_PROFILE", "1") == "1"
 BOOL_PROFILE = os.environ.get("RWX_BOOL_PROFILE", "0") == "1"  # and/or flips (needs bool_sites)
+BOOL_RHS_GUARD = os.environ.get("RWX_BOOL_RHS_GUARD", "0") == "1"  # and/or: no narrowing when the right operand may raise (off: see commit message)
 CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
            ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
 _ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
 # family recorded for each original operator (tools/lab/cmprun.py), in vector order
+_ORD_RAISING = ("<", "<=", ">", ">=")  # raise together on unorderable operands
 CMP_FAMILIES = {"<": _ORD, "<=": _ORD, ">": _ORD, ">=": _ORD, "==": _IDE, "!=": _IDE,
                 "is": _IDE, "is not": _IDE, "in": _MEM, "not in": _MEM}
 
@@ -1093,6 +1101,10 @@ def _cmp_keep(cmap, rel, line, col, old_op, new_op):
         return None
     fam = CMP_FAMILIES.get(old_op)
     if fam is None or new_op not in fam:
+        return None
+    if old_op in _ORD_RAISING and new_op not in _ORD_RAISING:
+        # An evaluation where old_op raised (None < 1, caught by sqlglot or the test) left
+        # no record, but == / != would not raise there: the profile cannot see that test.
         return None
     i, j = fam.index(old_op), fam.index(new_op)
     keep = cmap.cmp_unprofiled
@@ -1127,6 +1139,28 @@ def compare_flip(old_tree, new_tree):
     single-operator comparison and nowhere else; None otherwise."""
     flips = compare_flips(old_tree, new_tree)
     return flips[0] if flips and len(flips) == 1 else None
+
+
+def _bool_rhs_may_raise(tree, line, col) -> bool:
+    """The right operand of the two-operand and/or at (line, col) could raise when evaluated
+    (attribute lookups, ==/!= with a custom __eq__, ...). Only names, constants, `not` and
+    is / is not between those count as unable to raise. Not found: may raise."""
+    found = False
+    for node in ast.walk(tree):
+        # nested BoolOps can share a position: every one there must be safe
+        if isinstance(node, ast.BoolOp) and node.lineno == line and node.col_offset == col:
+            found = True
+            if len(node.values) != 2:
+                return True
+            for sub in ast.walk(node.values[1]):
+                if isinstance(sub, (ast.Name, ast.Constant, ast.Load, ast.Not, ast.Is, ast.IsNot)):
+                    continue
+                if isinstance(sub, ast.UnaryOp) and isinstance(sub.op, ast.Not):
+                    continue
+                if isinstance(sub, ast.Compare) and all(isinstance(o, (ast.Is, ast.IsNot)) for o in sub.ops):
+                    continue
+                return True
+    return not found
 
 
 def compare_flips(old_tree, new_tree):
