@@ -1449,6 +1449,66 @@ PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
 BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"
 BET_FINISH_FRAC = float(os.environ.get("RWX_BET_FINISH_FRAC", "1.0"))  # bet: finish verifying only when this cheap
+# RWX_KIND_PROBES=1: the probe sizes and the finishing share above apply only to commits whose
+# Python edits are all one-token mutations (an operator flipped, a `not` dropped or added, a
+# literal changed): the only code edits of the 70 practice and sample commits, on which the
+# clean bet was never wrong. Every other kind of edit gets the strict values below. The lab's
+# mutants show what the bet costs when a kind behaves differently (28 misses in 483 commits
+# with the small probes, 14 with 1000/2000 ms, none left from the bet with the share at 2).
+KIND_PROBES = os.environ.get("RWX_KIND_PROBES", "0") == "1"
+STRICT_PROBE_MS = int(os.environ.get("RWX_STRICT_PROBE_MS", "1000"))
+STRICT_PROBE2_MS = int(os.environ.get("RWX_STRICT_PROBE2_MS", "2000"))
+STRICT_FINISH_FRAC = float(os.environ.get("RWX_STRICT_FINISH_FRAC", "2.0"))
+_FLIP_OPS = frozenset("== != < <= > >= + - * / // % ** & | ^ << >> ~".split())
+_FLIP_WORDS = frozenset(("and", "or", "not", "is", "in", "True", "False", "None"))
+
+
+def _code_tokens(src: str) -> list:
+    import io
+    import tokenize as tk
+
+    skip = (tk.COMMENT, tk.NL, tk.NEWLINE, tk.INDENT, tk.DEDENT, tk.ENCODING, tk.ENDMARKER)
+    out = []
+    for t in tk.generate_tokens(io.StringIO(src).readline):
+        if t.type in skip:
+            continue
+        mutable = (t.type == tk.OP and t.string in _FLIP_OPS) or (t.type == tk.NAME and t.string in _FLIP_WORDS) \
+            or t.type in (tk.NUMBER, tk.STRING)
+        out.append((t.type, t.string, mutable))
+    return out
+
+
+def one_token_edit(old_src: str, new_src: str, limit: int = 4) -> bool:
+    """True when the two sources differ (comments and layout aside) in one short run of
+    tokens made only of operators, and/or/not/is/in, True/False/None and literals."""
+    try:
+        a, b = _code_tokens(old_src), _code_tokens(new_src)
+    except Exception:  # noqa: BLE001  (anything the tokenizer rejects is not a familiar edit)
+        return False
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    j = 0
+    while j < n - i and a[len(a) - 1 - j] == b[len(b) - 1 - j]:
+        j += 1
+    am, bm = a[i:len(a) - j], b[i:len(b) - j]
+    if len(am) > limit or len(bm) > limit:
+        return False
+    return all(t[2] for t in am) and all(t[2] for t in bm)
+
+
+def familiar_edit(py_changes) -> bool:
+    """Every changed Python file is a one-token mutation of its pinned source.
+    py_changes: {rel: (old source, new source)}."""
+    try:
+        for pair in (py_changes or {}).values():
+            old, new = pair
+            if not isinstance(old, str) or not isinstance(new, str) or not one_token_edit(old, new):
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 LIVE_FINISH = os.environ.get("RWX_LIVE_FINISH", "1") == "1"  # sound: finish verifying live commits when cheaper
 BET_LIVE = os.environ.get("RWX_BET_LIVE") == "1"  # experiment: drop unverified candidates on live commits  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
@@ -1483,11 +1543,11 @@ PROXY_OF: dict = {}  # slow test number -> number of its stand-in (filled by mai
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
-           dropped=None, proxy_ok: bool = True, cid=None):
+           dropped=None, proxy_ok: bool = True, cid=None, strict: bool = False):
     """The settled policy, then (RWX_MAXNODES_PROXY) a stand-in run for a slow test that is
     still printed unrun: when the scaled-down copy of the test passes on the patched tree,
     the slow test is left out. Evidence, not proof (like the other bets)."""
-    final = yield from _policy_settled(C, dur, data_only, focus, known, dropped, cid)
+    final = yield from _policy_settled(C, dur, data_only, focus, known, dropped, cid, strict)
     if not (MAXNODES_PROXY and proxy_ok and PROXY_OF) or data_only:
         return final
     final = set(final)
@@ -1502,10 +1562,10 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
 
 
 def _policy_settled(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
-                    dropped=None, cid=None):
+                    dropped=None, cid=None, strict: bool = False):
     """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
     runnable tests whose estimated CPU is worth less than the worker time they add."""
-    gen = _policy(C, dur, data_only, focus, known)
+    gen = _policy(C, dur, data_only, focus, known, strict)
     seen: dict = {}
     try:
         req = next(gen)
@@ -1726,7 +1786,8 @@ def _settle_batch(final, seen, known):
     return order[:best_j]
 
 
-def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
+def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
+            strict: bool = False):
     """Generator: yields (tests, stop_first) batches, receives {n: 'P'|'F'}, returns the final set.
 
     Passing probes can clear a giant on evidence from its test file. A clean
@@ -1737,7 +1798,7 @@ def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None,
         return set(C)  # Fixture edits and patches the engine cannot apply stay static.
     if known:
         # Tests reading an edited data file: included as they are, never run here.
-        rest_gen = _policy([n for n in C if n not in known], dur, False, focus, None)
+        rest_gen = _policy([n for n in C if n not in known], dur, False, focus, None, strict)
         return set(known) | (yield from rest_gen)
     heavy = [n for n in C if is_heavy(n)]
     hs = set(heavy)
@@ -1761,7 +1822,7 @@ def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None,
             # Every runnable candidate passed: in the lab no slow test ever failed then.
             return {n for n in heavy if n in NO_RUN}
         return {n for n in heavy if dur[n] < SKIP_MIN_MS}
-    return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}))
+    return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}, strict))
 
 
 def fixture_policy(C: list[int], runnable: list[int]):
@@ -1834,8 +1895,12 @@ def _spread(cands, budget, per_file_max, already=(), focus=None):
     return chosen[len(already):]
 
 
-def _probe_then_decide(C, rest, heavy, dur, focus):
-    probe = _spread(rest, PROBE_MS, 2, focus=focus)
+def _probe_then_decide(C, rest, heavy, dur, focus, strict=False):
+    probe_ms, probe2_ms, finish_frac = PROBE_MS, PROBE2_MS, BET_FINISH_FRAC
+    if strict:
+        probe_ms, probe2_ms = max(probe_ms, STRICT_PROBE_MS), max(probe2_ms, STRICT_PROBE2_MS)
+        finish_frac = max(finish_frac, STRICT_FINISH_FRAC)
+    probe = _spread(rest, probe_ms, 2, focus=focus)
     if not probe:
         cheapest = min(rest, key=lambda n: (batch_cost([n]), n))
         probe = [cheapest] if batch_cost([cheapest]) <= RUN_MAX_MS else []
@@ -1865,7 +1930,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         if batch_cost(probe2 + related) - batch_cost(probe2) <= RELATED_ALL_MS:
             probe2 += related
             evidenced.add(g)
-    probe2 += _spread([n for n in remaining if n not in set(probe2)], batch_cost(probe2) + PROBE2_MS, 4, already=probe2, focus=focus)
+    probe2 += _spread([n for n in remaining if n not in set(probe2)], batch_cost(probe2) + probe2_ms, 4, already=probe2, focus=focus)
     probe2 = list(dict.fromkeys(probe2))
     if not probe2:
         return set(C) - passed
@@ -1881,7 +1946,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         mandatory = set(heavy) & NO_RUN
         remaining = [n for n in rest if n not in passed]
         savings = _pack_cost(set(C) - passed) - _pack_cost(mandatory)
-        if remaining and batch_cost(remaining) <= BET_FINISH_FRAC * savings:
+        if remaining and batch_cost(remaining) <= finish_frac * savings:
             final = yield remaining, True
             failed3 = {n for n, st in final.items() if st == "F"}
             clean = {n for n, st in final.items() if st == "P"}
@@ -2254,6 +2319,9 @@ class Scheduler:
                     kw = {}
                     if MAXNODES_PROXY and any(rel.startswith("tests/") for rel in (py or ())):
                         kw["proxy_ok"] = False  # the patch edits test code: the stand-in copies the pinned test
+                    if KIND_PROBES and py and not familiar_edit(py):
+                        kw["strict"] = True
+                        log(f"{cid}: unfamiliar kind of edit -> strict probes")
                     gen = policy(C, DUR, data_only, focus, known, *extra, cid=cid, **kw)
                 try:
                     batch, stop_first = next(gen)
