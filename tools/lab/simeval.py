@@ -162,7 +162,6 @@ def load_truth(L):
 
 def main():
     rows, drops = [], {}
-    settle_peak = [0.0]
     skipped = [0]
     any_engine = False
     for L in sys.argv[1:]:
@@ -175,8 +174,12 @@ def main():
         lazy = sum(1 << n for n in sel.NO_RUN)
         an = sel.Analyzer(M, valid, lazy)
         truth = load_truth(L)
-        sel.SETTLE_BUDGET[0] = sel.SETTLE_BUDGET_PER_COMMIT_MS * len(truth)
-        sel.SETTLE_SPENT[0] = 0
+        verifiable = []
+        for cid in sorted(truth):
+            m, _ = an.analyze(open(f"{L}/commits/{cid}.patch").read())
+            if an.py_changes and m & valid:
+                verifiable.append([n for n in dur if m >> n & 1])
+        sel.set_settle_scale(len(truth), verifiable)
         for cid, (F, tcpu, unreliable, tcand, skipped_t) in sorted(truth.items()):
             mask, why = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             C = [n for n in dur if mask >> n & 1]
@@ -203,7 +206,6 @@ def main():
                     out |= {n for n in dur if deferred >> n & 1}
                     note += " +importers"
             any_engine |= bool(cpu)
-            settle_peak[0] = max(settle_peak[0], sel.SETTLE_SPENT[0] / max(1, len(truth)))
             # tests the truth run skipped have no known outcome: always printed, never dropped
             forced = (skipped_t & set(C)) - out
             if forced:
@@ -218,12 +220,11 @@ def main():
                     d[0] += 1
                     d[1] += n in F
             rows.append(dict(cid=f"{os.path.basename(L.rstrip('/'))}/{cid}", nC=len(C), nF=len(F), out=len(out), sim=sim,
-                             cpu=cpu, miss=miss, oracle=orc, cls=bucket(len(C), F, data_only), note=note,
+                             cpu=cpu, miss=miss, oracle=orc, cls=bucket(len(C), F, data_only), note=note, outs=sorted(out), fails=sorted(F), ran=sorted(ran),
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
     print(f"records skipped (current candidates not a subset of the truth run's): {skipped[0]}")
-    print(f"settle est CPU per commit (largest dir): {settle_peak[0]:.0f} ms (budget {sel.SETTLE_BUDGET_PER_COMMIT_MS} ms)")
 
 
 def report(rows, drops, warm):
