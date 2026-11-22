@@ -1467,10 +1467,15 @@ def _code_tokens(src: str) -> list:
     import io
     import tokenize as tk
 
-    skip = (tk.COMMENT, tk.NL, tk.NEWLINE, tk.INDENT, tk.DEDENT, tk.ENCODING, tk.ENDMARKER)
+    skip = (tk.COMMENT, tk.NL, tk.ENCODING, tk.ENDMARKER)
     out = []
     for t in tk.generate_tokens(io.StringIO(src).readline):
         if t.type in skip:
+            continue
+        if t.type in (tk.NEWLINE, tk.DEDENT):
+            # statement structure counts (never mutable): a moved, added or removed
+            # statement is not a one-token edit even when no other token changed
+            out.append((t.type, "", False))
             continue
         mutable = (t.type == tk.OP and t.string in _FLIP_OPS) or (t.type == tk.NAME and t.string in _FLIP_WORDS) \
             or t.type in (tk.NUMBER, tk.STRING)
@@ -1493,6 +1498,8 @@ def one_token_edit(old_src: str, new_src: str, limit: int = 4) -> bool:
     while j < n - i and a[len(a) - 1 - j] == b[len(b) - 1 - j]:
         j += 1
     am, bm = a[i:len(a) - j], b[i:len(b) - j]
+    if not am and not bm:
+        return False  # same tokens, yet the analyzer saw a change: not a token edit
     if len(am) > limit or len(bm) > limit:
         return False
     return all(t[2] for t in am) and all(t[2] for t in bm)
@@ -2202,11 +2209,27 @@ TPCDS_BLIND_GUARD = int(os.environ.get("RWX_TPCDS_BLIND_GUARD", "4"))
 # build turns it off: the gate has only been seen clearing TPC-DS correctly on one-token
 # mutations (practice, samples, lab).
 STRICT_BLIND_GUARD = int(os.environ.get("RWX_STRICT_BLIND_GUARD", "4"))
-STRICT_CIDS: set = set()  # commits whose policy runs with the strict settings
+STRICT_CIDS: dict = {}  # cid -> _LazyStrict: whether the commit runs with the strict settings
+
+
+class _LazyStrict:
+    """Truthy when the commit's edit is not familiar. Decided on first use (the probe step
+    or the TPC-DS gate), so commits that never get there never tokenize their files
+    (sqlglot/parser.py: about 0.1 s for both copies)."""
+
+    def __init__(self, cid, py):
+        self.cid, self.py, self.value = cid, py, None
+
+    def __bool__(self):
+        if self.value is None:
+            self.value = not familiar_edit(self.py)
+            if self.value:
+                log(f"{self.cid}: unfamiliar kind of edit -> strict probes")
+        return self.value
 
 
 def _blind_guard(cid) -> int:
-    if cid in STRICT_CIDS and STRICT_BLIND_GUARD:
+    if STRICT_CIDS.get(cid) and STRICT_BLIND_GUARD:
         return min(TPCDS_BLIND_GUARD, STRICT_BLIND_GUARD) if TPCDS_BLIND_GUARD else STRICT_BLIND_GUARD
     return TPCDS_BLIND_GUARD
 
@@ -2330,10 +2353,8 @@ class Scheduler:
                     kw = {}
                     if MAXNODES_PROXY and any(rel.startswith("tests/") for rel in (py or ())):
                         kw["proxy_ok"] = False  # the patch edits test code: the stand-in copies the pinned test
-                    if KIND_PROBES and py and not familiar_edit(py):
-                        kw["strict"] = True
-                        STRICT_CIDS.add(cid)
-                        log(f"{cid}: unfamiliar kind of edit -> strict probes")
+                    if KIND_PROBES and py:
+                        kw["strict"] = STRICT_CIDS[cid] = _LazyStrict(cid, py)
                     gen = policy(C, DUR, data_only, focus, known, *extra, cid=cid, **kw)
                 try:
                     batch, stop_first = next(gen)
