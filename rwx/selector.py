@@ -1329,6 +1329,8 @@ def _live(C, rest, heavy, passed, failed):
     """Something failed. Keep everything not proven passing, except slow tests that a
     narrow failure (few tests failing, none in the slow test's own file) cannot reach."""
     dur = DUR
+    if BET_FILE_N or BET_CLASS_N or BET_CONFINED:
+        return (yield from _live_bet(C, rest, heavy, passed, failed))
     if LIVE_FILE_FRAC > 0 or LIVE_REST_FRAC > 0:
         return (yield from _live_evidence(C, rest, heavy, passed, failed))
     skippable = [n for n in heavy if dur[n] >= NARROW_SKIP_MS and n not in NO_RUN]
@@ -1352,6 +1354,63 @@ def _live(C, rest, heavy, passed, failed):
     fail_files = {FILE_OF.get(n, "") for n in failed}
     drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
     return set(C) - passed - drop
+
+
+# BETS (lab measurement only, all off by default; each can create misses):
+#   RWX_BET_FILE_N=all|N    after a failure, drop a slow test (>= SKIP_MIN_MS recorded) when no
+#                           runnable candidate of its own test file failed and all / at least N
+#                           of them ran and passed (missing ones are run first)
+#   RWX_BET_CLASS_N=all|N   the same for mid-weight heavy tests (2 s to SKIP_MIN_MS) by test class
+#   RWX_BET_CONFINED=file|class  501+ candidates, failures confined to one file/class: print only
+#                           the failures and that file/class (plus slow tests kept by the rules above)
+BET_FILE_N = os.environ.get("RWX_BET_FILE_N", "")
+BET_CLASS_N = os.environ.get("RWX_BET_CLASS_N", "")
+BET_CONFINED = os.environ.get("RWX_BET_CONFINED", "")
+BET_MID_MS = 2000
+BET_BREADTH = float(os.environ.get("RWX_BET_BREADTH", "0.25"))  # no bet drops when more than this share of runs failed
+
+
+def _live_bet(C, rest, heavy, passed, failed):
+    passed, failed = set(passed), set(failed)
+    targets = []
+    for g in heavy:
+        if g in NO_RUN:
+            continue
+        if BET_FILE_N and DUR[g] >= SKIP_MIN_MS:
+            targets.append((g, FILE_OF, BET_FILE_N))
+        elif BET_CLASS_N and BET_MID_MS <= DUR[g] < SKIP_MIN_MS:
+            targets.append((g, CLS_OF, BET_CLASS_N))
+    plans, batch = {}, []
+    for g, group_of, rule in targets:
+        rel = [n for n in rest if group_of.get(n) == group_of.get(g)]
+        if not rel or any(n in failed for n in rel):
+            continue
+        need = len(rel) if rule == "all" else int(rule)
+        if need > len(rel):
+            continue
+        have = [n for n in rel if n in passed]
+        todo = sorted((n for n in rel if n not in passed and n not in batch), key=lambda n: (batch_cost([n]), n))
+        todo = todo[: max(0, need - len(have))] if rule != "all" else todo
+        if todo and batch_cost(batch + todo) - batch_cost(batch) > RELATED_ALL_MS:
+            continue
+        batch += todo
+        plans[g] = (rel, need)
+    if batch:
+        res = yield batch, False
+        passed |= {n for n, st in res.items() if st == "P"}
+        failed |= {n for n in batch if res.get(n) != "P"}
+    drop = {g for g, (rel, need) in plans.items()
+            if not any(n in failed for n in rel) and sum(n in passed for n in rel) >= need}
+    if len(failed) > BET_BREADTH * max(1, len(passed | failed)):
+        drop = set()  # broad breakage: slow tests fail with it (lab: giants fail on broad mutations)
+    selected = set(C) - passed - drop
+    if BET_CONFINED and len(C) > 500 and failed:
+        group_of = CLS_OF if BET_CONFINED == "class" else FILE_OF
+        groups = {group_of.get(n) for n in failed}
+        if len(groups) == 1:
+            # heavy tests outside the group stay unless a rule above dropped them
+            selected = {n for n in selected if n in failed or group_of.get(n) in groups or n in heavy}
+    return selected
 
 
 def _live_evidence(C, rest, heavy, passed, failed):

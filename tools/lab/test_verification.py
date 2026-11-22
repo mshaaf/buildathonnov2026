@@ -279,6 +279,19 @@ class VerificationTests(unittest.TestCase):
                 gen.send({0: "P"})  # settling [2, 1] would cost 101 ms
             self.assertEqual(done.exception.value, {1, 2, 3})
 
+    def test_bet_file_rule_drops_a_giant_only_on_own_file_evidence(self):
+        durations = {0: 1, 1: 1, 2: 1, 3: 1, 4: 9000}
+        files = {0: "a", 1: "a", 2: "g", 3: "g", 4: "g"}
+        for answer, expected in (({2: "P", 3: "P"}, {0, 1}), ({2: "P", 3: "F"}, {0, 1, 3, 4})):
+            with self.subTest(answer=answer), patch.multiple(
+                    selector, DUR=durations, CPU_EST=durations, CLS_SETUP={}, CLS_OF=files, FILE_OF=files,
+                    BET_FILE_N="all", BET_BREADTH=1.0):
+                gen = selector._live([0, 1, 2, 3, 4], [0, 1, 2, 3], [4], {9}, {0})
+                self.assertEqual(next(gen), ([2, 3], False))
+                with self.assertRaises(StopIteration) as done:
+                    gen.send(answer)
+                self.assertEqual(done.exception.value, expected)
+
     def test_settle_after_a_failure(self):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 1500, 3: 9000}

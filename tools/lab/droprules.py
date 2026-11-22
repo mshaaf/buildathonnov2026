@@ -56,6 +56,9 @@ def main():
                     and not any(n in F for n in relc)
                 fired["narrow"] = fired["file"] and len(rf) <= 0.03 * len(rest)
                 fired["norel"] = bool(rf) and not rel
+                cheap = sorted(rel, key=lambda n: (sel.batch_cost([n]), n))
+                for k in (10, 5, 3):
+                    fired[f"file_{k}"] = bool(rf) and len(rel) >= k and not any(n in F for n in cheap[:k])
                 for rule, on in fired.items():
                     if on:
                         s = stats.setdefault((names[g], rule), [0, 0, 0])
