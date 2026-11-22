@@ -516,11 +516,12 @@ class Analyzer:
     def added_file(self, rel: str, content, binary: bool, why: list) -> int:
         base = rel.rsplit("/", 1)[-1]
         if rel.endswith(".py"):
-            if base == "conftest.py" or "/" not in rel or rel.startswith("sqlglot/"):
-                # conftest: pytest loads it; root level: shadows imports; sqlglot/: dialects and
-                # optimizer passes are imported by computed names.
+            if base == "conftest.py" or "/" not in rel:
+                # conftest: pytest loads it; root level: may shadow any import
                 why.append(f"new {rel} -> ALL")
                 return self.all
+            if rel.startswith("sqlglot/"):
+                return self.new_module(rel, content, why)
             if _is_test_file(base):
                 if content is not None and _inert_module(content):
                     why.append(f"new test file {rel}: inert module -> nothing")
@@ -537,6 +538,28 @@ class Analyzer:
             return self.all
         why.append(f"new {rel}: nothing opens it")
         return 0
+
+    def new_module(self, rel: str, content, why: list) -> int:
+        """A new module under sqlglot/. Dialects and optimizer passes are imported by computed
+        names (`sqlglot.dialects.<key>`), so its name could be reached from any string.
+        Only when that name occurs nowhere in sqlglot/ or tests/ (not as a word, not in a
+        string) can nothing import it; then the observers are the directory listers:
+        sqlglotc/setup.py (test_sqlglotc) and, for sqlglot/typing, test_typing."""
+        parts = rel[: -len(".py")].split("/")
+        names = {parts[-1]} if parts[-1] != "__init__" else set()
+        names.add(parts[-2] if parts[-1] == "__init__" else parts[-1])
+        if _is_test_file(rel.rsplit("/", 1)[-1]) or any(n.startswith("_") and n.endswith("_") for n in names):
+            why.append(f"new {rel} -> ALL")
+            return self.all
+        words = source_words()
+        if words is None or any(n in words for n in names) or (SRC / rel[: -len(".py")]).exists():
+            why.append(f"new {rel}: its name is referenced (or shadows a package) -> ALL")
+            return self.all
+        mask = self.file_tests.get("tests/test_sqlglotc.py", 0)
+        if rel.startswith("sqlglot/typing/"):
+            mask |= self.file_tests.get("tests/test_typing.py", 0)
+        why.append(f"new {rel}: name unreferenced -> directory listers {mask.bit_count()}")
+        return mask
 
     def data_mask(self, rel: str, why: list, binary=False) -> int:
         m = self.map.opens.get(rel)
@@ -660,6 +683,27 @@ def _scope_nodes(tree, site) -> list:
         out.append(nxt)
         node = nxt
     return out
+
+
+_WORDS: list = []
+
+
+def source_words():
+    """Every identifier-like word in the pinned sqlglot/ and tests/ sources (lazy, once)."""
+    if not _WORDS:
+        words: set = set()
+        try:
+            if not (SRC / "sqlglot" / "__init__.py").is_file():
+                raise FileNotFoundError(SRC / "sqlglot")
+            for top in ("sqlglot", "tests"):
+                for p in (SRC / top).rglob("*"):
+                    if p.suffix in (".py", ".sql", ".json", ".txt", ".toml", ".cfg") and p.is_file():
+                        words.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", p.read_bytes().decode("utf-8", "replace")))
+            _WORDS.append(words)
+        except Exception as e:  # noqa: BLE001
+            log(f"source scan failed: {e!r}")
+            _WORDS.append(None)
+    return _WORDS[0]
 
 
 def _is_test_file(base: str) -> bool:

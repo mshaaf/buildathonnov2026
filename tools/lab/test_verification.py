@@ -252,6 +252,25 @@ class RobustnessTests(unittest.TestCase):
         with self.assertRaises(PatchMismatch):
             locate_hunks(old.replace("x3 = 3", "zz"), fp.hunks)
 
+    def test_new_module_only_reachable_by_its_name(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "sqlglot" / "dialects").mkdir(parents=True)
+            (src / "sqlglot" / "__init__.py").write_text("")
+            (src / "tests").mkdir()
+            (src / "tests" / "test_d.py").write_text('Dialect.get_or_raise("duck")\n')
+            fmap = FakeMap()
+            files = {"tests/test_sqlglotc.py": 0b1, "tests/test_typing.py": 0b10}
+            new = "diff --git a/sqlglot/dialects/{0}.py b/sqlglot/dialects/{0}.py\nnew file mode 100644\n--- /dev/null\n+++ b/sqlglot/dialects/{0}.py\n@@ -0,0 +1 @@\n+X = 1\n"
+            with patch.object(selector, "SRC", src):
+                selector._WORDS.clear()
+                analyzer = selector.Analyzer(fmap, 0xFF, file_tests=files)
+                self.assertEqual(analyzer.analyze(new.format("fresh"))[0], 0b1)
+                self.assertEqual(analyzer.analyze(new.format("duck"))[0], 0xFF)  # named in a test string
+            selector._WORDS.clear()
+
     def test_headers_without_prefixes(self):
         from patchlib import parse_patch
 
