@@ -506,13 +506,14 @@ class Engine:
         if data_changes:
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
         elif (
-            mode == "swap"
-            and py_changes
+            py_changes
             and all(rel.startswith("sqlglot/") for rel in py_changes)
-            and "tests/test_executor.py::TestExecutor" not in self.presetup_done
+            and (mode == "reimport" or "tests/test_executor.py::TestExecutor" not in self.presetup_done)
         ):
-            # Deferred fixture only when the parent did not already share the setup:
-            # wrapping a shared class would replace its data with lazy fields.
+            # Deferred fixture only when the parent's shared setup is not in use (a
+            # re-import builds a fresh class): wrapping a shared class would replace
+            # its data with lazy fields. install() checks that no source the setup
+            # runs is patched, so the setup cannot fail where the pinned one passed.
             from executor_fixture import install
 
             install(self.root, py_changes)
