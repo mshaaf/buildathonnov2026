@@ -1122,11 +1122,14 @@ def main() -> None:
         if diag_mode == "blind" and cid in OBSERVED:
             # diagnostic: on commits the engine ran, print only what a run saw failing
             final_set, note = set(OBSERVED[cid]), "diagnostic (blind): observed failures only"
-        if diag_mode == "heavy" and cid in OBSERVED:
+        if diag_mode == "heavy" and cid in OBSERVED and (py or os.environ.get("RWX_DIAG_PYONLY") != "1"):
             # diagnostic: on commits the engine ran, leave out every unrun slow test
+            # (RWX_DIAG_ONLY: only these test ids; RWX_DIAG_PYONLY=1: commits with Python changes)
             seen = OBSERVED[cid]
+            only = {t for t in os.environ.get("RWX_DIAG_ONLY", "").split(",") if t}
             final_set = {n for n in final_set if n in seen or not (
-                n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
+                (TEST_ID_OF.get(n) in only) if only else
+                (n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS))}
             note = "diagnostic (heavy): unrun slow tests left out"
         nums = sorted(final_set)
         workers = pack(nums, dur)
