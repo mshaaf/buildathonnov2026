@@ -833,7 +833,7 @@ def is_heavy(n) -> bool:
 
 SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
-SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "6000"))  # est CPU settle may spend, per commit in the batch
+SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "2500"))  # est CPU settle may spend, per commit in the batch
 SETTLE_BUDGET = [float("inf")]  # set by main(): per-commit budget x commits
 SETTLE_SPENT = [0]
 SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may also run tests this costly (e.g. generator_memory)
