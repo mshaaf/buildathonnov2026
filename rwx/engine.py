@@ -463,6 +463,11 @@ class Engine:
         os.dup2(devnull, 2)
         sys.stdout = sys.stderr = open(os.devnull, "w")
         sources = {f"{self.root}/{rel}": new for rel, (old, new) in py_changes.items()}
+        if sources and os.environ.get("RWX_LAZY_RUN") == "1":
+            # `python -c` children (test_lazy_load) see the patched tree too
+            import srchook
+
+            srchook.wrap_subprocess(sources, self.root, os.path.dirname(os.path.abspath(__file__)))
         if mode == "reimport":
             for name in list(sys.modules):
                 if name.split(".")[0] in PKG_PREFIXES:

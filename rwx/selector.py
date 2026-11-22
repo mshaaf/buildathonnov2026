@@ -615,6 +615,8 @@ def fixture_policy(C: list[int], runnable: list[int]):
 FILE_OF: dict = {}
 NO_RUN: set = set()  # tests that start a fresh interpreter: the engine cannot patch it
 NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
+LAZY_RUN = os.environ.get("RWX_LAZY_RUN") == "1"  # run it anyway: the engine hooks `python -c`
+LAZY_RUN_MS = 400  # a fresh interpreter importing sqlglot, patched module compiled from source
 
 
 PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "250"))
@@ -1031,12 +1033,18 @@ def main() -> None:
     dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     DUR.update(dur)
     FILE_OF.update({t["number"]: t["file"] for t in tests})
-    NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
+    if not LAZY_RUN:
+        NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     valid = 0
     for n in dur:
         valid |= 1 << n
     cmap = Map(MAP)
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
+    if LAZY_RUN:
+        # the engine runs test_lazy_load's fresh interpreter on the patched tree
+        for t in tests:
+            if t["id"] in NO_RUN_IDS:
+                CPU_EST[t["number"]] = max(CPU_EST.get(t["number"], 0), LAZY_RUN_MS)
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
     TEST_ID_OF.update({t["number"]: t["id"] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
