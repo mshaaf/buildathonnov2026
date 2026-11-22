@@ -531,6 +531,23 @@ def _():
     WB("sqlglot/helper.py", s.replace(b"# Interval units", b"# Interval\x00 units", 1))
 
 
+@spec("la03", "number edit in a one-line TRANSFORMS lambda")
+def _():
+    R("sqlglot/generators/duckdb.py", "exp.Seq2: lambda self, e: _seq_sql(self, e, 2),", "exp.Seq2: lambda self, e: _seq_sql(self, e, 4),")
+
+
+@spec("la04", "string constant edit in a one-line TRANSFORMS lambda")
+def _():
+    R("sqlglot/generators/postgres.py", 'exp.TimeToStr: lambda self, e: self.func("TO_CHAR", e.this, self.format_time(e)),',
+      'exp.TimeToStr: lambda self, e: self.func("TO_CHARS", e.this, self.format_time(e)),')
+
+
+@spec("la05", "operator flip in a one-line TRANSFORMS lambda")
+def _():
+    R("sqlglot/generators/presto.py", "exp.DayOfWeek: lambda self, e: f\"(({self.func('DAY_OF_WEEK', e.this)} % 7) + 1)\",",
+      "exp.DayOfWeek: lambda self, e: f\"(({self.func('DAY_OF_WEEK', e.this)} % 7) - 1)\",")
+
+
 def main():
     (OUT / "commits").mkdir(parents=True, exist_ok=True)
     kinds = {}
