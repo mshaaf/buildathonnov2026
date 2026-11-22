@@ -2572,8 +2572,11 @@ def main() -> None:
         if diag_mode == "heavy" and cid in OBSERVED:
             # diagnostic: on commits the engine ran, leave out every unrun slow test
             seen = OBSERVED[cid]
+            only = [x for x in os.environ.get("RWX_DIAG_HEAVY_IDS", "").split(",") if x]
+            ids = {t["number"]: t["id"] for t in tests}
             final_set = {n for n in final_set if n in seen or not (
-                n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
+                (n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)
+                and (not only or any(x in ids[n] for x in only)))}
             note = "diagnostic (heavy): unrun slow tests left out"
         dropped = job[9] if len(job) > 9 else None
         if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
