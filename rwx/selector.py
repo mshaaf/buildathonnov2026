@@ -606,7 +606,7 @@ class Analyzer:
             why.append(f"{rel}: very large change -> importers")
             return mask | self.importers(rel)
         mask |= self.import_blocks(rel, tree, new_tree, hunks, loc, why)
-        if flips and CMP_PROFILE and not BROAD:
+        if flips and (CMP_PROFILE or BOOL_PROFILE) and not BROAD:
             mask = self.compare_narrow(rel, flips, mask, why)
         return mask
 

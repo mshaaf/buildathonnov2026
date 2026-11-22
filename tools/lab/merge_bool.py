@@ -50,8 +50,13 @@ def main():
         if t["id"] in SUBPROCESS_TESTS:
             profiled &= ~(1 << t["number"])
     out: dict = {}
-    for sid, (rel, line, col, op, _ctx) in enumerate(sites):
+    keys = [(rel, line, col) for rel, line, col, *_rest in sites]
+    dup = {k for k in keys if keys.count(k) > 1} if len(set(keys)) != len(keys) else set()
+    for sid, (rel, line, col, op, *_rest) in enumerate(sites):
+        if (rel, line, col) in dup:
+            continue  # nested BoolOps sharing a start (`(a or b) or c`): never narrow these
         out.setdefault(rel, {})[(line, col)] = (op, mid(acc[sid]))
+    print(f"colliding site keys dropped: {len(dup)}", file=sys.stderr)
     d["bool_sites"] = out
     d["bool_unprofiled"] = mid(allm & ~profiled)
     d["masks"] = masks

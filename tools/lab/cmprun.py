@@ -120,6 +120,12 @@ class Finder(importlib.abc.MetaPathFinder):
 
 
 def child(test, outdir):
+    child_many([test], outdir)
+
+
+def child_many(tests, outdir):
+    """Run tests one after another in this process (shared mode: caches and registries
+    left by earlier tests stay, as in a pytest worker), one profile file per test."""
     seen = set()
     sites = SITES
 
@@ -168,29 +174,31 @@ def child(test, outdir):
 
     concurrent.futures.ProcessPoolExecutor = covrun.InlinePool
     concurrent.futures.process.ProcessPoolExecutor = covrun.InlinePool
-    status = "ok"
-    try:
-        mod = importlib.import_module(test["mod"])
-        cls = getattr(mod, test["cls"])
-        result = covrun.Result()
-        unittest.TestSuite([cls(test["meth"])]).run(result)
-        if result.bad:
-            status = "fail"
-    except Exception:  # noqa: BLE001
-        status = "crash"
+    for test in tests:
+        seen.clear()
+        status = "ok"
+        try:
+            mod = importlib.import_module(test["mod"])
+            cls = getattr(mod, test["cls"])
+            result = covrun.Result()
+            unittest.TestSuite([cls(test["meth"])]).run(result)
+            if result.bad:
+                status = "fail"
+        except Exception:  # noqa: BLE001
+            status = "crash"
+        out = {"number": test["number"], "status": status, "seen": sorted([s, v] for s, v in seen)}
+        tmp = os.path.join(outdir, f".{test['number']}.json")
+        with open(tmp, "w") as fh:
+            json.dump(out, fh)
+        os.replace(tmp, os.path.join(outdir, f"{test['number']}.json"))
     builtins._rwx_cmp_ = lambda sid, a, b: FUNCS[sites[sid][3]](a, b)
-    out = {"number": test["number"], "status": status, "seen": sorted([s, v] for s, v in seen)}
-    tmp = os.path.join(outdir, f".{test['number']}.json")
-    with open(tmp, "w") as fh:
-        json.dump(out, fh)
-    os.replace(tmp, os.path.join(outdir, f"{test['number']}.json"))
 
 
 def main():
     global ROOT
     root, tests_json, outdir = sys.argv[1], sys.argv[2], sys.argv[3]
     ROOT = os.path.abspath(root)
-    jobs, only, timeout = 2, None, 900.0
+    jobs, only, timeout, shared = 2, None, 900.0, 0
     args = sys.argv[4:]
     while args:
         a = args.pop(0)
@@ -200,6 +208,8 @@ def main():
             only = {int(x) for x in args.pop(0).split(",")}
         elif a == "--timeout":
             timeout = float(args.pop(0))
+        elif a == "--shared":
+            shared = int(args.pop(0))
     os.makedirs(outdir, exist_ok=True)
     t0 = time.time()
     precompile(ROOT)
@@ -214,6 +224,22 @@ def main():
             continue
         mod, cls, meth = covrun.parse_id(t["id"])
         todo.append(dict(t, mod=mod, cls=cls, meth=meth))
+    if shared:
+        # tests.json order (pytest's), split into contiguous chunks, one process each
+        chunks = [todo[i * len(todo) // shared:(i + 1) * len(todo) // shared] for i in range(shared)]
+        pids = []
+        for chunk in chunks:
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    child_many(chunk, outdir)
+                finally:
+                    os._exit(0)
+            pids.append(pid)
+        for pid in pids:
+            os.waitpid(pid, 0)
+        print(f"shared mode done in {time.time() - t0:.0f}s", file=sys.stderr, flush=True)
+        return
     todo.sort(key=lambda t: -t["seconds"])
     running, started, done = {}, time.time(), 0
     while todo or running:

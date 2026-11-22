@@ -16,7 +16,7 @@ called once, B is evaluated for real exactly when the pinned code would (via a l
 thunk, which is why class bodies are skipped: a lambda there cannot see class names).
 
 usage: boolrun.py SQLGLOT_ROOT tests.json OUTDIR [--jobs 2] [--only ...] [--timeout 1200]
-Writes OUTDIR/sites.json (id -> [file, line, col, op, ctx]) and OUTDIR/<n>.json with
+Writes OUTDIR/sites.json (id -> [file, line, col, op, ctx, speculate]) and OUTDIR/<n>.json with
 "differs": [site ids].
 """
 
@@ -90,7 +90,10 @@ class Instrument(ast.NodeTransformer):
             return node
         sid = len(SITES)
         op = "and" if isinstance(node.op, ast.And) else "or"
-        SITES.append((self.rel, node.lineno, node.col_offset, op, "test" if test_ctx else "value"))
+        # Speculation (evaluating B where the pinned code would not) only without attribute
+        # access: an attribute can run a property or a lazy module __getattr__ (imports).
+        spec = not any(isinstance(n, ast.Attribute) for n in ast.walk(node.values[1]))
+        SITES.append((self.rel, node.lineno, node.col_offset, op, "test" if test_ctx else "value", spec))
         thunk = ast.Lambda(ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]), node.values[1])
         call = ast.Call(ast.Name("_rwx_bool_", ast.Load()), [ast.Constant(sid), node.values[0], thunk], [])
         return ast.copy_location(call, node)
@@ -145,6 +148,9 @@ def child(test, outdir):
                     differs.add(sid)
             return b
         if sid not in differs:
+            if not sites[sid][5]:
+                differs.add(sid)  # cannot speculate safely: the flip may differ here
+                return a
             probing[0] = True
             try:
                 b = thunk()  # speculative: what the flipped operator would evaluate
