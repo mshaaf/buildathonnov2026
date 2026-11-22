@@ -293,6 +293,27 @@ class VerificationTests(unittest.TestCase):
                     gen.send(answer)
                 self.assertEqual(done.exception.value, expected)
 
+    def test_settle_runs_a_giant_alone_last_when_it_pays(self):
+        durations = {n: 1 for n in range(10)} | {10: 20000}
+        cpu = {n: 1 for n in range(10)} | {10: 30000}
+        files = {n: "a" for n in range(10)} | {10: "g"}
+        for ratio, ask in ((0.35, ([10], False)), (0.7, None)):
+            with self.subTest(ratio=ratio), patch.multiple(
+                    selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF=files, FILE_OF=files,
+                    SETTLE_RATIO=ratio, SETTLE_GIANT_MS=40000, GIANT_GRANT={}, EXEC_VERIFIABLE=set()):
+                gen = selector.policy(list(range(11)), durations, False)
+                self.assertEqual(next(gen), (list(range(10)), True))
+                first = {n: "P" for n in range(9)} | {9: "F"}
+                if ask is None:
+                    with self.assertRaises(StopIteration) as done:
+                        gen.send(first)
+                    self.assertEqual(done.exception.value, {9, 10})
+                    continue
+                self.assertEqual(gen.send(first), ask)  # 0.35 x 30 s < 10/12 x 20 s of worker time
+                with self.assertRaises(StopIteration) as done:
+                    gen.send({10: "P"})
+                self.assertEqual(done.exception.value, {9})
+
     def test_settle_after_a_failure(self):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 1500, 3: 9000}

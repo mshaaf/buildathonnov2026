@@ -140,6 +140,7 @@ class Analyzer:
         self.lazy_mask = lazy_mask
         self.file_tests = file_tests or {}  # test file -> mask of its tests
         self._trees: dict = {}
+        self._code_nodes: dict = {}
         profile = SRC / ".rwx-tokenizer.json"
         self.tokenizer = json.loads(profile.read_text()) if ATTR_NARROW and not BROAD and profile.is_file() else {}
 
@@ -175,7 +176,10 @@ class Analyzer:
                 mask = m.file_mask(rel)
             else:
                 mask = m.code_mask(rel, own)
-                if not mask and site.scope_path and site.scope_path[-1][0] == "class":
+                const_defaults = DEFAULT_CONST and self.only_constant_defaults(rel, site)
+                if const_defaults:
+                    why.append("only constant defaults changed: callers only")
+                if not mask and site.scope_path and site.scope_path[-1][0] == "class" and not const_defaults:
                     mask = m.span_mask(rel, site.code_key, *site.lines)
                 first = stmt.decorator_list[0].lineno if stmt.decorator_list else stmt.lineno
                 if not isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
@@ -233,7 +237,16 @@ class Analyzer:
             for name in site.names or ():
                 rr, _ = m.ref_mask(m.name_refs.get(name, ()))
                 readers |= rr
-            narrowed = users & readers if (readers and ATTR_NARROW) else users
+            if REF_LINES and readers:
+                # same references, but only tests that executed a line where the name appears
+                rmask = self.ref_line_mask(refs, site.names)
+                line_readers = 0
+                for name in site.names or ():
+                    line_readers |= self.ref_line_mask(m.name_refs.get(name, ()), (name,))
+                readers = line_readers
+                narrowed = users & readers if ATTR_NARROW else users
+            else:
+                narrowed = users & readers if (readers and ATTR_NARROW) else users
             why.append(f"class {ck} users={bin(users).count('1')} readers={bin(narrowed).count('1')} refs={bin(rmask).count('1')}")
             return narrowed | rmask
         # module level: whoever references the bound names, anywhere
@@ -247,6 +260,112 @@ class Analyzer:
             refs.extend(m.name_refs.get(name, ()))
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
+
+    def only_constant_defaults(self, rel, site) -> bool:
+        """The def statement differs only in default values, each a constant before and after.
+        Evaluating a constant default cannot fail or touch anything, and no code in sqlglot or
+        its tests reads __defaults__, so only calls (which enter the function) observe it."""
+        old_stmt = site.stmt
+        new_src = self.py_changes.get(rel, (None, None))[1]
+        if new_src is None or not isinstance(old_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        try:
+            new_tree = ast.parse(new_src)
+        except SyntaxError:
+            return False
+        twins = [n for n in ast.walk(new_tree) if isinstance(n, type(old_stmt)) and n.name == old_stmt.name
+                 and n.lineno == old_stmt.lineno]
+        if len(twins) != 1:
+            return False
+        new_stmt = twins[0]
+        od = old_stmt.args.defaults + [d for d in old_stmt.args.kw_defaults if d is not None]
+        nd = new_stmt.args.defaults + [d for d in new_stmt.args.kw_defaults if d is not None]
+        if len(od) != len(nd) or [d is None for d in old_stmt.args.kw_defaults] != [d is None for d in new_stmt.args.kw_defaults]:
+            return False
+        changed = [(a, b) for a, b in zip(od, nd) if ast.dump(a) != ast.dump(b)]
+        if not changed or not all(isinstance(a, ast.Constant) and isinstance(b, ast.Constant) for a, b in changed):
+            return False
+
+        def strip(fn):
+            clone = ast.parse(ast.unparse(fn)).body[0]
+            clone.args.defaults = []
+            clone.args.kw_defaults = [None] * len(clone.args.kw_defaults)
+            return ast.dump(clone)
+
+        return strip(old_stmt) == strip(new_stmt)
+
+    def ref_line_mask(self, refs, names) -> int:
+        """Like Map.ref_mask, but for references inside functions only the tests that executed
+        a line on which one of the names appears (Name, .attr or "string"). Import-time
+        references (class/module bodies) and anything not located keep the code-object mask."""
+        m = self.map
+        out = 0
+        for f, key, kind in refs:
+            lines = self._ref_lines(f, key, names) if kind == "func" else None
+            if lines is None:
+                out |= m.ref_mask([(f, key, kind)])[0]
+                continue
+            for ln, mid in m.code(f, key).items():
+                if ln in lines:
+                    out |= m.masks[mid]
+        return out
+
+    def _ref_lines(self, f, key, names):
+        from patchlib import _code_key
+
+        idx = self._code_nodes.get(f)
+        if idx is None:
+            text = self.old_source(f)
+            idx = {}
+            if text is not None:
+                try:
+                    tree = ast.parse(text)
+                except SyntaxError:
+                    tree = None
+                for node in ast.walk(tree) if tree is not None else ():
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        k = _code_key(node)
+                        idx[k] = None if k in idx else node  # duplicate keys: cannot tell them apart
+            self._code_nodes[f] = idx
+        node = idx.get(key)
+        if node is None:
+            return None
+        wanted = set(names)
+        lines: set = set()
+
+        def hit(n):
+            return ((isinstance(n, ast.Name) and n.id in wanted) or (isinstance(n, ast.Attribute) and n.attr in wanted)
+                    or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in wanted))
+
+        def visit(n):
+            for ch in ast.iter_child_nodes(n):
+                if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    # decorators, defaults and bases run in this scope; the body is another code object
+                    extra = list(getattr(ch, "decorator_list", []))
+                    if isinstance(ch, ast.ClassDef):
+                        extra += ch.bases + [k.value for k in ch.keywords]
+                    else:
+                        extra += ch.args.defaults + [d for d in ch.args.kw_defaults if d]
+                    for e in extra:
+                        if hit(e):
+                            lines.update(range(e.lineno, e.end_lineno + 1))
+                        visit(e)
+                    continue
+                if isinstance(ch, ast.GeneratorExp):
+                    return_none[0] = True  # generator bodies are separate code objects: stay coarse
+                if hit(ch):
+                    lines.update(range(ch.lineno, ch.end_lineno + 1))
+                visit(ch)
+
+        return_none = [False]
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for st in body:
+            if hit(st):
+                lines.update(range(st.lineno, st.end_lineno + 1))
+            visit(st)
+        if return_none[0] or not lines:
+            return None
+        return lines
 
     def refine_fixture(self, rel, old, new, fm, why):
         """A fixture a test class loads in setUpClass (into cls.ATTR) only reaches the
@@ -1068,6 +1187,8 @@ USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
 BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
+REF_LINES = os.environ.get("RWX_REF_LINES", "0") == "1"
+DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "0") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
@@ -1146,7 +1267,80 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
             rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
             if not rel or not all(n in allpass for n in rel):
                 final.add(g)
+    if SETTLE_GIANT_MS > 0:
+        final = yield from _settle_giants(C, final, seen | settled, known)
     return final
+
+
+# Giants in settle (RWX_SETTLE_GIANT_MS > 0, default off): run a printed slow test (est CPU
+# above SETTLE_MAX_MS, at most SETTLE_GIANT_MS) when ratio x CPU < pass chance x the worker
+# time it adds. Never a bet: the test runs. The guards only avoid spending CPU on a giant that
+# probably fails: no failure seen in its own test file, at most BET_BREADTH of runs failed.
+SETTLE_GIANT_MS = int(os.environ.get("RWX_SETTLE_GIANT_MS", "0"))
+SETTLE_GIANT_BUDGET_MS = int(os.environ.get("RWX_SETTLE_GIANT_BUDGET_MS", "110000"))  # per batch (~3 giants)
+HEAVY_BATCH: set = set()  # test numbers settle may run as a giant batch (the scheduler may serialize these)
+GIANT_GRANT: dict = {}  # commit key -> est ms of giant runs granted (set by main, in job order)
+EXEC_VERIFIABLE: set = set()  # commit keys whose TPC-DS the scheduler checks per query (cheaper)
+EXECUTOR_TEST = [None]
+
+
+def commit_key(C) -> tuple:
+    return (len(C), hash(tuple(sorted(C))))
+
+
+def giant_candidates(C) -> list:
+    return [g for g in C if g not in NO_RUN and SETTLE_MAX_MS < batch_cost([g]) <= SETTLE_GIANT_MS]
+
+
+def grant_giants(job_sets) -> None:
+    """Split the giant budget in job order by each commit's potential giant runs, before any
+    run, so no commit's decisions depend on scheduling order."""
+    left = SETTLE_GIANT_BUDGET_MS
+    for C in job_sets:
+        need = sum(batch_cost([g]) for g in giant_candidates(C))
+        if not need:
+            continue
+        grant = min(need, left)
+        GIANT_GRANT[commit_key(C)] = grant
+        left -= grant
+
+
+def _settle_giants(C, final, seen, known):
+    key = commit_key(C)
+    allowance = GIANT_GRANT.get(key, float("inf") if not GIANT_GRANT else 0)
+    while True:
+        nfail = sum(st != "P" for st in seen.values())
+        if nfail > BET_BREADTH * max(1, len(seen)):
+            return final
+        keep = 1 - (nfail + 1) / (len(seen) + 2) if nfail else 1.0
+        bad_files = {FILE_OF.get(n) for n, st in seen.items() if st != "P"}
+        eligible = []
+        for g in giant_candidates(C):
+            if g not in final or g in seen or g in (known or ()) or FILE_OF.get(g) in bad_files:
+                continue
+            if g == EXECUTOR_TEST[0] and key in EXEC_VERIFIABLE:
+                continue  # the per-query TPC-DS check after the policy is cheaper
+            eligible.append(g)
+        # Worker time is not additive (one giant can hide another): value whole subsets.
+        best = None
+        base = _pack_lb(final)
+        for mask in range(1, 1 << len(eligible)):
+            group = [g for i, g in enumerate(eligible) if mask >> i & 1]
+            cost = sum(batch_cost([g]) for g in group)
+            if cost > allowance:
+                continue
+            value = keep ** len(group) * (base - _pack_lb(final - set(group))) - SETTLE_RATIO * cost
+            if value > 0 and (best is None or value > best[0]):
+                g = min(group, key=lambda n: (batch_cost([n]), n))
+                best = (value, g, batch_cost([g]))
+        if best is None:
+            return final
+        _, g, cost = best
+        allowance -= cost
+        res = yield [g], False
+        seen = seen | {g: res.get(g, "F")}
+        if res.get(g) == "P":
+            final = final - {g}
 
 
 SETTLE_CHUNK_MS = int(os.environ.get("RWX_SETTLE_CHUNK_MS", "2000"))  # first settle batch size (est), doubling
@@ -1607,6 +1801,8 @@ class Scheduler:
                     continue
                 try:
                     sess = self.engine.session(py, data, case_site)
+                    if getattr(sess, "executor_ms", None) is not None and getattr(sess, "executor_partial", True) is False:
+                        EXEC_VERIFIABLE.add(commit_key(C))
                     a = [cid, C, gen, sess, batch, None,
                          {"py": py, "data": data, "site": case_site, "restarts": 0, "hung": False}]
                     self._submit(a, batch, stop_first)
@@ -1931,6 +2127,9 @@ def main() -> None:
             log(f"{cid}: job error {e!r} -> ALL")
             jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
     set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
+    if SETTLE_GIANT_MS > 0:
+        grant_giants([C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
+        HEAVY_BATCH.update(n for n in dur if n not in NO_RUN and SETTLE_MAX_MS < batch_cost([n]) <= SETTLE_GIANT_MS)
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
@@ -1948,6 +2147,7 @@ def main() -> None:
                          needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:
                 CLS_SETUP[exec_cls] = 0
+            EXECUTOR_TEST[0] = eng.executor_test
             log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
             budget = min(140.0, 3.2 * len(jobs) + 10)
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)
