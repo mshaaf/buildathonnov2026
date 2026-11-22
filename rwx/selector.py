@@ -436,6 +436,18 @@ class Analyzer:
                 why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
                 mask |= self.importers(rel)
                 continue
+            # A value whose type changed can make other import-time code that reads it raise
+            # (`B = A + 1` in a class body): those readers' modules break for every importer.
+            retyped = set()
+            for a, b in zip(rem_old, rem_new):
+                if isinstance(a, (ast.Assign, ast.AnnAssign)) and _value_type(a.value) != _value_type(b.value):
+                    retyped.update(bound_names(a))
+            for name in sorted(retyped):
+                for f, _key, kind in self.map.name_refs.get(name, ()):
+                    if kind in ("class", "module"):
+                        mask |= self.map.file_mask(f)
+            if retyped:
+                why.append(f"retyped {sorted(retyped)[:3]}: import-time readers' importers")
             old_names = {n for x in rem_old for n in bound_names(x)}
             new_names = {n for x in rem_new for n in bound_names(x)}
             # Names bound on both sides are the per-line sites' business (with their narrowing).
@@ -668,6 +680,19 @@ def _undecodable(text: str) -> bool:
 def _import_time(site) -> bool:
     return (site is not None and site.stmt is not None and site.kind in ("import", "header")
             and isinstance(site.scope_node, (ast.Module, ast.ClassDef)))
+
+
+def _value_type(v):
+    """Coarse runtime type of an assigned expression: literal type, or the node type."""
+    if v is None:
+        return None
+    if isinstance(v, ast.Constant):
+        return type(v.value)
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant):
+        return type(v.operand.value)
+    if isinstance(v, (ast.Dict, ast.List, ast.Tuple, ast.Set, ast.Lambda)):
+        return type(v)
+    return ("expr", ast.dump(v))  # a lookup or computation: unknown, equal only if identical
 
 
 def _scope_nodes(tree, site) -> list:

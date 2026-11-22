@@ -525,6 +525,12 @@ def _():
     R("sqlglot/helper.py", "PYTHON_VERSION = sys.version_info[:2]\n", "PYTHON_VERSION = sys.version_info[:2][5]\n")
 
 
+@spec("fm11", "null byte in a .py comment")
+def _():
+    s = (BASE / "sqlglot/helper.py").read_bytes()
+    WB("sqlglot/helper.py", s.replace(b"# Interval units", b"# Interval\x00 units", 1))
+
+
 def main():
     (OUT / "commits").mkdir(parents=True, exist_ok=True)
     kinds = {}
