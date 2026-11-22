@@ -526,7 +526,9 @@ ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
-BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after two passing probes
+BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"
+LIVE_FINISH = os.environ.get("RWX_LIVE_FINISH", "1") == "1"  # sound: finish verifying live commits when cheaper
+BET_LIVE = os.environ.get("RWX_BET_LIVE") == "1"  # experiment: drop unverified candidates on live commits  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
 
@@ -695,7 +697,8 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
 NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
 BREADTH = float(os.environ.get("RWX_BREADTH", "0.25"))
 RELATED_MS = int(os.environ.get("RWX_RELATED_MS", "2000"))
-NARROW_ON = os.environ.get("RWX_NARROW") == "1"  # experiment: off (cost more than it saved in the lab)
+NARROW_ON = os.environ.get("RWX_NARROW") == "1"
+NARROW_FULL_MS = int(os.environ.get("RWX_NARROW_FULL_MS", "4000"))  # experiment: off (cost more than it saved in the lab)
 
 
 def _live(C, rest, heavy, passed, failed):
@@ -704,9 +707,34 @@ def _live(C, rest, heavy, passed, failed):
     dur = DUR
     skippable = [n for n in heavy if dur[n] >= NARROW_SKIP_MS and n not in NO_RUN]
     if not NARROW_ON or not skippable:
+        if LIVE_FINISH or BET_LIVE:
+            # Something failed. Finish verifying the runnable candidates when that costs
+            # less than printing them unverified; only then (or under the live bet)
+            # print just what failed plus the tests that cannot be run here.
+            remaining = [n for n in rest if n not in passed and n not in failed]
+            keep = set(failed) | set(heavy)
+            savings = _pack_cost(set(C) - passed) - _pack_cost(keep)
+            if remaining and LIVE_FINISH and batch_cost(remaining) <= FINAL_FRAC * savings:
+                res = yield remaining, False
+                failed = set(failed) | {n for n, st in res.items() if st == "F"}
+                unreported = {n for n in remaining if n not in res}
+                return set(failed) | set(heavy) | unreported
+            if BET_LIVE:
+                return set(failed) | set(heavy)
         return set(C) - passed
     done = passed | failed
     unrun = [n for n in rest if n not in done]
+    if unrun and batch_cost(unrun) <= NARROW_FULL_MS:
+        # full knowledge of the runnable candidates, then decide the giants on it
+        res = yield unrun, False
+        passed = passed | {n for n, st in res.items() if st == "P"}
+        failed = failed | {n for n in unrun if res.get(n) != "P"}
+        breadth = len(failed) / max(1, len(passed) + len(failed))
+        fail_files = {FILE_OF.get(n, "") for n in failed}
+        drop = set()
+        if breadth < BREADTH:
+            drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
+        return set(failed) | (set(heavy) - drop)
     gfiles = {FILE_OF.get(n, "") for n in skippable}
     related = [n for n in unrun if FILE_OF.get(n, "") in gfiles]
     bp = _spread(related, RELATED_MS, 8)
