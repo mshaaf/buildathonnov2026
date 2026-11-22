@@ -832,6 +832,8 @@ def is_heavy(n) -> bool:
 
 SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
+SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "0"))  # settle may also run tests this costly (e.g. generator_memory)
+SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "0"))  # ratio multiplier once something failed; 0: no settling then
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
@@ -849,7 +851,13 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         final = set(e.value)
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
-    unproven = [n for n in final if n not in seen and not is_heavy(n) and n not in (known or ())]
+    ratio = SETTLE_RATIO
+    if any(st != "P" for st in seen.values()):
+        if SETTLE_FAIL_MULT <= 0:
+            return final
+        ratio *= SETTLE_FAIL_MULT
+    unproven = [n for n in final if n not in seen and n not in NO_RUN and n not in (known or ())
+                and (not is_heavy(n) or batch_cost([n]) <= SETTLE_MAX_MS)]
     if not unproven:
         return final
     order = sorted(unproven, key=lambda n: (-DUR[n] / (batch_cost([n]) + 1), n))
@@ -858,7 +866,7 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     if len(order) > SETTLE_PREFIX:
         steps.append(len(order))
     for j in steps:
-        c = SETTLE_RATIO * batch_cost(order[:j]) + _pack_cost(final - set(order[:j]))
+        c = ratio * batch_cost(order[:j]) + _pack_cost(final - set(order[:j]))
         if c < best:
             best, best_j = c, j
     if not best_j:

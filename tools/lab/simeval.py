@@ -21,6 +21,7 @@ import sys
 for k, v in (("SKIP_INTEGRATION", "0"), ("OPENBLAS_NUM_THREADS", "1"), ("OMP_NUM_THREADS", "1"),
              ("PYTHONDONTWRITEBYTECODE", "1"), ("RWX_SRC", "/sqlglot")):
     os.environ.setdefault(k, v)
+os.environ["RWX_SRC"] = os.path.abspath(os.environ["RWX_SRC"])  # the engine matches code by absolute path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "rwx"))
 if os.environ["RWX_SRC"] not in sys.path:
     sys.path.insert(0, os.environ["RWX_SRC"])
@@ -137,6 +138,8 @@ def load_truth(L):
     for f in sorted(glob.glob(f"{L}/truth.*.jsonl")):
         for line in open(f):
             r = json.loads(line)
+            if (r.get("timeout") or r.get("crash")) and os.environ.get("KEEP_UNRELIABLE") != "1":
+                continue  # unreported tests were marked failing: not ground truth
             truth[r["commit"]] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()},
                                   bool(r.get("timeout") or r.get("crash")))
     return truth
