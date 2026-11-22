@@ -72,11 +72,29 @@ class Map:
         self.cmp_unprofiled: int = d["masks"][d["cmp_unprofiled"]] if "cmp_unprofiled" in d else -1
         self.bool_sites: dict = d.get("bool_sites", {})  # file -> {(line, col): (op, mask_id)}
         self.bool_unprofiled: int = d["masks"][d["bool_unprofiled"]] if "bool_unprofiled" in d else -1
+        if not self.bool_sites and BOOL_PROFILE:
+            self._load_bool_side(path.with_name("bool.pkl.z"))
         # (file, code_key) of a class body -> class key
         self.class_by_code: dict = {}
         for k in self.class_desc:
             f, line, qual = k.split(":", 2)
             self.class_by_code[(f, f"{line}:{qual.rsplit('.', 1)[-1]}")] = k
+
+    def _load_bool_side(self, side: Path) -> None:
+        """and/or profiles from the side file (tools/lab/bool_side.py). Any problem: no
+        profiles, so and/or flips keep their full candidate sets."""
+        try:
+            s = pickle.loads(zlib.decompress(side.read_bytes()))
+            sites = {}
+            for f, v in s["bool_sites"].items():
+                sites[f] = {}
+                for k, (op, mask) in v.items():
+                    self.masks.append(mask)
+                    sites[f][k] = (op, len(self.masks) - 1)
+            unprof = s["bool_unprofiled"]
+        except Exception:
+            return
+        self.bool_sites, self.bool_unprofiled = sites, unprof
 
     def code(self, f: str, key: str) -> dict:
         return self.lines.get(f, {}).get(key, {})
