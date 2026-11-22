@@ -118,6 +118,30 @@ class VerificationTests(unittest.TestCase):
                 gen.send({0: "P"})
             self.assertEqual(result.exception.value, {1, 2})
 
+    def test_settle_runs_unproven_tests_worth_more_on_workers_than_in_cpu(self):
+        durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
+        cpu = {0: 1, 1: 1, 2: 100, 3: 9000}
+        for response, expected in (({1: "P", 2: "P"}, {3}), ({1: "P", 2: "F"}, {2, 3})):
+            with self.subTest(response=response), patch.multiple(
+                    selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5):
+                gen = selector.policy([0, 1, 2, 3], durations, False)
+                self.assertEqual(next(gen), ([0, 1, 2], True))
+                # 1 and 2 never reported: settling runs them, most valuable first, without stopping
+                self.assertEqual(gen.send({0: "P"}), ([2, 1], False))
+                with self.assertRaises(StopIteration) as done:
+                    gen.send(response)
+                self.assertEqual(done.exception.value, expected)
+
+    def test_settle_is_off_after_a_failure_by_default(self):
+        durations = {0: 1, 1: 3000, 2: 9000}
+        cpu = {0: 1, 1: 100, 2: 9000}
+        with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5):
+            gen = selector.policy([0, 1, 2], durations, False)
+            self.assertEqual(next(gen), ([0, 1], True))
+            with self.assertRaises(StopIteration) as done:
+                gen.send({0: "F"})
+            self.assertEqual(done.exception.value, {0, 1, 2})
+
     def test_final_batch_uses_the_giants_own_probe_evidence(self):
         # v4 rule: a giant is cleared only by ALL runnable candidates from its own test
         # file (here the executor tests 1-4 left after probe 1), then the final batch
