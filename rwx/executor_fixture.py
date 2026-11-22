@@ -63,11 +63,15 @@ def install(root, changes):
     manifest = Path(root) / ".rwx-executor.json"
     if not manifest.is_file():
         return
-    profile = json.loads(manifest.read_text())
-    if changes.keys().isdisjoint(profile["sources"]):
+    try:
+        profile = json.loads(manifest.read_text())
+        sources, fields = profile["sources"], profile["fields"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return  # unusable manifest: keep the ordinary class setup
+    if changes.keys().isdisjoint(sources):
         from tests.test_executor import TestExecutor
 
-        defer_setup(TestExecutor, profile["fields"])
+        defer_setup(TestExecutor, fields)
 
 
 if __name__ == "__main__":

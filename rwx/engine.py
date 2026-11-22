@@ -306,7 +306,11 @@ class Engine:
 
         self.executor_test = next((n for n, test in self.tests.items() if test["id"] == TEST_ID), None)
         profile = Path(self.root) / PROFILE
-        self.executor_profile = json.loads(profile.read_text()) if self.executor_test is not None and profile.is_file() else {}
+        try:
+            self.executor_profile = json.loads(profile.read_text()) if self.executor_test is not None and profile.is_file() else {}
+        except (OSError, ValueError) as e:  # a bad manifest only loses this optimization
+            self.log(f"executor profile unusable: {e!r}")
+            self.executor_profile = {}
         self.warm_codes: set = set()
         self.presetup_done: set = set()
         install_inline_pool()
