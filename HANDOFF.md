@@ -573,12 +573,17 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (10:38 EST): BB-4B2DCD7C, commit `b52a7d580eea70793b01776946f72b866cb9e778`
-(C14, branch `opt-c14`), 111.2 s = 101.94 simulated + 9.1 to 9.3 CPU, 0 misses.** Picked by hand
-by Ali; the page shows it as "Entered in the final (your pick)". The yellow "not your best
-score" warning refers to the 109.6 diagnostic (`3b7f152`), which misses 2 of the 30 samples:
-do NOT re-pick that one. Fallback if anything is wrong with C14: BB-4199A4AB (`8192e1c`, C7,
-111.5). Do not submit or re-pick anything else before the cutoff without talking to Ali.
+**FINAL ENTRY (10:51 EST):** two builds have scored with 101.94 simulated and 0 misses and
+differ only in the probe sizes on the ENV line:
+- **C14, BB-4B2DCD7C, `b52a7d580eea70793b01776946f72b866cb9e778` (branch `opt-c14`), 111.2**
+  (small 150/250 ms probes on one-token mutations). Marked "Entered in the final" at 10:38.
+- **C13, BB-72B1475C, `0751d97e2e294430a08060ecc155b7e017d4b45e` (branch `opt-c13`), 116.7**
+  (1000/2000 ms probes on every commit; lab misses 14 instead of 24 over 483 commits).
+  The lead session and an independent agent recommend C13 for the final (about 8 s of certain
+  cost on 60 commits against a lower chance of a 300 s miss); Ali decides which one stays
+  picked. Whichever of these two is marked at 11:00 is intended.
+Never pick: `3b7f152` (109.6, blind diagnostic, misses 2 of 30 samples) or `6507ffd` (C11,
+130.8, gate blocked). The yellow "not your best score" warning refers to the 109.6.
 
 ### What the gate is
 
@@ -812,3 +817,21 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
 - Lab record of the final entry's settings: 24 misses in 483 synthetic commits (all from the
   clean bet on one-token mutations, none involving TPC-DS); 0 misses on the 30 samples, on the
   practice board, and on the 58 commits with answers in the stress run.
+
+### Update 10:51 EST: last checks
+
+- **C13 `0751d97` scored 116.7** = 101.94 + 14.7 to 14.9 CPU, 0 misses. The large probes cost
+  5.5 s of practice CPU.
+- Track page re-read: the only statements about the final are "unseen commits, including
+  kinds of change not in practice", "about 1.5x as many commits" (4.5 min limit) and "A change
+  that only adds a comment is not promised to be harmless". Nothing on how commits are
+  generated.
+- Comment-only patches on the final code (12 hand-made, one batch): comments in Python code
+  print nothing (confirmed by a pytest run of test_parser + test_typing on a patched tree: 82
+  passed); an encoding-cookie comment prints every test (safe, about 37 s where the file is
+  ASCII); in `.sql` fixtures a new `--` line prints nothing (the loader drops those lines), a
+  new `#` line without a colon and a trailing `--` on a SQL line select the reading test.
+- Verified from the repo: C14 and C13 each differ from `6507ffd` by the ENV line only; all
+  eight review-fix commits, the zero-query manifest fix (`f3c6e42`), the and/or profiles, the
+  per-kind probes with the reviewed classifier, mshaaf's build-time duckdb answers and the
+  non-UTF-8 fixture fix are ancestors of both.
