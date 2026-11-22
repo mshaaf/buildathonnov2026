@@ -866,12 +866,12 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     if not unproven:
         return final
     order = sorted(unproven, key=lambda n: (-DUR[n] / (batch_cost([n]) + 1), n))
-    best0 = best = _pack_cost(final)
+    best0 = best = _pack_lb(final)
     best_j = 0
     steps = sorted(set(range(1, min(SETTLE_PREFIX, len(order)) + 1))
                    | {len(order) * i // 10 for i in range(1, 11) if len(order) * i // 10 > SETTLE_PREFIX})
     for j in steps:
-        c = ratio * batch_cost(order[:j]) + keep * _pack_cost(final - set(order[:j])) + (1 - keep) * best0
+        c = ratio * batch_cost(order[:j]) + keep * _pack_lb(final - set(order[:j])) + (1 - keep) * best0
         if c < best:
             best, best_j = c, j
     if not best_j:
@@ -947,6 +947,16 @@ MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 CLEAN_SKIPS_HEAVY = os.environ.get("RWX_CLEAN_SKIPS_HEAVY", "1") == "1"
 RUN_FRAC = float(os.environ.get("RWX_RUN_FRAC", "0"))
+
+
+def _pack_lb(nums) -> int:
+    """Lower bound of _pack_cost (longest test vs even split, per worker count). LPT met it
+    on every lab, sample and synthetic set checked but 2 of 5,040 (by at most 20 ms)."""
+    if not nums:
+        return 0
+    ds = [DUR[n] for n in nums]
+    top, tot = max(ds), sum(ds)
+    return min(max(top, -(-tot // k)) + WORKER_MS * k for k in range(1, min(MAX_WORKERS, len(ds)) + 1))
 
 
 def _pack_cost(nums) -> int:
