@@ -2157,6 +2157,7 @@ class Scheduler:
                 try:
                     fx = fixture[0] if fixture else None
                     sess = self.engine.session(py, data, case_site, fx)
+                    SESSION_DIAG[cid] = dict(getattr(sess, "diag", {}))
                     if getattr(sess, "executor_ms", None) is not None and getattr(sess, "executor_partial", True) is False:
                         EXEC_VERIFIABLE.add(commit_key(C))
                     a = [cid, C, gen, sess, batch, None,
@@ -2239,6 +2240,10 @@ class Scheduler:
                     executor = self.engine.executor_test
                     if selected is not None:
                         kind, selected = selected
+                        if getattr(sess, "executor_stage", False):
+                            # a planner-input check is not a run of the test
+                            STAGE_RAN[cid] = res.get(executor)
+                            OBSERVED.get(cid, set()).discard(executor)
                         if STAGE_LAB and getattr(sess, "executor_stage", False):
                             log(f"STAGELAB {cid} {res.get(executor)} cpu {sess.executor_ms}")
                         if kind == "verify":
@@ -2358,6 +2363,8 @@ IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
 CMAP: list = []  # [the Map], for importer masks found at run time
 LIVE: set = set()  # commits where some run reported a failure
 OBSERVED: dict = {}  # commit -> tests a run reported failing (engine-run commits only)
+SESSION_DIAG: dict = {}  # commit -> what its session knew (diagnostics only)
+STAGE_RAN: dict = {}  # commit -> result of the TPC-DS planner-input check
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
@@ -2630,6 +2637,22 @@ def main() -> None:
             final_set = {n for n in final_set if n in seen or not (
                 n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
             note = "diagnostic (heavy): unrun slow tests left out"
+        if diag_mode == "tpcds_if" and cid in OBSERVED and EXECUTOR_TEST[0] in (final_set or ()) \
+                and EXECUTOR_TEST[0] not in OBSERVED[cid]:
+            # diagnostic: leave out unrun test_execute_tpcds only where one property holds
+            info = SESSION_DIAG.get(cid, {})
+            prop = os.environ.get("RWX_DIAG_PROP", "")
+            hit = {
+                "swap": bool(info.get("swap")),
+                "single": bool(info.get("single")),
+                "postcode": bool(info.get("post_hit")),
+                "execfail": any(FILE_OF.get(n) == "tests/test_executor.py" for n in OBSERVED[cid]),
+                "casems40": info.get("case_ms") is not None and info["case_ms"] <= 40000,
+                "stagefail": STAGE_RAN.get(cid, "P") != "P",
+            }.get(prop, False)
+            if hit:
+                final_set = set(final_set) - {EXECUTOR_TEST[0]}
+                note = f"diagnostic (tpcds_if {prop}): unrun TPC-DS left out"
         dropped = job[9] if len(job) > 9 else None
         if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
             # profile-dropped candidates whose sentinels did not all pass (or never ran)

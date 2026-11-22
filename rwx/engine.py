@@ -784,6 +784,12 @@ class Session:
         self.executor_ms = None
         self.executor_partial = None
         self.executor_stage = False  # the check is tpcds_stages (planner input), not the queries
+        self.diag = {"swap": self.mode == "swap", "single": len(py_changes) == 1 and not data_changes
+                     and next(iter(py_changes)).startswith("sqlglot/"), "case_ms": None, "post_hit": None}
+        if engine.stage_profile and self.mode == "swap" and swaps:
+            post = set(engine.stage_profile["post"])
+            self.diag["post_hit"] = any(
+                f"{fn.removeprefix(engine.root + '/')}:{ln}:{nm}" in post for (fn, ln, nm), _ in swaps)
         if (engine.executor_profile and not data_changes and len(py_changes) == 1
                 and self.mode == "swap" and swaps
                 and next(iter(py_changes)).startswith("sqlglot/")):
@@ -793,6 +799,7 @@ class Session:
             if case_indices is not None:
                 ms = engine.executor_profile["ms"]
                 case_ms = sum(ms[i] for i in case_indices)
+                self.diag["case_ms"] = case_ms
                 stage_ms = None
                 if case_ms > TPCDS_VERIFY_MS and engine.stage_profile:
                     from tpcds_stages import applicable
