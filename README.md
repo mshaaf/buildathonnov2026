@@ -36,6 +36,33 @@ and how to split them over up to 8 workers.
 4. **Packing**: tests are split over the number of workers that minimizes the
    busiest worker plus 2 s per worker.
 
+Refinements to the map and the analysis, all derived from the pinned commit:
+
+- **Code-object entries.** Line events never fire for the first line of a code
+  object, so one-line lambdas and one-line `def`s had no coverage. The map also
+  records, per test, which code objects were entered (`tools/lab/startrun.py`,
+  `tools/lab/merge_starts.py`). A changed code object the map knows nothing about
+  is treated as unknown, never as unreached: its creating statement's tests, or
+  every importer of the file.
+- **Operand relations at comparison sites.** For every single-operator comparison
+  the map records, per test, which operand relations were observed there (equal,
+  ordered, identical but not equal, and so on; `tools/lab/cmprun.py`,
+  `tools/lab/merge_cmp.py`). A patch that only flips one comparison operator can
+  only change a test that observed operands on which the old and the new operator
+  disagree, so only those tests are candidates. This is coverage of the pinned
+  commit (which tests see which values at a site), not a table of outcomes.
+- **Import-time changes.** A module- or class-body statement that might now raise
+  is checked by importing the patched module in the session child: if the import
+  fails, every importer of the file is selected.
+- **File-level and unusual patches** (deleted, new, renamed or binary files,
+  encoding changes, pytest configuration, malformed diffs) select by what can
+  observe the file and fall back to every test when that cannot be bounded. Any
+  error while handling one commit selects every test for that commit only.
+- **Settling.** Tests that would be printed unverified are run instead when their
+  estimated CPU is below the worker time they add, in growing chunks. A test that
+  stops making progress is killed and counted as failing; a hard wall-clock guard
+  prints whatever is still unproven.
+
 `tools/` holds the build-time tooling (coverage and class collection, map
 builder) and `tools/lab/` the validation lab (synthetic patch generator, ground
 truth runner, policy simulator). None of the lab output ships.

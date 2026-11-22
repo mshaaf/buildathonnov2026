@@ -1188,7 +1188,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 REF_LINES = os.environ.get("RWX_REF_LINES", "0") == "1"
-DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "0") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
+DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "1") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
@@ -1208,7 +1208,7 @@ def is_heavy(n) -> bool:
     return cpu > RUN_MAX_MS and cpu > RUN_GAIN * DUR[n]
 
 
-SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "1.0"))  # assumed scorer CPU per estimated CPU ms; 0: off
+SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
 SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "6000"))  # est CPU settle may spend, per commit in the batch
 # Batch-wide settle budget, split up front so no commit's decisions depend on which other
