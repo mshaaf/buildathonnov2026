@@ -171,13 +171,15 @@ class Analyzer:
                 mask = m.code_mask(rel, own)
                 if not mask and site.scope_path and site.scope_path[-1][0] == "class":
                     mask = m.span_mask(rel, site.code_key, *site.lines)
-                if stmt.body and stmt.body[0].lineno <= stmt.lineno:
-                    # Body on the def line: coverage never records a code object's first
-                    # line, so callers are invisible. Anyone reaching the binding may call it.
-                    if isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
-                        mask |= self.import_mask(rel, site, why)
-                    else:
-                        mask |= m.span_mask(rel, site.code_key, *site.lines)
+                first = stmt.decorator_list[0].lineno if stmt.decorator_list else stmt.lineno
+                if not isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
+                    # nested def: decorators/defaults run in the enclosing function
+                    mask |= m.span_mask(rel, site.code_key, *site.lines)
+                elif stmt.body and stmt.body[0].lineno <= stmt.lineno and first not in m.code(rel, own):
+                    # Body on the def line and no entry for it: coverage never records a code
+                    # object's first line, so callers are unknown. Anyone reaching the binding
+                    # may call it; nobody known -> importers.
+                    mask |= self.import_mask(rel, site, why) or self.importers(rel)
             why.append(f"header {own} -> {bin(mask).count('1')}")
             return mask
         # blank/unknown position: whole enclosing code object
@@ -390,13 +392,16 @@ class Analyzer:
         runs after the statement creating it did: charge such a change to that statement."""
         if not site.scope_path or site.scope_path[-1][0] != "lambda":
             return 0
-        if not inserted and ln != site.scope_path[-1][2]:
+        first = site.scope_path[-1][2]
+        if not inserted and ln != first:
             return 0  # a later line of the lambda: its own coverage is complete
+        if not inserted and first in self.map.code(rel, site.code_key):
+            return 0  # entries (PY_START supplement) record who ran the first line
         outer = loc.locate(ln, lambdas=False)
-        if outer is None:
-            return self.map.file_mask(rel)
-        mask = self.site_mask(rel, outer, why)
-        why.append(f"lambda via {outer.kind} {outer.code_key} -> {mask.bit_count()}")
+        mask = self.site_mask(rel, outer, why) if outer is not None else 0
+        if not mask:
+            mask = self.importers(rel)  # unknown, never "unreached"
+        why.append(f"lambda via {outer.kind if outer else '?'} -> {mask.bit_count()}")
         return mask
 
     def import_blocks(self, rel, tree, new_tree, hunks, loc, why) -> int:

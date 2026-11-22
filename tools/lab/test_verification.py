@@ -49,6 +49,9 @@ class FakeMap:
     def file_mask(self, f):
         return self.importers.get(f, 0)
 
+    def code(self, f, key):
+        return self.lines.get(f, {}).get(key, {})
+
     def code_mask(self, f, key):
         m = 0
         for v in self.lines.get(f, {}).get(key, {}).values():
@@ -206,6 +209,12 @@ class RobustnessTests(unittest.TestCase):
         fmap.lines = {"sqlglot/m.py": {"1:make": {2: 0b100, 3: 0b100}}}
         (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old.replace("x + 1", "x + 2"))
         self.assertEqual(mask, 0b100, why)
+        fmap.lines["sqlglot/m.py"]["3:<lambda>"] = {3: 0b1000}  # entry from the PY_START supplement
+        (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old.replace("x + 1", "x + 2"))
+        self.assertEqual(mask, 0b1000, why)
+        fmap.lines = {}  # nothing known at all: importers, never "unreached"
+        (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old.replace("x + 1", "x + 2"))
+        self.assertEqual(mask, 0xF0, why)
 
     def test_one_line_def_is_charged_to_readers_of_its_name(self):
         old = "import re\n\n\ndef f(): return 1\n\n\nY = 2\n"
