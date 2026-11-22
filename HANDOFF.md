@@ -42,6 +42,8 @@ Run `python3 tools/lab/test_verification.py` for the focused regressions and
 
 ---
 
+See also **RESEARCH.md** for the measurements behind the current plan.
+
 ## 1. The problem in one screen
 
 For each patch to sqlglot (pinned at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`),
@@ -355,6 +357,8 @@ scores the newest commit on `main`, which is old):
 | `rwx` | latest | development line, all flags off by default |
 | `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
 | `bet-narrow-mid` | `bec9335` | **141.8**: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
+| `fast-v1` | `8849616` | **candidate**: 141.0 settings + `RWX_PRESETUP_CACHE=1` (build-time setUpClass snapshot, ~0.5 s less parent CPU; -1.3 s CPU on samples in paired runs) + `RWX_LAZY_RUN=1` (test_lazy_load runs on the patched tree). Sample output identical |
+| `diag-heavy` | `9fac365` | DIAGNOSTIC ONLY: 141.0 output minus unrun heavy tests on engine commits (see RESEARCH.md) |
 | `bet-narrow-mid-fx` | `2ac5328` | **141.0 (current best)**: bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0`. Practice: 125.762 s simulated (unchanged: no practice fixture commit benefits), CPU 15.09 / 15.19 / 15.42 |
 | `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
 | `diag-*` | | diagnostics only, never pick these |
@@ -369,6 +373,10 @@ Submission variants are just `rwx` plus an `ENV` line in the Dockerfile. The swi
 | `RWX_NARROW_SKIP_MS` | which slow tests the narrow rule may drop (3000 = giants; 1000 = mid-weight too) |
 | `RWX_DIAG_MODE=live/static`, `RWX_DIAG_MIN/MAX` | diagnostics: print nothing for a category; misses = how many in it break |
 | `RWX_PROBE_ORDER=rare` | rarity-ranked probes (tested, not better) |
+| `RWX_FIXTURE_RUN=1` | fixture-only TPC edits: run TestExecutor's per-query tests on the edited queries |
+| `RWX_PRESETUP_CACHE=1` | load the build-time snapshot of TestExecutor.setUpClass (`rwx/presetup_cache.py`) |
+| `RWX_LAZY_RUN=1` | run test_lazy_load: `python -c` children get an import hook with the patched sources (`rwx/srchook.py`) |
+| `RWX_DIAG_MODE=heavy/blind` | diagnostics: drop unrun heavy tests / print only observed failures on engine commits |
 
 **What practice looks like** (from the diagnostics on the bet version, 40 commits):
 16 live commits, 13 static commits (all of them break something: fixture edits), 11 that
