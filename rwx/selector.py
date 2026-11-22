@@ -819,7 +819,84 @@ BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after tw
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
 
+RUN_GAIN = float(os.environ.get("RWX_RUN_GAIN", "0"))  # also run tests whose CPU is below this share of their recorded time
+
+
+def is_heavy(n) -> bool:
+    """Never run here: starts a fresh interpreter, or estimated CPU too high for what
+    printing it costs (a test far slower on the board than in CPU is still worth running)."""
+    if n in NO_RUN:
+        return True
+    cpu = CPU_EST.get(n, DUR[n]) + CLS_SETUP.get(CLS_OF.get(n), 0)
+    return cpu > RUN_MAX_MS and cpu > RUN_GAIN * DUR[n]
+
+
+SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
+SETTLE_PREFIX = 40
+SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may also run tests this costly (e.g. generator_memory)
+SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
+
+
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
+    """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
+    runnable tests whose estimated CPU is worth less than the worker time they add."""
+    gen = _policy(C, dur, data_only, focus, known)
+    seen: dict = {}
+    try:
+        req = next(gen)
+        while True:
+            res = yield req
+            seen.update(res)
+            req = gen.send(res)
+    except StopIteration as e:
+        final = set(e.value)
+    if SETTLE_RATIO <= 0 or data_only or not seen:
+        return final
+    ratio = SETTLE_RATIO
+    nfail = sum(st != "P" for st in seen.values())
+    keep = 1.0  # chance an unproven test passes, so that running it removes it
+    if nfail:
+        if SETTLE_FAIL_MULT <= 0:
+            return final
+        ratio *= SETTLE_FAIL_MULT
+        keep = 1 - (nfail + 1) / (len(seen) + 2)  # Laplace estimate from this commit's runs
+    # Tests sharing a class with a seen failure usually fail too: running them buys nothing.
+    bad_cls = {CLS_OF.get(n) for n, st in seen.items() if st != "P"}
+    unproven = [n for n in final if n not in seen and n not in NO_RUN and n not in (known or ())
+                and (not is_heavy(n) or batch_cost([n]) <= SETTLE_MAX_MS) and CLS_OF.get(n) not in bad_cls]
+    if not unproven:
+        return final
+    order = sorted(unproven, key=lambda n: (-DUR[n] / (batch_cost([n]) + 1), n))
+    best0 = best = _pack_lb(final)
+    best_j = 0
+    steps = sorted(set(range(1, min(SETTLE_PREFIX, len(order)) + 1))
+                   | {len(order) * i // 10 for i in range(1, 11) if len(order) * i // 10 > SETTLE_PREFIX})
+    for j in steps:
+        c = ratio * batch_cost(order[:j]) + keep * _pack_lb(final - set(order[:j])) + (1 - keep) * best0
+        if c < best:
+            best, best_j = c, j
+    if not best_j:
+        return final
+    batch = order[:best_j]
+    res = yield batch, False
+    ok = {n for n, st in res.items() if st == "P"}
+    bad = {n for n in batch if res.get(n) != "P"}
+    final -= ok
+    if bad:
+        # A new failure: slow tests left out on clean evidence come back unless their own
+        # test file showed all of its runnable candidates passing.
+        allpass = {n for n, st in (seen | res).items() if st == "P"}
+        rest = [n for n in C if not is_heavy(n)]
+        for g in C:
+            if g in final or g in seen or g in res or not is_heavy(g):
+                continue
+            rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
+            if not rel or not all(n in allpass for n in rel):
+                final.add(g)
+    return final
+
+
+def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
     """Generator: yields (tests, stop_first) batches, receives {n: 'P'|'F'}, returns the final set.
 
     Passing probes can clear a giant on evidence from its test file. A clean
@@ -830,9 +907,9 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         return set(C)  # Fixture edits and patches the engine cannot apply stay static.
     if known:
         # Tests reading an edited data file: included as they are, never run here.
-        rest_gen = policy([n for n in C if n not in known], dur, False, focus, None)
+        rest_gen = _policy([n for n in C if n not in known], dur, False, focus, None)
         return set(known) | (yield from rest_gen)
-    heavy = [n for n in C if n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS]
+    heavy = [n for n in C if is_heavy(n)]
     hs = set(heavy)
     rest = sorted((n for n in C if n not in hs), key=lambda n: (CPU_EST.get(n, dur[n]), n))
     if not rest:
@@ -871,6 +948,16 @@ MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 CLEAN_SKIPS_HEAVY = os.environ.get("RWX_CLEAN_SKIPS_HEAVY", "1") == "1"
 RUN_FRAC = float(os.environ.get("RWX_RUN_FRAC", "0"))
+
+
+def _pack_lb(nums) -> int:
+    """Lower bound of _pack_cost (longest test vs even split, per worker count). LPT met it
+    on every lab, sample and synthetic set checked but 2 of 5,040 (by at most 20 ms)."""
+    if not nums:
+        return 0
+    ds = [DUR[n] for n in nums]
+    top, tot = max(ds), sum(ds)
+    return min(max(top, -(-tot // k)) + WORKER_MS * k for k in range(1, min(MAX_WORKERS, len(ds)) + 1))
 
 
 def _pack_cost(nums) -> int:
@@ -920,7 +1007,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         return (yield from _live(C, rest, heavy, passed, failed | (set(probe) - passed - failed)))
     giants = [n for n in heavy if dur[n] >= SKIP_MIN_MS]
     if not giants and not BET_CLEAN:
-        return set(C) - passed
+        return (yield from _finish_clean(C, rest, heavy, passed, NOGIANT_FRAC))
     # Second probe: ALL runnable candidates from each giant's own test file (when they fit
     # the budget, class setup included), then a wider spread.
     remaining = [n for n in rest if n not in passed]
@@ -977,10 +1064,32 @@ RELATED_MS = int(os.environ.get("RWX_RELATED_MS", "2000"))
 NARROW_ON = os.environ.get("RWX_NARROW") == "1"  # experiment: off (cost more than it saved in the lab)
 
 
+NOGIANT_FRAC = float(os.environ.get("RWX_NOGIANT_FRAC", "0"))
+LIVE_FILE_FRAC = float(os.environ.get("RWX_LIVE_FILE_FRAC", "0"))
+LIVE_REST_FRAC = float(os.environ.get("RWX_LIVE_REST_FRAC", "0"))
+
+
+def _finish_clean(C, rest, heavy, passed, frac):
+    """Everything run so far passed. Run the remaining runnable candidates when their CPU
+    is below frac x the worker cost a clean result would save."""
+    selected = set(C) - passed
+    remaining = [n for n in rest if n not in passed]
+    mandatory = set(heavy) & NO_RUN if CLEAN_SKIPS_HEAVY else {n for n in heavy if n in NO_RUN or DUR[n] < SKIP_MIN_MS}
+    if not remaining or frac <= 0 or batch_cost(remaining) > frac * (_pack_cost(selected) - _pack_cost(mandatory)):
+        return selected
+    res = yield remaining, True
+    clean = {n for n, st in res.items() if st == "P"}
+    if len(clean) == len(remaining):
+        return mandatory
+    return (yield from _live(C, rest, heavy, passed | clean, {n for n, st in res.items() if st == "F"}))
+
+
 def _live(C, rest, heavy, passed, failed):
     """Something failed. Keep everything not proven passing, except slow tests that a
     narrow failure (few tests failing, none in the slow test's own file) cannot reach."""
     dur = DUR
+    if LIVE_FILE_FRAC > 0 or LIVE_REST_FRAC > 0:
+        return (yield from _live_evidence(C, rest, heavy, passed, failed))
     skippable = [n for n in heavy if dur[n] >= NARROW_SKIP_MS and n not in NO_RUN]
     if not NARROW_ON or not skippable:
         return set(C) - passed
@@ -1002,6 +1111,41 @@ def _live(C, rest, heavy, passed, failed):
     fail_files = {FILE_OF.get(n, "") for n in failed}
     drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
     return set(C) - passed - drop
+
+
+def _live_evidence(C, rest, heavy, passed, failed):
+    """Something failed. A giant goes only when every runnable candidate of its own test
+    file ran and passed (bought when that costs under LIVE_FILE_FRAC x the worker time
+    the giant adds). Then the other unrun candidates are run when their CPU is below
+    LIVE_REST_FRAC x the worker time they add."""
+    passed, failed = set(passed), set(failed)
+    giants = [g for g in heavy if DUR[g] >= SKIP_MIN_MS and g not in NO_RUN]
+    drop = set()
+    if giants and LIVE_FILE_FRAC > 0:
+        batch = []
+        for g in giants:
+            rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
+            if not rel or any(n in failed for n in rel):
+                continue
+            todo = [n for n in rel if n not in passed and n not in batch]
+            sel_now = set(C) - passed
+            gain = _pack_cost(sel_now) - _pack_cost(sel_now - {g})
+            if batch_cost(batch + todo) - batch_cost(batch) <= min(RELATED_ALL_MS, LIVE_FILE_FRAC * gain):
+                batch += todo
+                drop.add(g)
+        if batch:
+            res = yield batch, False
+            passed |= {n for n, st in res.items() if st == "P"}
+            failed |= {n for n in batch if res.get(n) != "P"}
+        drop = {g for g in drop if all(n in passed for n in rest if FILE_OF.get(n) == FILE_OF.get(g))}
+    selected = set(C) - passed - drop
+    unrun = [n for n in rest if n not in passed and n not in failed]
+    if unrun and LIVE_REST_FRAC > 0:
+        gain = _pack_cost(selected) - _pack_cost(selected - set(unrun))
+        if batch_cost(unrun) <= LIVE_REST_FRAC * gain:
+            res = yield unrun, False
+            selected -= {n for n, st in res.items() if st == "P"}
+    return selected
 
 
 class Scheduler:
@@ -1084,6 +1228,13 @@ class Scheduler:
                         nxt, stop_first = gen.send(res)
                         if time.monotonic() > self.deadline or not sess.alive:
                             raise GeneratorExit
+                        if time.monotonic() + batch_cost(nxt) / 1000 > self.deadline:
+                            # No time for this batch: the policy settles with it unreported.
+                            final = _drain(gen)
+                            sess.close()
+                            active.remove(a)
+                            yield cid, final if final is not None else set(C), "cut: no time for the next batch"
+                            continue
                         sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
                         a[4] = nxt
                     except StopIteration as e:
@@ -1120,6 +1271,20 @@ class Scheduler:
                     if a in active:
                         active.remove(a)
                     yield a[0], set(a[1]), "scheduler error"
+
+def _drain(gen):
+    """Answer every further batch with no results (all unproven); the policy's final set,
+    or None if it keeps asking."""
+    try:
+        for _ in range(20):
+            gen.send({})
+    except StopIteration as e:
+        return set(e.value)
+    except Exception:  # noqa: BLE001
+        return None
+    gen.close()
+    return None
+
 
 DUR: dict = {}
 LIVE: set = set()  # commits where some run reported a failure
