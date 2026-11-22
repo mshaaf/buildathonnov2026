@@ -23,6 +23,9 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 # The packages the commits were labeled with: the runtime engine imports sqlglot's tests.
 COPY rwx/requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
+# The slim image ships most of the standard library without bytecode: without this every
+# run (and every fresh interpreter test_lazy_load starts) recompiles it, about 0.2 s each.
+RUN python -m compileall -q -j 0 /usr/local/lib/python3.13 > /dev/null 2>&1 || true
 COPY --from=sqlglotsrc /sqlglot /sqlglot
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests > /dev/null || true
 COPY rwx /app/rwx

@@ -991,9 +991,12 @@ def _encoding_marks(text: str) -> tuple:
     return (text.startswith("\ufeff"),) + tuple(l for l in head if CODING_RE.match(l))
 
 
+_SURROGATE_ESCAPES = re.compile("[\udc80-\udcff]")
+
+
 def _undecodable(text: str) -> bool:
     """Bytes that were not UTF-8 (decoded with surrogateescape)."""
-    return any("\udc80" <= ch <= "\udcff" for ch in text)
+    return _SURROGATE_ESCAPES.search(text) is not None
 
 
 def _import_time(site) -> bool:
