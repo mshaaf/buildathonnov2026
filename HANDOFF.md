@@ -573,7 +573,7 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY, still open at 08:55 EST:** the page still marks `3b7f152` (109.6, the blind
+**FINAL ENTRY, still open at 09:10 EST:** the page still marks `3b7f152` (109.6, the blind
 diagnostic, 2 misses on the 30 samples) as "Entered in the final". Someone has to click
 "Pick as our final entry" on a safe build. Best safe candidate right now: **BB-A0EE91C1,
 `343cf5a1c8044a1d6c6ff463822e1a4815cfe200`, branch `opt-gate-ng`, 113.3**.
@@ -642,3 +642,39 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
   free up at 9:24, 9:31, 9:37 and 9:44. Say so in the team chat before using one.
 - Ali's lab is on his Mac (`blast-lab/`); the previous lead session was lost in a reboot at
   about 08:08 EST and this section restarts from its files.
+
+### Update 09:10 EST
+
+- Board: `851cb8d` (guard at 4+) scored 130.6 = 123.394 simulated, so at least 4 other executor
+  tests fail on the practice commit while TPC-DS passes; no guard of that kind keeps the gain.
+  `343cf5a` (no guard, 1500 ms) scored **113.3** = 101.94 + 11.2 to 11.5 CPU, 0 misses.
+- A failing gate costs as much as a passing one: the test executes every selected query before
+  it compares any result. Native Mac, one gate run: 280 ms budget (42 parsed, none executed)
+  0.26 s; 500 ms 0.75 to 0.93 s; 1500 ms 1.2 to 1.5 s. Board CPU is about 2.7x that.
+- Larger probes before the clean bet, real selector over the 483 lab commits (misses / native
+  session CPU): 150/250 ms 28 / 231 s; 400/800 21 / 234 s; **1000/2000 18 / 251 s**;
+  2000/4000 16 / 254 s but one new miss (`boolx/b005`: with the bigger first probe failing,
+  the narrow rule's partial path drops TPC-DS, which really fails). Every commit that
+  1000/2000 fixes is one where the larger probe saw a failing test; no new misses. On the 30
+  samples all sizes give 94.581 s and 0 misses, and cost about 0.3 s of native CPU.
+- and/or value profiles (`RWX_BOOL_PROFILE=1`, side file `rwx/maps/bool.pkl.z`, agent branch
+  `opt-sim` 03892b2): real selector, misses 28 -> 24, no new ones (boolx b023, b024, b025,
+  b035: narrowed sets are verified in full instead of bet). Narrows 33 of 513 commits with
+  truth, drops a truly failing test on none. Samples byte-identical.
+- Simulated time outside TPC-DS is at the floor on sample-like commits (agent report): packing
+  is within 0.07 s of optimal over 156 distinct sets; verifying more on live commits costs
+  more CPU than it saves; mid-weight optimizer tests printed unrun fail more often than they
+  pass. CPU: nothing output-neutral beyond `RWX_FAST_CMP` (0.1 to 0.2 s), which is NOT in the
+  candidates below (new code, tiny gain).
+- **Candidates for the 9:24 and 9:31 slots** (local until submitted):
+  - C1 `d9cad54` (branch `opt-c1`): `343cf5a` + settings only: `RWX_PROBE_MS=1000
+    RWX_PROBE2_MS=2000 RWX_TPCDS_BLIND_MS=500`. Samples 94.581 s, 0 misses.
+  - C2 `5a4ad21` (branch `opt-c2`): C1 + `RWX_BOOL_PROFILE=1` (45 lines of loader + 24 KB
+    data). Samples identical to C1.
+  Expected on practice: 101.94 simulated, CPU about 10 to 11, so about 112.
+- Still running: `opt-dig2` (sound per-query TPC-DS check for one-line code, several files,
+  non-TPC fixture edits); an agent classifying the remaining lab misses; a cloud code review
+  of `343cf5a` against `main`.
+- Note for local runs on zsh: `env $FLAGS cmd` does not split `$FLAGS`; use bash
+  (`blast-lab/scratch-lead/srun.sh`, `e2e/e2e.sh`). Ali's session's first sample checks this
+  morning ran with default flags because of this and were redone.
