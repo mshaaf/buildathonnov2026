@@ -528,7 +528,7 @@ class Analyzer:
                 except PatchMismatch:
                     content = None
             if (removed and not fp.copy and content is not None and content == self.old_source(removed)
-                    and added.startswith("tests/") and removed.startswith("tests/")):
+                    and added.startswith("tests/") and removed.startswith("tests/") and _in_package(added)):
                 # A test module moved unchanged: its import already ran in every session.
                 why.append(f"moved {removed} -> {added} unchanged")
             else:
@@ -562,6 +562,10 @@ class Analyzer:
                 return self.all
             if rel.startswith("sqlglot/"):
                 return self.new_module(rel, content, why)
+            if not _in_package(rel):
+                # pytest puts a non-package test directory on sys.path (shadowing imports)
+                why.append(f"new {rel} outside a package -> ALL")
+                return self.all
             if _is_test_file(base):
                 if content is not None and _inert_module(content):
                     why.append(f"new test file {rel}: inert module -> nothing")
@@ -573,8 +577,9 @@ class Analyzer:
         if "/" not in rel and rel in CONFIG_FILES:
             why.append(f"new config {rel} -> ALL")
             return self.all
-        if binary and rel.startswith("sqlglot/"):
-            why.append(f"new binary {rel} -> ALL")
+        if rel.startswith("sqlglot/") and (binary or not rel.endswith(TEXT_SUFFIXES)):
+            # an extension module (.so/.pyd) or a .pyc would shadow a module of the package
+            why.append(f"new {rel} inside the package -> ALL")
             return self.all
         why.append(f"new {rel}: nothing opens it")
         return 0
@@ -761,6 +766,15 @@ def source_words():
             log(f"source scan failed: {e!r}")
             _WORDS.append(None)
     return _WORDS[0]
+
+
+TEXT_SUFFIXES = (".md", ".txt", ".rst", ".typed", ".json", ".toml", ".cfg", ".ini", ".yaml", ".yml", ".csv", ".sql")
+
+
+def _in_package(rel: str) -> bool:
+    """The file's directory is a package in the pinned tree (pytest imports by package name)."""
+    d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    return bool(d) and (SRC / d / "__init__.py").is_file()
 
 
 def _is_test_file(base: str) -> bool:
