@@ -354,7 +354,8 @@ scores the newest commit on `main`, which is old):
 |---|---|---|
 | `rwx` | latest | development line, all flags off by default |
 | `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
-| `bet-narrow-mid` | `bec9335` | experiment: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
+| `bet-narrow-mid` | `bec9335` | **141.8**: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
+| `bet-narrow-mid-fx` | `2ac5328` | bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0` |
 | `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
 | `diag-*` | | diagnostics only, never pick these |
 
@@ -386,3 +387,27 @@ included blind), plus about 15 s CPU.
 **Ideas not yet tried:** making the slow optimizer tests cheaper to verify (run only the
 fixture entries that reach the changed code, like Astra's per-query TPC-DS check);
 cutting CPU in the bet's finishing step for large clean commits.
+
+### Nov 22, ~05:30 UTC: TPC fixture runs (`RWX_FIXTURE_RUN=1`)
+
+Practice has 13 fixture-only commits that cost 57.5 s (4.4 s each), against 2.2 s each
+for the samples' fixture commits. The only fixtures that can cost much more are
+`tpc-h.sql` and `tpc-ds.sql`: their readers include `test_execute_tpch` (3.9 s),
+`test_optimized_tpch` (3.5 s) and `test_execute_tpcds` (21.5 s), and fixture-only
+commits were never run, so they were printed blind.
+
+Now the session swaps in the edited file's query pairs (`rwx/fixture_run.py`) and runs
+TestExecutor's per-query tests on the edited queries only. The other queries are
+byte-identical with no code changed, so they pass as at the pinned commit. A pass drops
+the test. TestOptimizer readers (`test_tpch`, `test_tpcds`) stay printed. Lab:
+`tpcfix` 219.4 -> 196.1 s, `tpcfix2` (sample-style edits) 196.2 -> 190.2 s. Both are
+exact (equal to the oracle) with 0 misses. Sample output is byte-identical.
+
+Other things measured this round:
+- gc tuning in sessions (off, high thresholds): no change, within noise.
+- Parent CPU is ~1.8 s: test-module imports 0.56 s, the TestExecutor presetup 0.74 s
+  (TPC-DS tables 0.59 s of it), map + analysis ~0.2 s. A build-time pickle of the
+  presetup state would load in 0.14 s (saves ~0.6 s), but it needs a manifest of the
+  code setUpClass runs (as warm keys). Not built yet.
+- The largest sample session is 2haz (6 s): `is` -> `==` on an enum, which breaks
+  nothing. The bet's finishing step verifies its 64 runnable candidates.
