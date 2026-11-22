@@ -544,6 +544,17 @@ def def_time_parts(node, future_annotations: bool) -> list:
     return parts
 
 
+def _unpack_safe(target, value) -> bool:
+    """Assigning value to target cannot fail on unpacking: a plain target, or a flat tuple /
+    list target without starred items given a literal sequence of the same length."""
+    if not isinstance(target, (ast.Tuple, ast.List, ast.Starred)):
+        return True
+    if isinstance(target, ast.Starred) or any(isinstance(x, (ast.Starred, ast.Tuple, ast.List)) for x in target.elts):
+        return False
+    return (isinstance(value, (ast.Tuple, ast.List)) and not any(isinstance(x, ast.Starred) for x in value.elts)
+            and len(value.elts) == len(target.elts))
+
+
 def stmt_safe(a, b, future_annotations: bool, known=frozenset()) -> bool:
     """Running statement b at import time cannot raise where a did not (same position)."""
     if type(a) is not type(b):
@@ -552,6 +563,7 @@ def stmt_safe(a, b, future_annotations: bool, known=frozenset()) -> bool:
         return (len(a.targets) == len(b.targets)
                 and all(_same_syntax(x, y) or (isinstance(x, ast.Name) and isinstance(y, ast.Name))
                         for x, y in zip(a.targets, b.targets))
+                and all(_unpack_safe(t, b.value) or _same_syntax(a.value, b.value) for t in b.targets)
                 and value_safe(a.value, b.value, known))
     if isinstance(a, ast.AnnAssign):
         ann_ok = future_annotations or _same_syntax(a.annotation, b.annotation) or expr_safe(b.annotation, known)
