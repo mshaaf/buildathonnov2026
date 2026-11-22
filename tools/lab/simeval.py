@@ -128,7 +128,7 @@ def replay(C, F, data_only, focus, known, cost, info, exec_n):
             note = "gate"
             if exec_n in F:
                 out.add(exec_n)
-    return out, cpu, ran, note
+    return out, cpu, ran, note, batches
 
 
 def covered(C, tcand):
@@ -192,7 +192,15 @@ def main():
             focus = sel.commit_focus(M, C, py)
             info = exec_info(eng, py, data, an.case_site) if (eng and py) else ("swap", None, None)
             cost = (lambda n: tcpu.get(n, sel.CPU_EST[n])) if CPU_SRC == "truth" else (lambda n: sel.CPU_EST[n])
-            out, cpu, ran, note = replay(C, F, data_only, focus, known, cost, info, exec_n)
+            deferred = getattr(an, "deferred", 0) & valid
+            out, cpu, ran, note, batches = replay(C, F, data_only, focus, known, cost, info, exec_n)
+            if deferred:
+                # main adds the importers unless the session showed the patched modules import;
+                # in a truth record an import failure shows as every candidate failing
+                import_failed = bool(tcand) and bool(F) and F >= tcand
+                if not batches or import_failed:
+                    out |= {n for n in dur if deferred >> n & 1}
+                    note += " +importers"
             any_engine |= bool(cpu)
             settle_peak[0] = max(settle_peak[0], sel.SETTLE_SPENT[0] / max(1, len(truth)))
             sim = sel._pack_cost(out)
