@@ -1,7 +1,7 @@
 """Lab: run each sample commit's full candidate set through the engine and compare
 with the labeled answers. Run inside the lab image with the repo at /app."""
 import json, sys, time, resource, os
-sys.path.insert(0, "/app/rwx")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "rwx"))
 os.environ.setdefault("RWX_SRC", "/sqlglot")
 import selector as sel
 from engine import Engine
@@ -17,7 +17,7 @@ dur = {t["number"]: t["seconds"] for t in tests}
 valid = 0
 for n in dur: valid |= 1 << n
 t0 = cpu()
-eng = Engine("/sqlglot", tests, log=lambda *a: print(*a, file=sys.stderr),
+eng = Engine(os.environ["RWX_SRC"], tests, log=lambda *a: print(*a, file=sys.stderr),
              presetup=("tests/test_executor.py::TestExecutor",) if os.environ.get("PRESETUP") == "1" else ())
 print(f"warm cpu {cpu()-t0:.2f}s, warm codes {len(eng.warm_keys)}", flush=True)
 an = sel.Analyzer(sel.Map(sel.MAP), valid)
