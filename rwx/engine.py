@@ -241,6 +241,7 @@ class Engine:
         profile = Path(self.root) / PROFILE
         self.executor_profile = json.loads(profile.read_text()) if self.executor_test is not None and profile.is_file() else {}
         self.warm_codes: set = set()
+        self.presetup_keys: set = set()  # code keys a cached setUpClass would have run
         self.presetup_done: set = set()
         install_inline_pool()
         if self.root not in sys.path:
@@ -286,7 +287,7 @@ class Engine:
             mon.set_events(tool, 0)
             mon.register_callback(tool, mon.events.PY_START, None)
             mon.free_tool_id(tool)
-        self.warm_keys = {(c.co_filename, c.co_firstlineno, c.co_qualname) for c in seen}
+        self.warm_keys = {(c.co_filename, c.co_firstlineno, c.co_qualname) for c in seen} | self.presetup_keys
 
     def _presetup(self, ref: str):
         """Run a test class's setUpClass once here, so forked children share its data.
@@ -299,17 +300,30 @@ class Engine:
         if getattr(klass, "__unittest_skip__", False):
             return
         real = getattr(mod, "duckdb", None)
-        if real is not None:
-            mod.duckdb = _LazyDuckModule(real)
-        try:
-            klass.setUpClass()
-        finally:
+        keys = None
+        if os.environ.get("RWX_PRESETUP_CACHE") == "1" and real is not None:
+            try:
+                from presetup_cache import REF, load
+
+                if ref == REF:
+                    keys = load(self.root, klass, real)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"presetup cache unusable: {e!r}")
+                keys = None
+        if keys is not None:
+            self.presetup_keys |= keys
+        else:
             if real is not None:
-                mod.duckdb = real
+                mod.duckdb = _LazyDuckModule(real)
+            try:
+                klass.setUpClass()
+            finally:
+                if real is not None:
+                    mod.duckdb = real
         klass.setUpClass = classmethod(lambda cls: None)
         klass.tearDownClass = classmethod(lambda cls: None)
         self.presetup_done.add(ref)
-        self.log(f"presetup done: {ref}")
+        self.log(f"presetup done: {ref}{' (cached)' if keys is not None else ''}")
 
     def _index_functions(self):
         root = self.root + "/"
