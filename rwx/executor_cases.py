@@ -39,6 +39,15 @@ def build(root):
             hits[line] = hits.get(line, 0) | bit
         return mon.DISABLE
 
+    def start(code, offset):
+        # Code objects whose body sits on their first line (one-line lambdas/defs) never
+        # raise a LINE event: record every start too, so a missing key means "never ran".
+        if code.co_filename.startswith(prefix):
+            rel = code.co_filename[len(prefix) :]
+            key = f"{rel}:{code.co_firstlineno}:{code.co_qualname}"
+            records[key] = records.get(key, 0) | (1 << (current + 1) if current is not None else 1)
+        return mon.DISABLE
+
     def enter_case(index):
         nonlocal current
         current = index
@@ -85,8 +94,9 @@ def build(root):
     tests.TestExecutor.subtestHelper = check_case
     tests.mp_execute = execute_case
     mon.use_tool_id(tool, "executor-query-coverage")
-    events = mon.events.LINE
-    mon.register_callback(tool, events, enter)
+    events = mon.events.LINE | mon.events.PY_START
+    mon.register_callback(tool, mon.events.LINE, enter)
+    mon.register_callback(tool, mon.events.PY_START, start)
     mon.set_events(tool, events)
     try:
         result = unittest.TestSuite([tests.TestExecutor("test_execute_tpcds")]).run(unittest.TestResult())
@@ -102,20 +112,33 @@ def build(root):
     return {}
 
 
-def affected_cases(profile, root, swaps, site=None):
+def affected_cases(profile, root, swaps, site=None, sites=None):
+    """Indices of the TPC-DS queries that ran a swapped code object, or None when unknown.
+
+    sites: {(rel, "firstlineno:name"): [(lo, hi), ...]} changed statement spans (every change
+    of that code object), narrowing it to the queries that ran a line of those statements.
+    A key missing from the profile is unknown, not "never ran": line events never fire on a
+    code object's first line, so one-line lambdas/defs leave no trace (None). A span that
+    covers the code object's first line is decided at function level for the same reason."""
     coverage = profile["coverage"]
+    spans = dict(sites or {})
+    if site and not spans:
+        spans[(site[0], site[1])] = [tuple(site[2])]
     indices = 0
     for (filename, line, name), _ in swaps:
         rel = filename.removeprefix(root + "/")
         key = f"{rel}:{line}:{name}"
-        mask = int(coverage.get(key, "0"), 16)
+        if key not in coverage:
+            return None
+        mask = int(coverage[key], 16)
         if mask & 1:
             return None
-        if site and site[:2] == (rel, f"{line}:{name.rsplit('.', 1)[-1]}") and "lines" in profile:
-            lo, hi = site[2]
-            for lineno, hits in profile["lines"].get(key, {}).items():
-                if lo <= int(lineno) <= hi:
-                    indices |= int(hits, 16)
+        sp = spans.get((rel, f"{line}:{name.rsplit('.', 1)[-1]}"))
+        if sp and "lines" in profile and all(lo > line for lo, _ in sp):
+            hits = profile["lines"].get(key, {})
+            for lineno, h in hits.items():
+                if any(lo <= int(lineno) <= hi for lo, hi in sp):
+                    indices |= int(h, 16)
         else:
             indices |= mask
     return [i for i in range(len(profile["ms"])) if (indices >> (i + 1)) & 1]

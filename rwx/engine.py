@@ -35,6 +35,7 @@ from pathlib import Path
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
 TPCDS_BLIND_MS = int(os.environ.get("RWX_TPCDS_BLIND_MS", "0"))  # gate when affected queries are unknown: cheapest queries up to this est CPU
+TPCDS_WIDE = os.environ.get("RWX_TPCDS_WIDE", "0") == "1"  # per-query check also for several files / non-TPC data / all changed statements
 TPC_DATA = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")  # fixtures the executor tests read
 TPCDS_VERIFY_MS = int(os.environ.get("RWX_TPCDS_VERIFY_MS", "5000"))  # most affected-query CPU (est ms) a session prepares to verify
 CPU_DUMP = os.environ.get("RWX_CPU_DUMP", "")  # lab only: per-session CPU breakdown file
@@ -760,6 +761,28 @@ class _LazyDuckModule:
 class Session:
     """One forked child holding one commit's patched tree; runs test batches on request."""
 
+    @staticmethod
+    def _tpcds_checkable(py_changes, data_changes, swaps) -> bool:
+        """The per-query TPC-DS check sees every change: one sqlglot file and no data edit, or
+        (RWX_TPCDS_WIDE) several sqlglot files whose modules are all loaded (so every changed
+        code object is among the swaps) and data edits only outside the TPC fixtures, the
+        only data test_execute_tpcds reads."""
+        if not py_changes or not all(rel.startswith("sqlglot/") and rel.endswith(".py") for rel in py_changes):
+            return False
+        if len(py_changes) == 1 and not data_changes:
+            return True
+        if not TPCDS_WIDE:
+            return False
+        if any(rel.startswith(TPC_DATA) or not rel.startswith("tests/fixtures/") for rel in data_changes):
+            return False
+        for rel in py_changes:
+            name = rel[:-3].replace("/", ".")
+            if name.endswith(".__init__"):
+                name = name[: -len(".__init__")]
+            if name not in sys.modules:
+                return False  # its changed code objects are not among the swaps
+        return True
+
     def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None, fixture=None):
         self.mode, swaps = engine.plan(py_changes)
         self.info = swaps if self.mode == "reimport" else len(swaps)
@@ -767,12 +790,15 @@ class Session:
         self.executor_ms = None
         self.executor_partial = None
         known_big = False
-        if (engine.executor_profile and not data_changes and len(py_changes) == 1
-                and self.mode == "swap" and swaps
-                and next(iter(py_changes)).startswith("sqlglot/")):
+        if (engine.executor_profile and self.mode == "swap" and swaps
+                and self._tpcds_checkable(py_changes, data_changes, swaps)):
             from executor_cases import affected_cases
 
-            case_indices = affected_cases(engine.executor_profile, engine.root, swaps, case_site)
+            if TPCDS_WIDE and isinstance(case_site, dict):
+                case_indices = affected_cases(engine.executor_profile, engine.root, swaps, sites=case_site)
+            else:
+                case_indices = affected_cases(engine.executor_profile, engine.root, swaps,
+                                              case_site if not isinstance(case_site, dict) else None)
             if case_indices is not None:
                 ms = engine.executor_profile["ms"]
                 case_ms = sum(ms[i] for i in case_indices)

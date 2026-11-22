@@ -589,6 +589,12 @@ class Analyzer:
         if len(old_changed) + len(added) > 3000:
             why.append(f"{rel}: very large change -> importers")
             return self.importers(rel)
+        # Statement spans narrow the TPC-DS per-query check only when the edit replaces lines
+        # one for one and leaves every statement where it was (same kind, lines, indent):
+        # then only expressions changed, and a query that ran none of a changed statement's
+        # lines runs the same code as before.
+        spans_ok = bool(TPCDS_WIDE and rel.startswith("sqlglot/") and old_changed and old_changed == added
+                        and all(h.old_len == h.new_len for h in hunks) and _stmt_skeleton(tree) == _stmt_skeleton(new_tree))
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
@@ -597,6 +603,8 @@ class Analyzer:
             candidates = self.site_mask(rel, site, why) | self.lambda_outer(rel, loc, site, ln, why)
             if single_file and old_changed == added == {ln} and site.kind == "func":
                 self.case_site = rel, site.code_key, site.lines
+            if site.kind == "func" and spans_ok:
+                self.case_sites.setdefault((rel, site.code_key), []).append(tuple(site.lines))
             if (single_file and self.tokenizer and old_changed == added == {ln}
                     and site.kind == "import" and site.class_key(rel) in self.tokenizer["classes"]):
                 name = flipped_bool(site.stmt, old.splitlines()[ln - 1], new.splitlines()[ln - 1])
@@ -883,6 +891,7 @@ class Analyzer:
         self.data_changes: dict = {}
         self.sites: set = set()
         self.case_site = None
+        self.case_sites: dict = {}  # (rel, code key) -> changed statement spans (TPC-DS per-query check)
         self.unverifiable = False
         self.deferred = 0  # importers needed unless the engine proves the patched modules import
         self.cmp_flip = None  # (rel, line, col, old op, new op): first comparison flip seen
@@ -1001,6 +1010,13 @@ class Analyzer:
 
 CONFIG_FILES = ("pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", ".pytest.ini")
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+TPCDS_WIDE = os.environ.get("RWX_TPCDS_WIDE", "0") == "1"
+
+
+def _stmt_skeleton(tree) -> list:
+    return [(type(n).__name__, n.lineno, n.end_lineno, n.col_offset) for n in ast.walk(tree) if isinstance(n, ast.stmt)]
 
 
 def _encoding_marks(text: str) -> tuple:
@@ -2269,6 +2285,7 @@ class Scheduler:
                             if sess.alive and res.get(executor) == "P":
                                 selected = selected - {executor}
                             note = "checked affected TPC-DS queries"
+                            note += f" ({'pass' if executor not in selected else 'FAIL'}, {sess.executor_ms} ms{', blind' if getattr(sess, 'executor_blind', False) else ''}{', partial' if sess.executor_partial else ''})"
                         else:
                             # a sample of affected queries gated leaving TPC-DS out
                             if not (sess.alive and res.get(executor) == "P"):
@@ -2573,6 +2590,8 @@ def main() -> None:
         try:
             mask, why = an.analyze(read_patch(patch))
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
+            if TPCDS_WIDE:
+                case_site = {k: list(v) for k, v in an.case_sites.items()}
             if an.deferred:
                 DEFERRED[cid] = an.deferred & valid
             fruns = dict(an.fixture_runs)
