@@ -724,7 +724,10 @@ NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
 BREADTH = float(os.environ.get("RWX_BREADTH", "0.25"))
 RELATED_MS = int(os.environ.get("RWX_RELATED_MS", "2000"))
 NARROW_ON = os.environ.get("RWX_NARROW") == "1"
-NARROW_FULL_MS = int(os.environ.get("RWX_NARROW_FULL_MS", "4000"))  # experiment: off (cost more than it saved in the lab)
+NARROW_FULL_MS = int(os.environ.get("RWX_NARROW_FULL_MS", "4000"))
+NARROW_CHUNKS = os.environ.get("RWX_NARROW_CHUNKS", "1") == "1"
+NARROW_SAMEFILE = os.environ.get("RWX_NARROW_SAMEFILE") == "1"
+NARROW_CHUNK_MS = int(os.environ.get("RWX_NARROW_CHUNK_MS", "600"))  # experiment: off (cost more than it saved in the lab)
 
 
 def _live(C, rest, heavy, passed, failed):
@@ -751,10 +754,41 @@ def _live(C, rest, heavy, passed, failed):
     done = passed | failed
     unrun = [n for n in rest if n not in done]
     if unrun and batch_cost(unrun) <= NARROW_FULL_MS:
-        # full knowledge of the runnable candidates, then decide the giants on it
-        res = yield unrun, False
-        passed = passed | {n for n, st in res.items() if st == "P"}
-        failed = failed | {n for n in unrun if res.get(n) != "P"}
+        # Full knowledge of the runnable candidates, then decide the slow tests on it.
+        # Run in chunks, the slow tests' own files first, and stop as soon as the
+        # answer cannot change: every droppable test already has a failure in its
+        # file, or failures are already broad whatever the rest would show.
+        sfiles = {FILE_OF.get(g, "") for g in skippable}
+        if NARROW_SAMEFILE:
+            # only the slow tests' own files decide; the rest is printed unverified
+            others = [n for n in unrun if FILE_OF.get(n, "") not in sfiles]
+            same = [n for n in unrun if FILE_OF.get(n, "") in sfiles]
+            if same:
+                res = yield same, False
+                passed = passed | {n for n, st in res.items() if st == "P"}
+                failed = failed | {n for n in same if res.get(n) != "P"}
+            fail_files = {FILE_OF.get(n, "") for n in failed}
+            drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
+            return set(failed) | set(others) | (set(heavy) - drop)
+        order = sorted(unrun, key=lambda n: (FILE_OF.get(n, "") not in sfiles, CPU_EST.get(n, dur[n]), n))
+        total = len(passed) + len(failed) + len(order)
+        while order:
+            if NARROW_CHUNKS:
+                chunk, budget = [], max(NARROW_CHUNK_MS, batch_cost(order[:1]))
+                while order and batch_cost(chunk + order[:1]) <= budget:
+                    chunk.append(order.pop(0))
+                # keep a file's tests together with the slow tests' files first
+            else:
+                chunk, order = order, []
+            res = yield chunk, False
+            passed = passed | {n for n, st in res.items() if st == "P"}
+            failed = failed | {n for n in chunk if res.get(n) != "P"}
+            if not order:
+                break
+            fail_files = {FILE_OF.get(n, "") for n in failed}
+            if all(FILE_OF.get(g, "") in fail_files for g in skippable) or len(failed) >= BREADTH * total:
+                # nothing can be dropped any more: keep every slow test, unverified rest included
+                return set(C) - passed
         breadth = len(failed) / max(1, len(passed) + len(failed))
         fail_files = {FILE_OF.get(n, "") for n in failed}
         drop = set()
