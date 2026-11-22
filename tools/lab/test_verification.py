@@ -272,11 +272,11 @@ class VerificationTests(unittest.TestCase):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 100, 3: 9000}
         with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5,
-                            SETTLE_BUDGET=[150], SETTLE_SPENT=[100]):
+                            SETTLE_SCALE=[50 / 13000]):  # allowance 50 ms for this worker cost (13 s)
             gen = selector.policy([0, 1, 2, 3], durations, False)
             next(gen)
             with self.assertRaises(StopIteration) as done:
-                gen.send({0: "P"})  # settling [2, 1] would cost 101 ms, 51 left
+                gen.send({0: "P"})  # settling [2, 1] would cost 101 ms
             self.assertEqual(done.exception.value, {1, 2, 3})
 
     def test_settle_after_a_failure(self):

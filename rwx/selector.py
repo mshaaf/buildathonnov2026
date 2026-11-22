@@ -1026,11 +1026,13 @@ def is_heavy(n) -> bool:
     return cpu > RUN_MAX_MS and cpu > RUN_GAIN * DUR[n]
 
 
-SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
+SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "1.0"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
-SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "2500"))  # est CPU settle may spend, per commit in the batch
-SETTLE_BUDGET = [float("inf")]  # set by main(): per-commit budget x commits
-SETTLE_SPENT = [0]
+SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "6000"))  # est CPU settle may spend, per commit in the batch
+# Batch-wide settle budget, split up front so no commit's decisions depend on which other
+# commits finished first: commit share = SETTLE_SCALE x worker cost of its candidate set
+# (set by main(): budget per commit x commits / summed worker cost of the verifiable commits).
+SETTLE_SCALE = [float("inf")]
 SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may also run tests this costly (e.g. generator_memory)
 SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
@@ -1051,6 +1053,8 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
     left_out = {g for g in C if g not in final and g not in seen and is_heavy(g)}
+    allowance = SETTLE_SCALE[0] * _pack_lb(C) if SETTLE_SCALE[0] != float("inf") else float("inf")
+    spent = 0
     settled: dict = {}
     chunk = SETTLE_CHUNK_MS
     for _ in range(SETTLE_ROUNDS):
@@ -1066,9 +1070,9 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
                 cut.append(n)
             batch = cut
         chunk *= 2
-        if SETTLE_SPENT[0] + batch_cost(batch) > SETTLE_BUDGET[0]:
-            break  # batch-wide settle budget exhausted: print the unproven tests
-        SETTLE_SPENT[0] += batch_cost(batch)
+        if spent + batch_cost(batch) > allowance:
+            break  # this commit's share of the settle budget is spent: print the unproven tests
+        spent += batch_cost(batch)
         res = yield batch, False
         settled.update({n: res.get(n, "F") for n in batch})
         final -= {n for n in batch if res.get(n) == "P"}
@@ -1086,6 +1090,12 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
 
 SETTLE_CHUNK_MS = int(os.environ.get("RWX_SETTLE_CHUNK_MS", "2000"))  # first settle batch size (est), doubling
 SETTLE_ROUNDS = 8
+
+
+def set_settle_scale(commits: int, verifiable: list) -> None:
+    """Split the batch's settle budget over the commits by worker cost, before any runs."""
+    weight = sum(_pack_lb(C) for C in verifiable)
+    SETTLE_SCALE[0] = SETTLE_BUDGET_PER_COMMIT_MS * commits / weight if weight else float("inf")
 
 
 def _settle_batch(final, seen, known):
@@ -1774,7 +1784,6 @@ def main() -> None:
         an = Analyzer(cmap, valid, lazy, file_tests)
     an.class_masks = class_masks(tests)
     patches = list_patches(DATA / "commits")
-    SETTLE_BUDGET[0] = SETTLE_BUDGET_PER_COMMIT_MS * len(patches)
     jobs, final = [], {}
     for patch in patches:
         cid = patch.name[: -len(".patch")]
@@ -1801,6 +1810,7 @@ def main() -> None:
         except Exception as e:  # never crash: run everything for this commit
             log(f"{cid}: job error {e!r} -> ALL")
             jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
+    set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
