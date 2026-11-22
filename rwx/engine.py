@@ -34,8 +34,12 @@ from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
+CPU_DUMP = os.environ.get("RWX_CPU_DUMP", "")  # lab only: per-session CPU breakdown file
 WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
-WATCH_STARTUP_S = 10.0  # ... and for the child's first line (patching, re-import, import check)
+# ... and for the child's first line ("M", after patching, re-import and the import
+# check): WATCH_FACTOR x the estimated start-up, which is about 1 s for a re-import.
+STARTUP_EST_S = {"reimport": 1.0, "swap": 0.1}
+WATCH_STARTUP_FACTOR = 8.0
 
 
 class InlinePool:
@@ -541,6 +545,8 @@ class Engine:
                 bad.append(rel)
         msg = f"M fail {' '.join(bad)}" if bad else "M skip" if skipped else "M ok"
         os.write(wfd, (msg + "\n").encode())
+        if CPU_DUMP:  # lab diagnostics: the child's start-up CPU (fork, patch, re-import, check)
+            os.write(wfd, f"C {time.process_time():.4f}\n".encode())
 
     def _child(self, mode, swaps, py_changes, data_changes, numbers, wfd):
         self._apply(mode, swaps, py_changes, data_changes)
@@ -747,6 +753,7 @@ class Session:
         self.windows: dict | None = None  # test -> seconds it may run without a result line
         self.mark = 0.0  # last progress: batch submitted or a line arrived
         self.progressed = False  # any line ever arrived from this child (the first is "M")
+        self.startup_window = max(WATCH_MIN_S, WATCH_STARTUP_FACTOR * STARTUP_EST_S.get(self.mode, 1.0))
         self.pid = pid
         self.cmd = cmd_w
         self.res = res_r
@@ -759,6 +766,7 @@ class Session:
         self.crash = None
         self.import_ok = None  # set by the child's "M" line: changed modules imported cleanly
         self.total_cpu = 0.0
+        self.startup_cpu = None
         self.maxrss_mb = 0.0
 
     def fileno(self):
@@ -805,6 +813,8 @@ class Session:
                 self.crash = " ".join(parts[1:])
             elif parts[0] == "M":
                 self.import_ok = parts[1] == "ok"
+            elif parts[0] == "C":
+                self.startup_cpu = float(parts[1])
             else:
                 n = int(parts[0])
                 self.results[n] = parts[1]
@@ -817,7 +827,7 @@ class Session:
         if self.windows is None or self._deadline is None:
             return self._deadline
         if not self.progressed:
-            return self.mark + WATCH_STARTUP_S
+            return self.mark + self.startup_window
         nxt = self.next_unreported()
         return self.mark + (self.windows.get(nxt, WATCH_MIN_S) if nxt is not None else WATCH_MIN_S)
 

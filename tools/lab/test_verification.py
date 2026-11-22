@@ -149,6 +149,40 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(out[0][1], {1, 2, 3})
 
 
+class ImportHangTests(unittest.TestCase):
+    def test_import_time_hang_is_an_import_failure(self):
+        import tempfile
+        import time
+        import engine as engine_module
+
+        class Importers:
+            def file_mask(self, rel):
+                return 0b110 if rel == "tests/zz_hang.py" else 0
+
+        with tempfile.TemporaryDirectory() as root:
+            engine = _hang_engine()
+            engine.root = root
+            engine.plan = lambda changes: ("reimport", "test")
+            py = {"tests/__init__.py": ("", ""), "tests/zz_hang.py": ("", "while True:\n    pass\n")}
+
+            def fake_policy(C, dur, data_only, focus=None, known=None):
+                res = yield [0], True
+                return set(C) - {n for n, st in res.items() if st == "P"}
+
+            sched = selector.Scheduler(engine, lanes=1, deadline=time.monotonic() + 60)
+            with patch.object(engine_module, "WATCH_MIN_S", 0.3), \
+                    patch.dict(engine_module.STARTUP_EST_S, {"reimport": 0.1}), \
+                    patch.object(selector, "policy", fake_policy), \
+                    patch.multiple(selector, DUR={0: 1}, CPU_EST={0: 1}, CLS_OF={0: "Hangs"}, CLS_SETUP={},
+                                   CMAP=[Importers()], IMPORT_OK={}, DEFERRED={}):
+                start = time.monotonic()
+                out = list(sched.run([("c", [0], py, {}, False, {}, set(), None)]))
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertIs(selector.IMPORT_OK["c"], False)
+                self.assertEqual(selector.DEFERRED["c"], 0b110)
+        self.assertEqual(out[0][1], {0})
+
+
 class VerificationTests(unittest.TestCase):
     def test_session_fixture_is_set_up_once_per_session(self):
         import engine as engine_module

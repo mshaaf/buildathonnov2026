@@ -1706,7 +1706,10 @@ def _live_evidence(C, rest, heavy, passed, failed):
 HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
 # Progress watchdog: a batch is hung when no result line arrived for max(WATCH_MIN_S,
 # WATCH_FACTOR x (estimate of the test running now + its class setup)); a fresh child
-# first gets WATCH_STARTUP_S for patching and its import check. Only the running test
+# first gets max(4 s, 8 x estimated start-up) for patching and its import check; silence
+# past that in a re-import session is an import-time hang, reported as an import
+# failure (every test that loads a changed module fails, as pytest would report the
+# importers of a module whose import never returns). Only the running test
 # counts as failing; the batch's later tests continue in a fresh session of the same
 # commit, at most WATCH_RESTARTS times per commit (never for a child silent from start).
 WATCH_FACTOR = 8.0
@@ -1719,7 +1722,7 @@ class Scheduler:
         self.lanes = lanes
         self.deadline = deadline
 
-    def _windows(self, nums):
+    def _windows(self, nums, sess=None):
         """Per-test watchdog windows, or None (plain batch timeout) for engines without
         run_order (test doubles)."""
         from engine import WATCH_MIN_S
@@ -1727,10 +1730,18 @@ class Scheduler:
         run_order = getattr(self.engine, "run_order", None)
         if run_order is None:
             return None
-        # Class setup counts for every test of the class: a deferred setup (TestExecutor
-        # in re-import sessions) runs inside whichever test first reads its data.
-        return {n: max(WATCH_MIN_S, WATCH_FACTOR * (CPU_EST.get(n, DUR.get(n, 0))
-                                                   + WATCH_SETUP.get(CLS_OF.get(n), 0)) / 1000)
+        # Class setup counts for every test of the class: a deferred setup runs inside
+        # whichever test first reads its data. A re-import session builds the classes
+        # afresh, so it may pay the map's full setup (WATCH_SETUP). A swap session uses
+        # the parent's shared setup where there is one (CLS_SETUP 0) but still opens its
+        # duckdb connections lazily (about half of that setup): count half of what was shared.
+        swap = getattr(sess, "mode", None) == "swap"
+
+        def setup(c):
+            full = WATCH_SETUP.get(c, 0)
+            return (CLS_SETUP.get(c, 0) + full) / 2 if swap else full
+
+        return {n: max(WATCH_MIN_S, WATCH_FACTOR * (CPU_EST.get(n, DUR.get(n, 0)) + setup(CLS_OF.get(n))) / 1000)
                 for n in run_order(nums)}
 
     def _submit(self, a, nums, stop_first):
@@ -1741,11 +1752,23 @@ class Scheduler:
         self._send(a[3], nums, stop_first)
 
     def _send(self, sess, nums, stop_first):
-        windows = self._windows(nums)
+        windows = self._windows(nums, sess)
         if windows is None:
             sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first)
         else:
             sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first, windows=windows)
+
+    def _import_hang(self, cid, py):
+        """The patched tree never finished importing: every importer of a changed module fails."""
+        mask = 0
+        try:
+            for rel in py:
+                mask |= CMAP[0].file_mask(rel) if CMAP else 0
+        except Exception as e:  # noqa: BLE001
+            log(f"{cid}: importer mask failed {e!r}"[:200])
+        IMPORT_OK[cid] = False
+        DEFERRED[cid] = DEFERRED.get(cid, 0) | mask
+        log(f"{cid}: no import check line: import-time hang, {mask.bit_count()} importers fail")
 
     def _restart(self, a) -> bool:
         """Replace a hung (killed) session by a fresh one of the same commit, if allowed."""
@@ -1847,6 +1870,8 @@ class Scheduler:
                             sess.kill()
                             sess.close()
                             ctx["hung"] = progressed  # a child silent from the start would hang again
+                            if not progressed and getattr(sess, "mode", None) == "reimport" and ctx["py"]:
+                                self._import_hang(cid, ctx["py"])
                             log(f"{cid}: test {hung} hung after {len(hung_res) - 1} results, {len(rest)} left in the batch")
                             if rest:
                                 if self._restart(a):
@@ -1928,6 +1953,7 @@ class Scheduler:
                             continue
                         sess.close()
                         active.remove(a)
+                        _dump_cpu(cid, sess)
                         yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s rss {sess.maxrss_mb:.0f}MB batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
                     except GeneratorExit:
                         gen.close()
@@ -1945,6 +1971,20 @@ class Scheduler:
                     if a in active:
                         active.remove(a)
                     yield a[0], set(a[1]), "scheduler error"
+
+def _dump_cpu(cid, sess):
+    """Lab diagnostics (RWX_CPU_DUMP=file): one JSON line per finished session."""
+    from engine import CPU_DUMP
+
+    if not CPU_DUMP:
+        return
+    try:
+        with open(CPU_DUMP, "a") as f:
+            f.write(json.dumps({"cid": cid, "mode": sess.mode, "total": sess.total_cpu,
+                                "startup": sess.startup_cpu, "tests": sess.cpu}) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log(f"cpu dump failed {e!r}")
+
 
 def _drain(gen, first=None):
     """Answer the pending batch with `first` (default: nothing reported) and every further
@@ -1964,6 +2004,7 @@ def _drain(gen, first=None):
 DUR: dict = {}
 DEFERRED: dict = {}  # commit -> importers mask needed unless its session imported the patch cleanly
 IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
+CMAP: list = []  # [the Map], for importer masks found at run time
 LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
@@ -2073,6 +2114,7 @@ def main() -> None:
         valid |= 1 << n
     try:
         cmap = Map(MAP)
+        CMAP[:] = [cmap]
     except Exception as e:  # no map: every commit selects every test, statically
         log(f"map failed: {e!r}")
         for patch in list_patches(DATA / "commits"):
