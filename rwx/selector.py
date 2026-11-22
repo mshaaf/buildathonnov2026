@@ -10,6 +10,7 @@ import ast
 import json
 import os
 import pickle
+import re
 import sys
 import time
 import zlib
@@ -18,7 +19,22 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from patchlib import Locator, ast_equal, apply_hunks, changed_lines, parse_patch  # noqa: E402
+from patchlib import (  # noqa: E402
+    Locator,
+    PatchMismatch,
+    _same_syntax as same_syntax,
+    apply_hunks,
+    bound_names,
+    change_blocks,
+    changed_lines,
+    diff_hunks,
+    has_future_annotations,
+    known_lookups,
+    locate_hunks,
+    parse_patch,
+    stmt_inert,
+    stmt_safe,
+)
 
 DATA = Path(os.environ.get("RWX_DATA", "/data"))
 SRC = Path(os.environ.get("RWX_SRC", "/sqlglot"))
@@ -111,10 +127,11 @@ class Map:
 
 
 class Analyzer:
-    def __init__(self, cmap: Map, all_mask: int, lazy_mask: int = 0):
+    def __init__(self, cmap: Map, all_mask: int, lazy_mask: int = 0, file_tests: dict | None = None):
         self.map = cmap
         self.all = all_mask
         self.lazy_mask = lazy_mask
+        self.file_tests = file_tests or {}  # test file -> mask of its tests
         self._trees: dict = {}
         profile = SRC / ".rwx-tokenizer.json"
         self.tokenizer = json.loads(profile.read_text()) if ATTR_NARROW and not BROAD and profile.is_file() else {}
@@ -122,8 +139,8 @@ class Analyzer:
     def old_source(self, rel: str) -> str | None:
         p = SRC / rel
         try:
-            return p.read_text()
-        except (OSError, UnicodeDecodeError):
+            return p.read_bytes().decode("utf-8", "surrogateescape")
+        except (OSError, ValueError):
             return None
 
     def tree(self, rel: str, text: str):
@@ -153,6 +170,13 @@ class Analyzer:
                 mask = m.code_mask(rel, own)
                 if not mask and site.scope_path and site.scope_path[-1][0] == "class":
                     mask = m.span_mask(rel, site.code_key, *site.lines)
+                if stmt.body and stmt.body[0].lineno <= stmt.lineno:
+                    # Body on the def line: coverage never records a code object's first
+                    # line, so callers are invisible. Anyone reaching the binding may call it.
+                    if isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
+                        mask |= self.import_mask(rel, site, why)
+                    else:
+                        mask |= m.span_mask(rel, site.code_key, *site.lines)
             why.append(f"header {own} -> {bin(mask).count('1')}")
             return mask
         # blank/unknown position: whole enclosing code object
@@ -284,30 +308,47 @@ class Analyzer:
         why.append(f"arg_types flip {flipped} on {len(affected)} classes -> {bin(mask).count('1')}")
         return mask
 
+    def importers(self, rel: str) -> int:
+        """Every test that imported the file (all of them if the map never saw it load)."""
+        return self.map.file_mask(rel) or self.all
+
     def python_file(self, fp, rel: str, why: list, single_file=False) -> int:
         old = self.old_source(rel)
         if old is None:
             raise ValueError(f"missing base source: {rel}")
-        new = apply_hunks(old, fp.hunks)
+        hunks = locate_hunks(old, fp.hunks)
+        if not hunks:
+            why.append(f"{rel}: no hunks")
+            return 0
+        new = apply_hunks(old, hunks)
+        if _encoding_marks(old) != _encoding_marks(new) or _undecodable(new):
+            # A coding cookie or bytes that are not UTF-8 decide whether the file imports at
+            # all. The engine compiles text, so it cannot check this: static importers.
+            self.unverifiable = True
+            why.append(f"{rel}: encoding change -> importers")
+            return self.importers(rel)
         tree = self.tree(rel, old)
-        equal = ast_equal(tree, new)
-        if equal is None:
+        try:
+            new_tree = ast.parse(new)
+        except Exception:  # SyntaxError, or ValueError for null bytes / surrogates
+            new_tree = None
+        if new_tree is None:
             self.py_changes[rel] = (old, new)
             why.append(f"{rel}: SYNTAX ERROR -> importers")
-            return self.map.file_mask(rel) or self.all
-        if equal:
+            return self.importers(rel)
+        if same_syntax(tree, new_tree):
             why.append(f"{rel}: AST unchanged")
             return 0
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
-        old_changed, added = changed_lines(fp.hunks)
+        old_changed, added = changed_lines(hunks)
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
                 mask |= self.map.file_mask(rel)
                 continue
-            candidates = self.site_mask(rel, site, why)
+            candidates = self.site_mask(rel, site, why) | self.lambda_outer(rel, loc, site, ln, why)
             if single_file and old_changed == added == {ln} and site.kind == "func":
                 self.case_site = rel, site.code_key, site.lines
             if (single_file and self.tokenizer and old_changed == added == {ln}
@@ -319,7 +360,7 @@ class Analyzer:
                     why.append(f"{name} consumers -> {candidates.bit_count()}")
             mask |= candidates
         # Pure insertions: use the old lines around each insertion point.
-        for anchor in insertion_anchors(fp.hunks):
+        for anchor in insertion_anchors(hunks):
             for ln in anchor:
                 if ln < 1:
                     continue
@@ -332,7 +373,195 @@ class Analyzer:
                     why.append(f"insert near {ln} in {site.code_key}")
                 else:
                     mask |= self.site_mask(rel, site, why)
+                mask |= self.lambda_outer(rel, loc, site, ln, why, inserted=True)
+        if sum(h.old_len + h.new_len for h in hunks) > 3000:
+            why.append(f"{rel}: very large change -> importers")
+            return mask | self.importers(rel)
+        mask |= self.import_blocks(rel, tree, new_tree, hunks, loc, why)
         return mask
+
+    def lambda_outer(self, rel, loc, site, ln, why, inserted=False) -> int:
+        """Coverage never records a code object's first line, so runs of a lambda that only
+        execute its first line (all runs, for a one-line lambda) are invisible. A lambda only
+        runs after the statement creating it did: charge such a change to that statement."""
+        if not site.scope_path or site.scope_path[-1][0] != "lambda":
+            return 0
+        if not inserted and ln != site.scope_path[-1][2]:
+            return 0  # a later line of the lambda: its own coverage is complete
+        outer = loc.locate(ln, lambdas=False)
+        if outer is None:
+            return self.map.file_mask(rel)
+        mask = self.site_mask(rel, outer, why)
+        why.append(f"lambda via {outer.kind} {outer.code_key} -> {mask.bit_count()}")
+        return mask
+
+    def import_blocks(self, rel, tree, new_tree, hunks, loc, why) -> int:
+        """Changes to statements that run at import time (module/class bodies, def and class
+        headers). Two things the per-line sites miss: a statement that may now raise breaks
+        every importer, and names bound only by the new (or only by the old) statements
+        change who sees what."""
+        if BROAD:
+            return 0
+        new_loc = Locator(new_tree)
+        fut = has_future_annotations(tree)
+        mask = 0
+        for o_lo, o_hi, n_lo, n_hi in change_blocks(hunks):
+            old_sites = [s for s in (loc.locate(ln, lambdas=False) for ln in range(o_lo, o_hi + 1)) if _import_time(s)]
+            new_sites = [s for s in (new_loc.locate(ln, lambdas=False) for ln in range(n_lo, n_hi + 1)) if _import_time(s)]
+            old_stmts = list({id(s.stmt): s.stmt for s in old_sites}.values())
+            new_stmts = list({id(s.stmt): s.stmt for s in new_sites}.values())
+            if not old_stmts and not new_stmts:
+                continue
+            paths = {tuple(name for _, name, _ in x.scope_path) for x in old_sites + new_sites}
+            if len(paths) != 1:
+                why.append(f"import-time {o_lo}-{o_hi}: several scopes -> importers")
+                mask |= self.importers(rel)
+                continue
+            site = self._scope_site(tree, next(iter(paths)))
+            if site is None:
+                why.append(f"import-time {o_lo}-{o_hi}: scope not found -> importers")
+                mask |= self.importers(rel)
+                continue
+            known = known_lookups(tree, o_lo, _scope_nodes(tree, site))
+            rem_new = [b for b in new_stmts if not any(same_syntax(a, b) for a in old_stmts)]
+            rem_old = [a for a in old_stmts if not any(same_syntax(a, b) for b in new_stmts)]
+            if len(rem_old) == len(rem_new):
+                safe = all(stmt_safe(a, b, fut, known) for a, b in zip(rem_old, rem_new))
+            else:
+                safe = all(stmt_inert(b, fut, known) for b in rem_new)
+            if not safe:
+                why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
+                mask |= self.importers(rel)
+                continue
+            old_names = {n for x in rem_old for n in bound_names(x)}
+            new_names = {n for x in rem_new for n in bound_names(x)}
+            # Names bound on both sides are the per-line sites' business (with their narrowing).
+            names = old_names ^ new_names
+            if not names:
+                continue
+            site.names = tuple(sorted(names))
+            extra = self.import_mask(rel, site, why)
+            why.append(f"bindings {list(site.names)[:3]} -> {extra.bit_count()}")
+            mask |= extra
+        return mask
+
+    def _scope_site(self, tree, path):
+        """An old-file import-time Site for the class (or module) named by `path`."""
+        from patchlib import Site, _code_key
+
+        node, scope_path = tree, []
+        for name in path:
+            nxt = None
+            for ch in node.body:
+                if isinstance(ch, ast.ClassDef) and ch.name == name:
+                    nxt = ch
+            if nxt is None:
+                return None
+            first = nxt.decorator_list[0].lineno if nxt.decorator_list else nxt.lineno
+            scope_path.append(("class", name, first))
+            node = nxt
+        return Site("import", tuple(scope_path), _code_key(node), (0, 0),
+                    class_line=node.lineno if isinstance(node, ast.ClassDef) else None,
+                    names=(), stmt=None, scope_node=node)
+
+    # ------------------------------------------------------------ whole-file changes
+    def file_level(self, fp, why: list) -> int:
+        """Creation, deletion, rename, copy or binary change of a file."""
+        removed = None if (fp.created or fp.copy) else fp.old_path
+        added = None if fp.deleted else fp.new_path
+        if fp.old_path == fp.new_path and not fp.created and not fp.deleted:
+            removed = added = None  # in place (binary) change
+        mask = 0
+        if fp.binary and fp.old_path == fp.new_path and fp.path:
+            mask |= self.data_mask(fp.path, why, binary=True)
+        if removed:
+            mask |= self.removed_file(removed, why)
+        if added:
+            content = None
+            if not fp.binary:
+                base = self.old_source(removed) if (removed and not fp.copy) else ("" if fp.created else self.old_source(fp.old_path))
+                try:
+                    content = apply_hunks(base, locate_hunks(base, fp.hunks)) if base is not None else None
+                except PatchMismatch:
+                    content = None
+            if (removed and not fp.copy and content is not None and content == self.old_source(removed)
+                    and added.startswith("tests/") and removed.startswith("tests/")):
+                # A test module moved unchanged: its import already ran in every session.
+                why.append(f"moved {removed} -> {added} unchanged")
+            else:
+                mask |= self.added_file(added, content, fp.binary, why)
+        return mask
+
+    def removed_file(self, rel: str, why: list) -> int:
+        if rel.endswith(".py"):
+            mask = self.map.file_mask(rel) | self.file_tests.get(rel, 0)
+            if rel.startswith("sqlglot/"):
+                mask |= self.file_tests.get("tests/test_sqlglotc.py", 0)  # lists the package's files
+            why.append(f"removed {rel}: importers and its own tests -> {mask.bit_count()}")
+            return mask
+        if rel.startswith("tests/"):
+            mid = self.map.opens.get(rel)
+            mask = self.map.masks[mid] if mid is not None else 0
+            why.append(f"removed data {rel}: readers -> {mask.bit_count()}")
+            return mask
+        if "/" not in rel and rel in CONFIG_FILES:
+            why.append(f"removed config {rel} -> ALL")
+            return self.all
+        why.append(f"removed {rel}: nothing reads it")
+        return 0
+
+    def added_file(self, rel: str, content, binary: bool, why: list) -> int:
+        base = rel.rsplit("/", 1)[-1]
+        if rel.endswith(".py"):
+            if base == "conftest.py" or "/" not in rel or rel.startswith("sqlglot/"):
+                # conftest: pytest loads it; root level: shadows imports; sqlglot/: dialects and
+                # optimizer passes are imported by computed names.
+                why.append(f"new {rel} -> ALL")
+                return self.all
+            if _is_test_file(base):
+                if content is not None and _inert_module(content):
+                    why.append(f"new test file {rel}: inert module -> nothing")
+                    return 0
+                why.append(f"new test file {rel} runs code at import -> ALL")
+                return self.all
+            why.append(f"new {rel}: not imported by anything -> nothing")
+            return 0
+        if "/" not in rel and rel in CONFIG_FILES:
+            why.append(f"new config {rel} -> ALL")
+            return self.all
+        if binary and rel.startswith("sqlglot/"):
+            why.append(f"new binary {rel} -> ALL")
+            return self.all
+        why.append(f"new {rel}: nothing opens it")
+        return 0
+
+    def data_mask(self, rel: str, why: list, binary=False) -> int:
+        m = self.map.opens.get(rel)
+        fm = self.map.masks[m] if m is not None else 0
+        if fm == 0:
+            # data file nobody opened directly: tests in its directory's users
+            d = rel.rsplit("/", 1)[0] + "/"
+            for f, mid in self.map.opens.items():
+                if f.startswith(d):
+                    fm |= self.map.masks[mid]
+        if binary and not rel.startswith("tests/"):
+            fm = self.all if rel.startswith("sqlglot/") else 0
+        why.append(f"{'binary ' if binary else ''}data {rel} -> {fm.bit_count()}")
+        return fm
+
+    def other_file(self, fp, rel: str, why: list) -> int:
+        if "/" not in rel and rel in CONFIG_FILES:
+            old = self.old_source(rel)
+            if old is None:
+                raise ValueError(f"missing base config: {rel}")
+            new = apply_hunks(old, locate_hunks(old, fp.hunks))
+            if _config_same_for_pytest(rel, old, new):
+                why.append(f"config {rel}: parses, pytest settings unchanged -> nothing")
+                return 0
+            why.append(f"config {rel}: pytest may read it differently -> ALL")
+            return self.all
+        why.append(f"other file {rel} -> nothing")
+        return 0
 
     def analyze(self, text: str) -> tuple[int, list]:
         why: list = []
@@ -341,31 +570,159 @@ class Analyzer:
         self.data_changes: dict = {}
         self.sites: set = set()
         self.case_site = None
-        files = parse_patch(text)
-        if any(fp.binary or fp.old_path != fp.new_path for fp in files):
-            return self.all, ["file creation, removal, rename or binary change -> ALL"]
+        self.unverifiable = False
+        files = self.merge_repeats(parse_patch(text), why)
         for fp in files:
+            if not fp.path and (fp.hunks or fp.binary):
+                return self.all, ["patch entry without a path -> ALL"]
+        for fp in files:
+            if fp.binary or fp.created or fp.deleted or fp.copy or fp.old_path != fp.new_path:
+                mask |= self.file_level(fp, why)
+                continue
             rel = fp.path
+            if not rel:
+                continue
             if rel.endswith(".py"):
                 mask |= self.python_file(fp, rel, why, single_file=len(files) == 1)
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
                 if old is None:
                     raise ValueError(f"missing base fixture: {rel}")
-                self.data_changes[rel] = apply_hunks(old, fp.hunks)
-                m = self.map.opens.get(rel)
-                fm = self.map.masks[m] if m is not None else 0
-                if fm == 0 and fp.old_path is not None:
-                    # data file nobody opened directly: tests in its directory's users
-                    d = rel.rsplit("/", 1)[0] + "/"
-                    for f, mid in self.map.opens.items():
-                        if f.startswith(d):
-                            fm |= self.map.masks[mid]
-                why.append(f"data {rel} -> {bin(fm).count('1')}")
-                mask |= fm
+                self.data_changes[rel] = apply_hunks(old, locate_hunks(old, fp.hunks))
+                mask |= self.data_mask(rel, why)
             else:
-                why.append(f"other file {rel} -> nothing")
+                mask |= self.other_file(fp, rel, why)
+        if self.unverifiable:
+            self.py_changes = {}  # nothing the engine runs could stand in for the real import
         return mask, why
+
+    def merge_repeats(self, files, why):
+        """The same file patched by several entries: apply them in order, re-diff once."""
+        seen: dict = {}
+        for fp in files:
+            if fp.path and not (fp.binary or fp.created or fp.deleted or fp.copy or fp.old_path != fp.new_path):
+                seen.setdefault(fp.path, []).append(fp)
+        out = []
+        done = set()
+        for fp in files:
+            group = seen.get(fp.path) if fp.path else None
+            if not group or len(group) == 1:
+                out.append(fp)
+                continue
+            if fp.path in done:
+                continue
+            done.add(fp.path)
+            old = self.old_source(fp.path)
+            if old is None:
+                raise ValueError(f"missing base source: {fp.path}")
+            text = old
+            for g in group:
+                text = apply_hunks(text, locate_hunks(text, g.hunks))
+            merged = type(fp)(fp.path, fp.path, diff_hunks(old, text))
+            why.append(f"{fp.path}: {len(group)} entries merged")
+            out.append(merged)
+        return out
+
+
+CONFIG_FILES = ("pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", ".pytest.ini")
+CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+
+
+def _encoding_marks(text: str) -> tuple:
+    """BOM and coding cookies (first two lines): they decide how Python decodes the file."""
+    head = text.split("\n", 2)[:2]
+    return (text.startswith("\ufeff"),) + tuple(l for l in head if CODING_RE.match(l))
+
+
+def _undecodable(text: str) -> bool:
+    """Bytes that were not UTF-8 (decoded with surrogateescape)."""
+    return any("\udc80" <= ch <= "\udcff" for ch in text)
+
+
+def _import_time(site) -> bool:
+    return (site is not None and site.stmt is not None and site.kind in ("import", "header")
+            and isinstance(site.scope_node, (ast.Module, ast.ClassDef)))
+
+
+def _scope_nodes(tree, site) -> list:
+    """The class nodes enclosing a site, outermost first (module scope: empty)."""
+    out, node = [], tree
+    for kind, name, _ in site.scope_path:
+        nxt = None
+        for ch in getattr(node, "body", []):
+            if isinstance(ch, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and ch.name == name:
+                nxt = ch
+        if nxt is None or kind != "class":
+            break
+        out.append(nxt)
+        node = nxt
+    return out
+
+
+def _is_test_file(base: str) -> bool:
+    return (base.startswith("test") or base.endswith("_test.py")) and base.endswith(".py")
+
+
+def _inert_module(src: str) -> bool:
+    """A new test module whose import cannot touch other tests: imports, defs, classes made
+    of defs and literal attributes, no decorators, no other top-level code."""
+    try:
+        tree = ast.parse(src)
+    except Exception:
+        return True  # cannot be imported: only its own (unnumbered) tests fail
+    for st in tree.body:
+        if isinstance(st, (ast.Import, ast.ImportFrom)):
+            if any(a.name == "*" for a in st.names):
+                return False
+            continue
+        if isinstance(st, ast.ClassDef):
+            if st.decorator_list or st.keywords or not all(isinstance(b, (ast.Name, ast.Attribute)) for b in st.bases):
+                return False
+            for sub in st.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and not sub.decorator_list and all(
+                        isinstance(d, ast.Constant) for d in sub.args.defaults + [d for d in sub.args.kw_defaults if d]):
+                    continue
+                if isinstance(sub, ast.Pass) or (isinstance(sub, ast.Expr) and isinstance(sub.value, ast.Constant)):
+                    continue
+                if isinstance(sub, ast.Assign) and all(isinstance(t, ast.Name) for t in sub.targets) and isinstance(sub.value, ast.Constant):
+                    continue
+                return False
+            continue
+        if stmt_inert(st, True):
+            continue
+        if (isinstance(st, ast.If) and isinstance(st.test, ast.Compare) and isinstance(st.test.left, ast.Name)
+                and st.test.left.id == "__name__"):
+            continue
+        return False
+    return True
+
+
+def _config_same_for_pytest(rel: str, old: str, new: str) -> bool:
+    """The config still parses and its pytest settings did not change."""
+    if _undecodable(new):
+        return False
+    if rel.endswith(".toml"):
+        try:
+            import tomllib
+        except ImportError:
+            return False
+        try:
+            a, b = tomllib.loads(old), tomllib.loads(new)
+        except Exception:
+            return False
+        ta, tb = a.get("tool", {}), b.get("tool", {})
+        return ta.get("pytest") == tb.get("pytest") and "pytest" not in tb
+    import configparser
+
+    def load(text):
+        cp = configparser.ConfigParser(interpolation=None, strict=False)
+        cp.read_string(text)
+        return {k: dict(cp[k]) for k in cp.sections() if k in ("pytest", "tool:pytest")}
+
+    try:
+        return load(old) == load(new) and not load(new)
+    except Exception:
+        return False
 
 
 def flipped_bool(stmt, before, after):
@@ -671,80 +1028,97 @@ class Scheduler:
                     gen.close()
                     yield cid, set(C), "out of time"
                     continue
-                sess = self.engine.session(py, data, case_site)
-                sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
+                try:
+                    sess = self.engine.session(py, data, case_site)
+                    sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
+                except Exception as e:  # one commit's trouble must not stop the others
+                    log(f"{cid}: session failed {e!r}"[:300])
+                    gen.close()
+                    yield cid, set(C), "session failed"
+                    continue
                 active.append([cid, C, gen, sess, batch, None])
             if not active:
                 continue
             timeout = max(0.05, min(a[3].deadline for a in active) - time.monotonic())
             ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
             for a in list(active):
-                cid, C, gen, sess, batch, selected = a
-                finished = False
-                if sess in ready:
-                    finished = sess.read()
-                if not finished and sess.expired():
-                    log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
-                    sess.kill()
-                    finished = True
-                if not finished:
-                    continue
-                if not sess.alive and sess.crash is None and len(sess.results) < len(batch) and not sess.expired():
-                    pass
-                res = dict(sess.results)
-                if any(st == "F" for st in res.values()):
-                    LIVE.add(cid)
-                if not sess.alive:
-                    # crashed or killed: whatever did not report counts as failing
-                    for n in batch:
-                        res.setdefault(n, "F")
-                executor = self.engine.executor_test
-                if selected is not None:
-                    kind, selected = selected
-                    if kind == "verify":
-                        # every affected query was run: a pass clears TPC-DS
-                        if sess.alive and res.get(executor) == "P":
-                            selected = selected - {executor}
-                        note = "checked affected TPC-DS queries"
-                    else:
-                        # a sample of affected queries gated leaving TPC-DS out
-                        if not (sess.alive and res.get(executor) == "P"):
-                            selected = selected | {executor}
-                        note = f"TPC-DS sample gate {'passed' if executor not in selected else 'FAILED: kept TPC-DS'}"
-                    sess.close()
-                    active.remove(a)
-                    yield cid, selected, note
-                    continue
                 try:
-                    nxt, stop_first = gen.send(res)
-                    if time.monotonic() > self.deadline or not sess.alive:
-                        raise GeneratorExit
-                    sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
-                    a[4] = nxt
-                except StopIteration as e:
-                    if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
-                            and sess.alive and executor not in res and time.monotonic() < self.deadline):
-                        cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
-                        if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
-                            sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
-                            a[4:] = [[executor], ("verify", e.value)]
-                            continue
-                    if (executor is not None and executor in C and executor not in e.value
-                            and sess.executor_ms is not None and sess.alive and executor not in res
-                            and time.monotonic() < self.deadline):
-                        cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
-                        sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
-                        a[4:] = [[executor], ("gate", e.value)]
+                    cid, C, gen, sess, batch, selected = a
+                    finished = False
+                    if sess in ready:
+                        finished = sess.read()
+                    if not finished and sess.expired():
+                        log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
+                        sess.kill()
+                        finished = True
+                    if not finished:
                         continue
-                    sess.close()
-                    active.remove(a)
-                    yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
-                except GeneratorExit:
-                    gen.close()
-                    sess.close()
-                    active.remove(a)
-                    yield cid, set(C), "stopped"
+                    if not sess.alive and sess.crash is None and len(sess.results) < len(batch) and not sess.expired():
+                        pass
+                    res = dict(sess.results)
+                    if any(st == "F" for st in res.values()):
+                        LIVE.add(cid)
+                    if not sess.alive:
+                        # crashed or killed: whatever did not report counts as failing
+                        for n in batch:
+                            res.setdefault(n, "F")
+                    executor = self.engine.executor_test
+                    if selected is not None:
+                        kind, selected = selected
+                        if kind == "verify":
+                            # every affected query was run: a pass clears TPC-DS
+                            if sess.alive and res.get(executor) == "P":
+                                selected = selected - {executor}
+                            note = "checked affected TPC-DS queries"
+                        else:
+                            # a sample of affected queries gated leaving TPC-DS out
+                            if not (sess.alive and res.get(executor) == "P"):
+                                selected = selected | {executor}
+                            note = f"TPC-DS sample gate {'passed' if executor not in selected else 'FAILED: kept TPC-DS'}"
+                        sess.close()
+                        active.remove(a)
+                        yield cid, selected, note
+                        continue
+                    try:
+                        nxt, stop_first = gen.send(res)
+                        if time.monotonic() > self.deadline or not sess.alive:
+                            raise GeneratorExit
+                        sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
+                        a[4] = nxt
+                    except StopIteration as e:
+                        if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
+                                and sess.alive and executor not in res and time.monotonic() < self.deadline):
+                            cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                            if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
+                                sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
+                                a[4:] = [[executor], ("verify", e.value)]
+                                continue
+                        if (executor is not None and executor in C and executor not in e.value
+                                and sess.executor_ms is not None and sess.alive and executor not in res
+                                and time.monotonic() < self.deadline):
+                            cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                            sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
+                            a[4:] = [[executor], ("gate", e.value)]
+                            continue
+                        sess.close()
+                        active.remove(a)
+                        yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
+                    except GeneratorExit:
+                        gen.close()
+                        sess.close()
+                        active.remove(a)
+                        yield cid, set(C), "stopped"
 
+                except Exception as e:  # one commit's trouble must not stop the others
+                    log(f"{a[0]}: scheduler error {e!r}"[:300])
+                    try:
+                        a[3].kill()
+                        a[3].close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if a in active:
+                        active.remove(a)
+                    yield a[0], set(a[1]), "scheduler error"
 
 DUR: dict = {}
 LIVE: set = set()  # commits where some run reported a failure
@@ -795,6 +1169,31 @@ def batch_timeout(batch) -> float:
     return 10.0 + 4.0 * batch_cost(batch) / 1000
 
 
+def list_patches(d: Path) -> list:
+    """Commit patch files: regular files named <id>.patch (anything else is not a commit)."""
+    try:
+        entries = sorted(d.iterdir(), key=lambda p: p.name)
+    except OSError as e:
+        log(f"cannot list {d}: {e!r}")
+        return []
+    out = []
+    for p in entries:
+        try:
+            if p.name.endswith(".patch") and len(p.name) > len(".patch") and p.is_file():
+                out.append(p)
+        except OSError:
+            continue
+    return out
+
+
+def read_patch(p: Path) -> str:
+    """Patch text; bytes that are not UTF-8 survive as surrogates so they can be detected."""
+    data = p.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return data.decode("utf-8", "surrogateescape")
+
+
 def main() -> None:
     t0 = time.monotonic()
     out = os.fdopen(os.dup(1), "w")
@@ -816,13 +1215,16 @@ def main() -> None:
     for t in tests:
         if t["id"] in NO_RUN_IDS:
             lazy |= 1 << t["number"]
-    an = Analyzer(cmap, valid, lazy)
-    patches = sorted((DATA / "commits").glob("*.patch"))
+    file_tests: dict = {}
+    for t in tests:
+        file_tests[t["file"]] = file_tests.get(t["file"], 0) | 1 << t["number"]
+    an = Analyzer(cmap, valid, lazy, file_tests)
+    patches = list_patches(DATA / "commits")
     jobs, final = [], {}
     for patch in patches:
-        cid = patch.stem
+        cid = patch.name[: -len(".patch")]
         try:
-            mask, why = an.analyze(patch.read_text(errors="replace"))
+            mask, why = an.analyze(read_patch(patch))
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None

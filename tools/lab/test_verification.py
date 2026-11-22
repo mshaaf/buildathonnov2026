@@ -33,6 +33,35 @@ class BrokenTeardown(unittest.TestCase):
         pass
 
 
+class FakeMap:
+    """Just enough of selector.Map for analyzer tests: file -> importers mask."""
+
+    def __init__(self, importers=None, opens=None):
+        self.importers = importers or {}
+        self.masks = []
+        self.opens = {}
+        for f, m in (opens or {}).items():
+            self.opens[f] = len(self.masks)
+            self.masks.append(m)
+        self.class_desc, self.class_users, self.name_refs, self.attr_refs, self.lines = {}, {}, {}, {}, {}
+        self.arg_missing, self.class_by_code = {}, {}
+
+    def file_mask(self, f):
+        return self.importers.get(f, 0)
+
+    def code_mask(self, f, key):
+        return 0
+
+    def span_mask(self, f, key, lo, hi):
+        return 0
+
+    def ref_mask(self, refs, seen=None):
+        return 0, False
+
+    def class_mask(self, key):
+        return 0
+
+
 class VerificationTests(unittest.TestCase):
     def test_unused_and_repeated_fixtures(self):
         calls = []
@@ -113,13 +142,16 @@ class VerificationTests(unittest.TestCase):
                     self.assertEqual(done.exception.value, expected)
 
     def test_unmodeled_changes_cannot_be_verified_on_the_base_tree(self):
-        analyzer = selector.Analyzer(None, 7)
-        mask, _ = analyzer.analyze("diff --git a/x.py b/x.py\ndeleted file mode 100644\n--- a/x.py\n+++ /dev/null\n")
-        self.assertEqual(mask, 7)
+        analyzer = selector.Analyzer(FakeMap({"sqlglot/x.py": 2}), 7)
+        mask, _ = analyzer.analyze("diff --git a/sqlglot/x.py b/sqlglot/x.py\ndeleted file mode 100644\n--- a/sqlglot/x.py\n+++ /dev/null\n")
+        self.assertEqual(mask, 2)  # importers of the removed module
+        self.assertFalse(analyzer.py_changes)
+        mask, _ = analyzer.analyze("diff --git a/sqlglot/y.py b/sqlglot/y.py\nnew file mode 100644\n--- /dev/null\n+++ b/sqlglot/y.py\n@@ -0,0 +1 @@\n+X = 1\n")
+        self.assertEqual(mask, 7)  # a new module can be imported by a computed name
         self.assertFalse(analyzer.py_changes)
 
     def test_tokenizer_readers_only_narrow_an_isolated_literal_flip(self):
-        analyzer = selector.Analyzer(None, 15, lazy_mask=8)
+        analyzer = selector.Analyzer(FakeMap(), 15, lazy_mask=8)
         analyzer.tokenizer = {"classes": ["sqlglot/demo.py:1:Tokenizer"], "flags": {"FLAG": "0x2"}}
         base = "class Tokenizer:\n    FLAG = False\n"
         diff = "diff --git a/sqlglot/demo.py b/sqlglot/demo.py\n@@ -2 +2 @@\n-    FLAG = False\n+    FLAG = "
