@@ -862,6 +862,7 @@ class Analyzer:
         self.unverifiable = False
         self.deferred = 0  # importers needed unless the engine proves the patched modules import
         self.cmp_flip = None  # (rel, line, col, old op, new op) of a pure comparison-operator edit
+        self.profile_dropped = 0  # candidates a value profile removed (checked by sentinels at run time)
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
         self.fixture_runs: dict = {}  # setup-loaded fixture rel -> [class attr] when pairs line up
@@ -934,6 +935,7 @@ class Analyzer:
             if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
                 keep |= self.map.masks[mid]
         narrowed = mask & keep
+        self.profile_dropped |= mask & ~narrowed
         why.append(f"compare {old_op} -> {new_op} at {line}:{col}: {mask.bit_count()} -> {narrowed.bit_count()}")
         return narrowed
 
@@ -1301,7 +1303,8 @@ SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may a
 SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
 
-def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
+def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
+           dropped=None):
     """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
     runnable tests whose estimated CPU is worth less than the worker time they add."""
     gen = _policy(C, dur, data_only, focus, known)
@@ -1314,6 +1317,8 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
             req = gen.send(res)
     except StopIteration as e:
         final = set(e.value)
+    if dropped and C and not data_only and PROFILE_SENTINEL:
+        final = yield from _sentinels(C, final, seen, set(dropped), focus or {})
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
     left_out = {g for g in C if g not in final and g not in seen and is_heavy(g)}
@@ -1440,6 +1445,58 @@ def set_settle_scale(commits: int, verifiable: list) -> None:
     """Split the batch's settle budget over the commits by worker cost, before any runs."""
     weight = sum(_pack_lb(C) for C in verifiable)
     SETTLE_SCALE[0] = SETTLE_BUDGET_PER_COMMIT_MS * commits / weight if weight else float("inf")
+
+
+# Pollution sentinels (RWX_PROFILE_SENTINEL, default on). A value profile drops candidates R
+# that cannot be infected directly, but an infected test can leave shared state behind that
+# makes a later test fail in the same process. After the infected tests N have run in this
+# session, run some of R (same class first, then same file, then a spread): if one fails, the
+# profile is not trusted for this commit and R goes back to the unproven set. main() prints R
+# unless this marked the commit cleared, so every fallback path (crash, cut, kill) keeps it.
+PROFILE_SENTINEL = os.environ.get("RWX_PROFILE_SENTINEL", "1") == "1"
+SENTINEL_INFECTED_MS = int(os.environ.get("RWX_SENTINEL_INFECTED_MS", "3000"))
+SENTINEL_CLASS_MS = int(os.environ.get("RWX_SENTINEL_CLASS_MS", "3000"))
+SENTINEL_FILE_MS = int(os.environ.get("RWX_SENTINEL_FILE_MS", "1500"))
+SENTINEL_SPREAD_MS = int(os.environ.get("RWX_SENTINEL_SPREAD_MS", "500"))
+SENTINEL_CLEARED: set = set()  # commit keys whose sentinels all passed
+FRESH_PROCESS: set = set()  # tests that run their checks in a fresh interpreter (test_lazy_load)
+
+
+def _sentinels(C, final, seen, R, focus):
+    if all(n in NO_RUN or n in FRESH_PROCESS for n in C):
+        # the only infected tests start their own interpreter: nothing in this process is touched
+        SENTINEL_CLEARED.add(commit_key(C))
+        return final
+    seen = dict(seen)
+    infected_unrun = [n for n in C if n not in seen and not is_heavy(n)]
+    if infected_unrun and batch_cost(infected_unrun) <= SENTINEL_INFECTED_MS:
+        # the potential polluters must have run before the sentinels
+        res = yield sorted(infected_unrun, key=lambda n: (batch_cost([n]), n)), False
+        seen.update({n: res.get(n, "F") for n in infected_unrun})
+        final = final - {n for n in infected_unrun if res.get(n) == "P"}
+    if any(n not in seen for n in C if not is_heavy(n)):
+        return final | R  # not every runnable infected test ran: R stays unproven
+    runnable = sorted((n for n in R if not is_heavy(n)), key=lambda n: (batch_cost([n]), n))
+    classes = {CLS_OF.get(n) for n in C}
+    files = {FILE_OF.get(n) for n in C}
+    picks: list = []
+
+    def take(pool, budget):
+        start = batch_cost(picks)
+        for n in pool:
+            if n not in picks and batch_cost(picks + [n]) - start <= budget:
+                picks.append(n)
+
+    take([n for n in runnable if CLS_OF.get(n) in classes], SENTINEL_CLASS_MS)
+    take([n for n in runnable if FILE_OF.get(n) in files], SENTINEL_FILE_MS)
+    picks += _spread([n for n in runnable if n not in picks], SENTINEL_SPREAD_MS, 2, focus=focus)
+    if not picks:
+        return final | R
+    res = yield picks, True
+    if all(res.get(n) == "P" for n in picks):
+        SENTINEL_CLEARED.add(commit_key(C))
+        return final
+    return final | (R - {n for n in picks if res.get(n) == "P"})
 
 
 def _settle_batch(final, seen, known):
@@ -1987,7 +2044,8 @@ class Scheduler:
                 if fixture:
                     gen = fixture_policy(C, fixture[1])
                 else:
-                    gen = policy(C, DUR, data_only, focus, known)
+                    extra = [job[9]] if len(job) > 9 and job[9] else []
+                    gen = policy(C, DUR, data_only, focus, known, *extra)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -2316,6 +2374,7 @@ def main() -> None:
     dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     DUR.update(dur)
     FILE_OF.update({t["number"]: t["file"] for t in tests})
+    FRESH_PROCESS.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     if not LAZY_RUN:
         NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     valid = 0
@@ -2389,10 +2448,14 @@ def main() -> None:
                 if runnable and spec and _pack_cost(C) > _pack_cost([n for n in C if n not in runnable]):
                     fixture = (spec, runnable, {rel.removeprefix("tests/fixtures/"): fruns[rel] for rel in data})
                     log(f"{cid}: fixture run: {len(runnable)} {EXEC_CLS} tests on the edited queries")
-            jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture))
+            dropped = None
+            if PROFILE_SENTINEL and C and not data_only and an.profile_dropped & valid:
+                dropped = sorted(n for n in dur if (an.profile_dropped & valid) >> n & 1)
+                log(f"{cid}: profile dropped {len(dropped)} candidates: sentinels check them")
+            jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture, dropped))
         except Exception as e:  # never crash: run everything for this commit
             log(f"{cid}: job error {e!r} -> ALL")
-            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None, None))
+            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None, None, None))
     set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
     if SETTLE_GIANT_MS > 0:
         grant_giants([C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
@@ -2426,7 +2489,8 @@ def main() -> None:
     total = 0
     diag_min = int(os.environ.get("RWX_DIAG_MIN", "0"))
     diag_max = int(os.environ.get("RWX_DIAG_MAX", "100000"))
-    for cid, C, py, data, data_only, *_ in jobs:
+    for job in jobs:
+        cid, C, py, data, data_only = job[:5]
         final_set, note = results.get(cid, (set(C), "static"))
         if diag_min and diag_min <= len(C) <= diag_max:
             final_set, note = set(), "diagnostic: printed nothing"
@@ -2442,6 +2506,11 @@ def main() -> None:
             final_set = {n for n in final_set if n in seen or not (
                 n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
             note = "diagnostic (heavy): unrun slow tests left out"
+        dropped = job[9] if len(job) > 9 else None
+        if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
+            # profile-dropped candidates whose sentinels did not all pass (or never ran)
+            final_set = set(final_set) | set(dropped)
+            note += f"; +{len(dropped)} profile-dropped (sentinels not passed)"
         if DEFERRED.get(cid) and IMPORT_OK.get(cid) is not True:
             # the patched modules were not shown to import: every importer may fail
             extra = DEFERRED[cid]
