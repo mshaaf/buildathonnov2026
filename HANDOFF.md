@@ -465,3 +465,29 @@ it bets after running under 20% of the candidates it is wrong 20 times out of 25
 synthetic mutants differ from the organizers' (theirs break broadly or not at all), and the
 final adds kinds not in practice. Larger probes (1000/2000 ms) halve the lab misses for
 about +0.25 s est CPU per commit.
+
+## 14. `opt-merge-fast` (Nov 22, ~12:00 UTC): CPU, and what is left
+
+- `opt-merge-fast` = `opt-merge-proxy` + two output-neutral CPU cuts:
+  - the stdlib is precompiled in the image (the slim base ships 163 of about 640 `.pyc`,
+    so every run recompiled 67 modules, about 0.2 s, and so did every `python -c` that
+    test_lazy_load starts);
+  - `_undecodable` uses a regex instead of a Python loop over every character (0.13 s on
+    the samples).
+  Parent CPU on the samples 1.75 -> 1.57 s. Output byte-identical to `opt-merge-proxy` on
+  the samples (3 runs), tpcfix2, astra6 and tpcdsset.
+- Board: `fast-v2` (`cdbef83`, the rwx line + test_max_nodes stand-in + live slow-test runs +
+  TPC-DS check budget) scored 142.9 = 123.394 simulated (same as `d17c048`) + 19.5 CPU.
+  The rwx line spends about twice the merged line's CPU (samples, same machine: 18.4 vs
+  8.5 s): the merged line's comparison profiles leave `2haz`, `66ks` and `2qn5` with no
+  candidates.
+- The rwx line and `d17c048` reach the same 123.394, with and without the stand-in.
+  `test_lazy_load` is the common part (both have `RWX_LAZY_RUN`), so the stand-in and the
+  TPC-DS budget saved nothing on practice. `diag-heavy` (28 s with 1 miss) is then mostly
+  one commit that really needs its slow tests plus test_lazy_load. On the samples every
+  live commit with TPC-DS candidates really fails both TPC-DS tests. Slow tests are not
+  where the remaining practice cost is.
+- Kernel time is 8% of CPU (copy-on-write after fork); gc in sessions makes no
+  difference. The remaining cost is runnable tests printed unverified on live commits;
+  running them costs more CPU than it saves (RESEARCH.md on the rwx line). Precision (the
+  profiles) is the lever.
