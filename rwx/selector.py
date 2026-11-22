@@ -70,6 +70,8 @@ class Map:
         self.attr_refs: dict = d.get("attr_refs", {})
         self.cmp_sites: dict = d.get("cmp_sites", {})  # file -> {(line, col): (op, {vector: mask_id})}
         self.cmp_unprofiled: int = d["masks"][d["cmp_unprofiled"]] if "cmp_unprofiled" in d else -1
+        self.bool_sites: dict = d.get("bool_sites", {})  # file -> {(line, col): (op, mask_id)}
+        self.bool_unprofiled: int = d["masks"][d["bool_unprofiled"]] if "bool_unprofiled" in d else -1
         # (file, code_key) of a class body -> class key
         self.class_by_code: dict = {}
         for k in self.class_desc:
@@ -557,9 +559,11 @@ class Analyzer:
         if same_syntax(tree, new_tree):
             why.append(f"{rel}: AST unchanged")
             return 0
-        flip = compare_flip(tree, new_tree)
-        if flip is not None:
-            self.cmp_flip = (rel,) + flip
+        flips = compare_flips(tree, new_tree)
+        if flips:
+            self.cmp_flips += [(rel,) + f for f in flips]
+            if self.cmp_flip is None:
+                self.cmp_flip = (rel,) + flips[0]
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
@@ -602,6 +606,8 @@ class Analyzer:
             why.append(f"{rel}: very large change -> importers")
             return mask | self.importers(rel)
         mask |= self.import_blocks(rel, tree, new_tree, hunks, loc, why)
+        if flips and (CMP_PROFILE or BOOL_PROFILE) and not BROAD:
+            mask = self.compare_narrow(rel, flips, mask, why)
         return mask
 
     def lambda_outer(self, rel, loc, site, ln, why, inserted=False) -> int:
@@ -861,7 +867,9 @@ class Analyzer:
         self.case_site = None
         self.unverifiable = False
         self.deferred = 0  # importers needed unless the engine proves the patched modules import
-        self.cmp_flip = None  # (rel, line, col, old op, new op) of a pure comparison-operator edit
+        self.cmp_flip = None  # (rel, line, col, old op, new op): first comparison flip seen
+        self.cmp_flips: list = []  # every flip of files whose only change is operator flips
+        self.profile_dropped = 0  # candidates a value profile removed (checked by sentinels at run time)
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
         self.fixture_runs: dict = {}  # setup-loaded fixture rel -> [class attr] when pairs line up
@@ -913,29 +921,37 @@ class Analyzer:
         if not self.py_changes:
             mask |= self.deferred  # no session will import anything
             self.deferred = 0
-        if self.cmp_flip is not None and len(files) == 1 and CMP_PROFILE and not BROAD:
-            mask = self.compare_narrow(mask, why)
         return mask, why
 
-    def compare_narrow(self, mask: int, why: list) -> int:
-        """The whole patch flips one comparison operator. A test can only behave differently
-        if it evaluated that site on operands where the old and new operator disagree: keep
-        the candidates whose pinned value profile shows such an evaluation (plus unprofiled)."""
-        rel, line, col, old_op, new_op = self.cmp_flip
-        entry = self.map.cmp_sites.get(rel, {}).get((line, col))
-        if entry is None or entry[0] != old_op or self.map.cmp_unprofiled < 0:
-            return mask
-        fam = CMP_FAMILIES.get(old_op)
-        if fam is None or new_op not in fam:
-            return mask
-        i, j = fam.index(old_op), fam.index(new_op)
+    def compare_narrow(self, rel: str, flips: list, mask: int, why: list) -> int:
+        """This file's only change is operator flips of single-operator comparisons. Every
+        changed file contributes its own set and the commit takes the union, so this is
+        sound in multi-file patches too: consider a test in none of the other files'
+        sets that saw no distinguishing evaluation at any flip here. Up to its first
+        divergent evaluation, its run is the pinned run; that evaluation must be at a
+        changed site; it is not in another file (that test would be in that file's set),
+        and at a flip the operands are the pinned ones, on which old and new operators
+        agree. So it never diverges. Keep this file's candidates whose pinned value
+        profile shows a distinguishing evaluation at some flip (plus unprofiled tests)."""
         keep = self.map.cmp_unprofiled
-        for vec, mid in entry[1].items():
-            if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
-                keep |= self.map.masks[mid]
+        for line, col, old_op, new_op in flips:
+            k = self.flip_keep(rel, line, col, old_op, new_op)
+            if k is None:
+                why.append(f"compare {old_op} -> {new_op} at {line}:{col}: no profile")
+                return mask
+            keep |= k
         narrowed = mask & keep
-        why.append(f"compare {old_op} -> {new_op} at {line}:{col}: {mask.bit_count()} -> {narrowed.bit_count()}")
+        self.profile_dropped |= mask & ~narrowed
+        why.append(f"compare flips x{len(flips)} in {rel}: {mask.bit_count()} -> {narrowed.bit_count()}")
         return narrowed
+
+    def flip_keep(self, rel, line, col, old_op, new_op):
+        """Tests that may behave differently under this one operator flip, from the
+        per-site narrower registered for its kind (SITE_NARROWERS); None = cannot narrow."""
+        for kind_ops, narrower in SITE_NARROWERS:
+            if old_op in kind_ops:
+                return narrower(self.map, rel, line, col, old_op, new_op)
+        return None
 
     def merge_repeats(self, files, why):
         """The same file patched by several entries: apply them in order, re-diff once."""
@@ -986,6 +1002,7 @@ def _import_time(site) -> bool:
 
 
 CMP_PROFILE = os.environ.get("RWX_CMP_PROFILE", "1") == "1"
+BOOL_PROFILE = os.environ.get("RWX_BOOL_PROFILE", "0") == "1"  # and/or flips (needs bool_sites)
 CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
            ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
 _ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
@@ -994,9 +1011,55 @@ CMP_FAMILIES = {"<": _ORD, "<=": _ORD, ">": _ORD, ">=": _ORD, "==": _IDE, "!=": 
                 "is": _IDE, "is not": _IDE, "in": _MEM, "not in": _MEM}
 
 
+def _cmp_keep(cmap, rel, line, col, old_op, new_op):
+    """Comparison sites (tools/lab/cmprun.py profiles): tests that evaluated the site on
+    operands where old_op and new_op disagree (or raise / return non-bools), plus unprofiled."""
+    if not CMP_PROFILE:
+        return None
+    entry = cmap.cmp_sites.get(rel, {}).get((line, col))
+    if entry is None or entry[0] != old_op or cmap.cmp_unprofiled < 0:
+        return None
+    fam = CMP_FAMILIES.get(old_op)
+    if fam is None or new_op not in fam:
+        return None
+    i, j = fam.index(old_op), fam.index(new_op)
+    keep = cmap.cmp_unprofiled
+    for vec, mid in entry[1].items():
+        if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
+            keep |= cmap.masks[mid]
+    return keep
+
+
+def _bool_keep(cmap, rel, line, col, old_op, new_op):
+    """and/or sites (tools/lab/boolrun.py profiles): tests that saw an evaluation where the
+    flip could change the result, plus unprofiled."""
+    if not BOOL_PROFILE:
+        return None
+    entry = cmap.bool_sites.get(rel, {}).get((line, col))
+    if entry is None or entry[0] != old_op or cmap.bool_unprofiled < 0:
+        return None
+    return cmap.masks[entry[1]] | cmap.bool_unprofiled
+
+
+# Per-site narrowers for operator flips found by compare_flips(): (old operators handled,
+# fn(map, rel, line, col, old_op, new_op) -> mask of tests to keep, or None = cannot narrow).
+# Analyzer.compare_narrow() takes the union over a file's flips (any None: no narrowing).
+SITE_NARROWERS = [
+    (set(CMP_FAMILIES), _cmp_keep),
+    ({"and", "or"}, _bool_keep),
+]
+
+
 def compare_flip(old_tree, new_tree):
     """(line, col, old op, new op) when the trees differ in exactly one operator of a
     single-operator comparison and nowhere else; None otherwise."""
+    flips = compare_flips(old_tree, new_tree)
+    return flips[0] if flips and len(flips) == 1 else None
+
+
+def compare_flips(old_tree, new_tree):
+    """[(line, col, old op, new op), ...] when the trees differ only in operators of
+    single-operator comparisons (one or more); None when anything else differs."""
     found = []
 
     def walk(a, b):
@@ -1008,14 +1071,21 @@ def compare_flip(old_tree, new_tree):
             if type(a.ops[0]) not in CMP_OPS or type(b.ops[0]) not in CMP_OPS:
                 return False
             found.append((a.lineno, a.col_offset, CMP_OPS[type(a.ops[0])], CMP_OPS[type(b.ops[0])]))
-            return len(found) == 1
+            return True
+        if (isinstance(a, ast.BoolOp) and len(a.values) == 2 and len(b.values) == 2
+                and type(a.op) is not type(b.op)):
+            if not walk(a.values, b.values):
+                return False
+            names = {ast.And: "and", ast.Or: "or"}
+            found.append((a.lineno, a.col_offset, names[type(a.op)], names[type(b.op)]))
+            return True
         if isinstance(a, ast.AST):
             return all(walk(getattr(a, f), getattr(b, f)) for f in a._fields)
         if isinstance(a, list):
             return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
         return a == b
 
-    return found[0] if walk(old_tree, new_tree) and len(found) == 1 else None
+    return found if walk(old_tree, new_tree) and found else None
 
 
 def _value_type(v):
@@ -1301,7 +1371,8 @@ SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may a
 SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
 
-def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
+def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
+           dropped=None):
     """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
     runnable tests whose estimated CPU is worth less than the worker time they add."""
     gen = _policy(C, dur, data_only, focus, known)
@@ -1314,6 +1385,8 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
             req = gen.send(res)
     except StopIteration as e:
         final = set(e.value)
+    if dropped and C and not data_only and PROFILE_SENTINEL:
+        final = yield from _sentinels(C, final, seen, set(dropped), focus or {})
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
     left_out = {g for g in C if g not in final and g not in seen and is_heavy(g)}
@@ -1440,6 +1513,58 @@ def set_settle_scale(commits: int, verifiable: list) -> None:
     """Split the batch's settle budget over the commits by worker cost, before any runs."""
     weight = sum(_pack_lb(C) for C in verifiable)
     SETTLE_SCALE[0] = SETTLE_BUDGET_PER_COMMIT_MS * commits / weight if weight else float("inf")
+
+
+# Pollution sentinels (RWX_PROFILE_SENTINEL, default on). A value profile drops candidates R
+# that cannot be infected directly, but an infected test can leave shared state behind that
+# makes a later test fail in the same process. After the infected tests N have run in this
+# session, run some of R (same class first, then same file, then a spread): if one fails, the
+# profile is not trusted for this commit and R goes back to the unproven set. main() prints R
+# unless this marked the commit cleared, so every fallback path (crash, cut, kill) keeps it.
+PROFILE_SENTINEL = os.environ.get("RWX_PROFILE_SENTINEL", "1") == "1"
+SENTINEL_INFECTED_MS = int(os.environ.get("RWX_SENTINEL_INFECTED_MS", "3000"))
+SENTINEL_CLASS_MS = int(os.environ.get("RWX_SENTINEL_CLASS_MS", "3000"))
+SENTINEL_FILE_MS = int(os.environ.get("RWX_SENTINEL_FILE_MS", "1500"))
+SENTINEL_SPREAD_MS = int(os.environ.get("RWX_SENTINEL_SPREAD_MS", "500"))
+SENTINEL_CLEARED: set = set()  # commit keys whose sentinels all passed
+FRESH_PROCESS: set = set()  # tests that run their checks in a fresh interpreter (test_lazy_load)
+
+
+def _sentinels(C, final, seen, R, focus):
+    if all(n in NO_RUN or n in FRESH_PROCESS for n in C):
+        # the only infected tests start their own interpreter: nothing in this process is touched
+        SENTINEL_CLEARED.add(commit_key(C))
+        return final
+    seen = dict(seen)
+    infected_unrun = [n for n in C if n not in seen and not is_heavy(n)]
+    if infected_unrun and batch_cost(infected_unrun) <= SENTINEL_INFECTED_MS:
+        # the potential polluters must have run before the sentinels
+        res = yield sorted(infected_unrun, key=lambda n: (batch_cost([n]), n)), False
+        seen.update({n: res.get(n, "F") for n in infected_unrun})
+        final = final - {n for n in infected_unrun if res.get(n) == "P"}
+    if any(n not in seen for n in C if not is_heavy(n)):
+        return final | R  # not every runnable infected test ran: R stays unproven
+    runnable = sorted((n for n in R if not is_heavy(n)), key=lambda n: (batch_cost([n]), n))
+    classes = {CLS_OF.get(n) for n in C}
+    files = {FILE_OF.get(n) for n in C}
+    picks: list = []
+
+    def take(pool, budget):
+        start = batch_cost(picks)
+        for n in pool:
+            if n not in picks and batch_cost(picks + [n]) - start <= budget:
+                picks.append(n)
+
+    take([n for n in runnable if CLS_OF.get(n) in classes], SENTINEL_CLASS_MS)
+    take([n for n in runnable if FILE_OF.get(n) in files], SENTINEL_FILE_MS)
+    picks += _spread([n for n in runnable if n not in picks], SENTINEL_SPREAD_MS, 2, focus=focus)
+    if not picks:
+        return final | R
+    res = yield picks, True
+    if all(res.get(n) == "P" for n in picks):
+        SENTINEL_CLEARED.add(commit_key(C))
+        return final
+    return final | (R - {n for n in picks if res.get(n) == "P"})
 
 
 def _settle_batch(final, seen, known):
@@ -1987,7 +2112,8 @@ class Scheduler:
                 if fixture:
                     gen = fixture_policy(C, fixture[1])
                 else:
-                    gen = policy(C, DUR, data_only, focus, known)
+                    extra = [job[9]] if len(job) > 9 and job[9] else []
+                    gen = policy(C, DUR, data_only, focus, known, *extra)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -2316,6 +2442,7 @@ def main() -> None:
     dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     DUR.update(dur)
     FILE_OF.update({t["number"]: t["file"] for t in tests})
+    FRESH_PROCESS.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     if not LAZY_RUN:
         NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     valid = 0
@@ -2389,10 +2516,15 @@ def main() -> None:
                 if runnable and spec and _pack_cost(C) > _pack_cost([n for n in C if n not in runnable]):
                     fixture = (spec, runnable, {rel.removeprefix("tests/fixtures/"): fruns[rel] for rel in data})
                     log(f"{cid}: fixture run: {len(runnable)} {EXEC_CLS} tests on the edited queries")
-            jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture))
+            dropped = None
+            if PROFILE_SENTINEL and C and not data_only and an.profile_dropped & valid:
+                in_c = set(C)
+                dropped = sorted(n for n in dur if (an.profile_dropped & valid) >> n & 1 and n not in in_c)
+                log(f"{cid}: profile dropped {len(dropped)} candidates: sentinels check them")
+            jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture, dropped))
         except Exception as e:  # never crash: run everything for this commit
             log(f"{cid}: job error {e!r} -> ALL")
-            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None, None))
+            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None, None, None))
     set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
     if SETTLE_GIANT_MS > 0:
         grant_giants([C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
@@ -2426,7 +2558,8 @@ def main() -> None:
     total = 0
     diag_min = int(os.environ.get("RWX_DIAG_MIN", "0"))
     diag_max = int(os.environ.get("RWX_DIAG_MAX", "100000"))
-    for cid, C, py, data, data_only, *_ in jobs:
+    for job in jobs:
+        cid, C, py, data, data_only = job[:5]
         final_set, note = results.get(cid, (set(C), "static"))
         if diag_min and diag_min <= len(C) <= diag_max:
             final_set, note = set(), "diagnostic: printed nothing"
@@ -2442,6 +2575,11 @@ def main() -> None:
             final_set = {n for n in final_set if n in seen or not (
                 n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
             note = "diagnostic (heavy): unrun slow tests left out"
+        dropped = job[9] if len(job) > 9 else None
+        if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
+            # profile-dropped candidates whose sentinels did not all pass (or never ran)
+            final_set = set(final_set) | set(dropped)
+            note += f"; +{len(dropped)} profile-dropped (sentinels not passed)"
         if DEFERRED.get(cid) and IMPORT_OK.get(cid) is not True:
             # the patched modules were not shown to import: every importer may fail
             extra = DEFERRED[cid]
