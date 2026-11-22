@@ -53,8 +53,16 @@ def setup_tests(tests):
     sel.DUR.clear(); sel.DUR.update(dur)
     sel.FILE_OF.clear(); sel.FILE_OF.update({t["number"]: t["file"] for t in tests})
     sel.CLS_OF.clear(); sel.CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
-    sel.NO_RUN.clear(); sel.NO_RUN.update(t["number"] for t in tests if t["id"] in sel.NO_RUN_IDS)
+    sel.NO_RUN.clear()
+    if not getattr(sel, "LAZY_RUN", False):
+        sel.NO_RUN.update(t["number"] for t in tests if t["id"] in sel.NO_RUN_IDS)
     sel.CPU_EST.clear(); sel.CPU_EST.update({n: M.cpu_ms.get(n, dur[n]) for n in dur})
+    if getattr(sel, "LAZY_RUN", False):  # the engine runs test_lazy_load on the patched tree (rwx/srchook.py)
+        for t in tests:
+            if t["id"] in sel.NO_RUN_IDS:
+                sel.CPU_EST[t["number"]] = max(sel.CPU_EST[t["number"]], sel.LAZY_RUN_MS)
+    if hasattr(sel, "TEST_ID_OF"):
+        sel.TEST_ID_OF.clear(); sel.TEST_ID_OF.update({t["number"]: t["id"] for t in tests})
     sel.CLS_SETUP.clear(); sel.CLS_SETUP.update(M.cls_setup_ms)
     if SIM_EXEC:
         sel.CLS_SETUP[EXEC_CLS] = 0  # presetup in the warm parent
@@ -147,11 +155,12 @@ def load_truth(L):
             last[r["commit"]] = r  # a re-run ("redo") is appended later: the last record wins
     truth = {}
     for cid, r in last.items():
-        bad = bool(r.get("timeout") or r.get("crash"))
+        hung = r.get("hung")
+        bad = bool(r.get("timeout") or r.get("crash")) or (hung is not None and not isinstance(hung, list))
         if bad and os.environ.get("KEEP_UNRELIABLE") != "1":
             continue  # unreported tests were marked failing: not ground truth
         truth[cid] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()}, bad, set(r["cand"]),
-                      set(r.get("skipped", ())))
+                      set(r.get("skipped", ())) | set(hung if isinstance(hung, list) else ()))  # hung: outcome unknown
     if os.path.exists(f"{L}/pytest.jsonl"):  # real-pytest failing sets override the engine's
         for line in open(f"{L}/pytest.jsonl"):
             r = json.loads(line)
@@ -162,6 +171,8 @@ def load_truth(L):
 
 def main():
     rows, drops = [], {}
+    missed = []
+    fixture_eligible = [0]
     giant_stats = {}
     unknown_drops = [0]
     skipped = [0]
@@ -208,6 +219,8 @@ def main():
             if info[1] is not None and info[2] is False:
                 sel.EXEC_VERIFIABLE.add(sel.commit_key(C))
             cost = (lambda n: tcpu.get(n, sel.CPU_EST[n])) if CPU_SRC == "truth" else (lambda n: sel.CPU_EST[n])
+            if getattr(sel, "FIXTURE_RUN", False) and data_only and data and set(data) <= set(getattr(an, "fixture_runs", {})):
+                fixture_eligible[0] += 1  # the engine's per-query fixture run is not modelled: printed as static
             deferred = getattr(an, "deferred", 0) & valid
             out, cpu, ran, note, batches = replay(C, F, data_only, focus, known, cost, info, exec_n)
             if deferred:
@@ -236,6 +249,18 @@ def main():
                     st[3] += 0 if g in F else sel._pack_cost(out | {g}) - sim
             orc = sel._pack_cost(F)
             miss = bool(F - out)
+            if miss:
+                seen_fail = bool(ran & F)
+                for n in sorted(F - out):
+                    if n not in C:
+                        rule = "analyzer (not a candidate)"
+                    elif seen_fail:
+                        rule = "dropped after a failure was seen (NARROW / live rule)"
+                    elif sel.is_heavy(n):
+                        rule = "slow test dropped, no failure seen (clean-skips-heavy / BET_CLEAN)"
+                    else:
+                        rule = "runnable test left unrun, no failure seen (BET_CLEAN)"
+                    missed.append((f"{os.path.basename(L.rstrip('/'))}/{cid}", names[n], rule))
             for n in C:
                 if dur[n] >= SLOW and n not in out and n not in ran and n not in sel.NO_RUN:
                     d = drops.setdefault(names[n], [0, 0])
@@ -246,6 +271,10 @@ def main():
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
+    for m in missed:
+        print("MISS", *m)
+    if fixture_eligible[0]:
+        print(f"FIXTURE_RUN-eligible commits (not modelled, charged as static): {fixture_eligible[0]}")
     for k, (n, f, ms, saved) in sorted(giant_stats.items()):
         print(f"giant runs {k}: {n} runs, {f} failed, est CPU {ms / 1000:.1f} s, sim saved {saved / 1000:.1f} s, "
               f"break-even ratio {saved / max(ms, 1):.2f}")
