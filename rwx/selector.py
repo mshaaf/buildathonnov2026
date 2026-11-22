@@ -786,6 +786,9 @@ class Analyzer:
         return mask
 
     def removed_file(self, rel: str, why: list) -> int:
+        if _is_config(rel):
+            why.append(f"removed config {rel} -> ALL")
+            return self.all
         if rel.endswith(".py"):
             mask = self.map.file_mask(rel) | self.file_tests.get(rel, 0)
             if rel.startswith("sqlglot/"):
@@ -805,6 +808,9 @@ class Analyzer:
 
     def added_file(self, rel: str, content, binary: bool, why: list) -> int:
         base = rel.rsplit("/", 1)[-1]
+        if _is_config(rel):
+            why.append(f"new config {rel} -> ALL")
+            return self.all
         if rel.endswith(".py"):
             if base == "conftest.py" or "/" not in rel:
                 # conftest: pytest loads it; root level: may shadow any import
@@ -871,6 +877,9 @@ class Analyzer:
         return fm
 
     def other_file(self, fp, rel: str, why: list) -> int:
+        if _is_config(rel) and not ("/" not in rel and rel in CONFIG_FILES):
+            why.append(f"config {rel} -> ALL")
+            return self.all
         if "/" not in rel and rel in CONFIG_FILES:
             old = self.old_source(rel)
             if old is None:
@@ -912,6 +921,8 @@ class Analyzer:
                 continue
             if rel.endswith(".py"):
                 mask |= self.python_file(fp, rel, why, single_file=len(files) == 1)
+            elif _is_config(rel):
+                mask |= self.other_file(fp, rel, why)  # e.g. tests/pytest.ini: config, not a fixture
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
                 if old is None:
@@ -1009,6 +1020,13 @@ class Analyzer:
 
 
 CONFIG_FILES = ("pyproject.toml", "setup.cfg", "tox.ini", "pytest.ini", ".pytest.ini")
+# pytest 9 also reads pytest.toml / .pytest.toml, and starts its config search in the test
+# directory: these names at the root or anywhere under tests/ can change how tests run.
+PYTEST_CONFIGS = CONFIG_FILES + ("pytest.toml", ".pytest.toml")
+
+
+def _is_config(rel: str) -> bool:
+    return rel.rsplit("/", 1)[-1] in PYTEST_CONFIGS and ("/" not in rel or rel.startswith("tests/"))
 CODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
