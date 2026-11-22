@@ -605,6 +605,8 @@ PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "250"))
 PROBE_ORDER = os.environ.get("RWX_PROBE_ORDER", "focus")
 RELATED_EVIDENCE_MS = int(os.environ.get("RWX_RELATED_EVIDENCE_MS", "1200"))
 RELATED_ALL_MS = int(os.environ.get("RWX_RELATED_ALL_MS", "4000"))
+# giants whose own test file must run clean before they can be dropped (empty: all giants)
+EVIDENCE_FILES = {f for f in os.environ.get("RWX_EVIDENCE_FILES", "").split(",") if f}
 MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 
@@ -666,6 +668,10 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     probe2, evidenced = [], set()
     for g in giants:
         gf = FILE_OF.get(g, "")
+        if EVIDENCE_FILES and gf not in EVIDENCE_FILES:
+            # the lab never saw this giant fail once the first probe passed
+            evidenced.add(g)
+            continue
         related = [n for n in remaining if FILE_OF.get(n, "") == gf and n not in set(probe2)]
         if not related:
             continue
