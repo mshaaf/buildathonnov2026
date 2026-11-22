@@ -1,6 +1,7 @@
 """Coverage of individual TPC-DS queries in the pinned TestExecutor test."""
 
 import json
+import os
 import sys
 import time
 import unittest
@@ -157,6 +158,11 @@ def install(indices):
             del self.tpcds_sqls
 
     TestExecutor.test_execute_tpcds = selected
+    if os.environ.get("RWX_TPCDS_EXPECTED") == "1":
+        import tests.test_executor as module
+        from tpcds_expected import install as install_expected
+
+        install_expected(str(Path(module.__file__).resolve().parents[1]))
 
 
 if __name__ == "__main__":

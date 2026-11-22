@@ -30,10 +30,11 @@ COPY --from=sqlglotsrc /sqlglot /sqlglot
 RUN python -m compileall -q /sqlglot/sqlglot /sqlglot/tests > /dev/null || true
 COPY rwx /app/rwx
 RUN python -m compileall -q /app/rwx > /dev/null && chmod -R a+rX /app /sqlglot
-ENV RWX_KIND_PROBES=1 RWX_BOOL_PROFILE=1 RWX_TPCDS_BLIND_GUARD=0 RWX_TPCDS_BLIND_MS=500 RWX_MAXNODES_PROXY=1 RWX_BET_CLEAN=1 RWX_NARROW=1 RWX_NARROW_SKIP_MS=1000 RWX_NARROW_CHUNKS=0 RWX_FIXTURE_RUN=1 RWX_PRESETUP_CACHE=1 RWX_LAZY_RUN=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+ENV RWX_TPCDS_EXPECTED=1 RWX_KIND_PROBES=1 RWX_BOOL_PROFILE=1 RWX_TPCDS_BLIND_GUARD=0 RWX_TPCDS_BLIND_MS=500 RWX_MAXNODES_PROXY=1 RWX_BET_CLEAN=1 RWX_NARROW=1 RWX_NARROW_SKIP_MS=1000 RWX_NARROW_CHUNKS=0 RWX_FIXTURE_RUN=1 RWX_PRESETUP_CACHE=1 RWX_LAZY_RUN=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
 RUN python /app/rwx/executor_fixture.py /sqlglot && chmod a+r /sqlglot/.rwx-executor.json
 RUN python /app/rwx/tokenizer_coverage.py /sqlglot && chmod a+r /sqlglot/.rwx-tokenizer.json
 RUN python /app/rwx/executor_cases.py /sqlglot && chmod a+r /sqlglot/.rwx-executor-cases.json
+RUN python /app/rwx/tpcds_expected.py /sqlglot > /dev/null 2>&1; chmod a+r /sqlglot/.rwx-tpcds-expected.pkl 2>/dev/null; true
 # optional: without the snapshot the engine runs setUpClass itself
 RUN python /app/rwx/presetup_cache.py /sqlglot > /dev/null 2>&1; chmod a+r /sqlglot/.rwx-presetup.pkl 2>/dev/null; true
 CMD ["python", "/app/rwx/selector.py"]
