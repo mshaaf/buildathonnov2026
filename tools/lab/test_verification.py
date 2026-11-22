@@ -675,6 +675,16 @@ class RobustnessTests(unittest.TestCase):
             # anything besides the one operator: no narrowing
             (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b").replace("return 1", "return 2"))
             self.assertEqual(mask & 0b1111, 0b1111, why)
+            # two flips in one file: union of both sites' distinguishing tests
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b").replace("a is b", "a == b"))
+            self.assertEqual(mask, 0b1101, why)
+            # a flip plus a comment-only file: the comment contributes nothing
+            analyzer = selector.Analyzer(fmap, 0xFF)
+            other = "X = 1\n"
+            text = _diff("sqlglot/m.py", old, old.replace("a < b", "a <= b")) + _diff("sqlglot/n.py", other, "# c\n" + other)
+            with patch.object(analyzer, "old_source", side_effect=lambda rel: old if rel.endswith("m.py") else other):
+                mask, why = analyzer.analyze(text)
+            self.assertEqual(mask, 0b1100, why)
         with patch.object(selector, "CMP_PROFILE", False):
             (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b"))
             self.assertEqual(mask, 0b1111, why)
