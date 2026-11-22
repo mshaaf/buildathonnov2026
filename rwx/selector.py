@@ -1050,12 +1050,53 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         final = set(e.value)
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
+    left_out = {g for g in C if g not in final and g not in seen and is_heavy(g)}
+    settled: dict = {}
+    chunk = SETTLE_CHUNK_MS
+    for _ in range(SETTLE_ROUNDS):
+        batch = _settle_batch(final, seen | settled, known)
+        if not batch:
+            break
+        if batch_cost(batch) > 2 * chunk:
+            # Grow in steps: results so far re-estimate the pass chance before spending more.
+            cut = []
+            for n in batch:
+                if cut and batch_cost(cut + [n]) > chunk:
+                    break
+                cut.append(n)
+            batch = cut
+        chunk *= 2
+        if SETTLE_SPENT[0] + batch_cost(batch) > SETTLE_BUDGET[0]:
+            break  # batch-wide settle budget exhausted: print the unproven tests
+        SETTLE_SPENT[0] += batch_cost(batch)
+        res = yield batch, False
+        settled.update({n: res.get(n, "F") for n in batch})
+        final -= {n for n in batch if res.get(n) == "P"}
+    if any(st != "P" for st in settled.values()):
+        # A new failure: slow tests left out on clean evidence come back unless their own
+        # test file showed all of its runnable candidates passing.
+        allpass = {n for n, st in (seen | settled).items() if st == "P"}
+        rest = [n for n in C if not is_heavy(n)]
+        for g in left_out:
+            rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
+            if not rel or not all(n in allpass for n in rel):
+                final.add(g)
+    return final
+
+
+SETTLE_CHUNK_MS = int(os.environ.get("RWX_SETTLE_CHUNK_MS", "2000"))  # first settle batch size (est), doubling
+SETTLE_ROUNDS = 8
+
+
+def _settle_batch(final, seen, known):
+    """The printed, never-run tests worth running: the prefix (by recorded time per CPU) that
+    minimises ratio x CPU + expected worker cost of what stays printed."""
     ratio = SETTLE_RATIO
     nfail = sum(st != "P" for st in seen.values())
     keep = 1.0  # chance an unproven test passes, so that running it removes it
     if nfail:
         if SETTLE_FAIL_MULT <= 0:
-            return final
+            return []
         ratio *= SETTLE_FAIL_MULT
         keep = 1 - (nfail + 1) / (len(seen) + 2)  # Laplace estimate from this commit's runs
     # Tests sharing a class with a seen failure usually fail too: running them buys nothing.
@@ -1063,7 +1104,7 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     unproven = [n for n in final if n not in seen and n not in NO_RUN and n not in (known or ())
                 and (not is_heavy(n) or batch_cost([n]) <= SETTLE_MAX_MS) and CLS_OF.get(n) not in bad_cls]
     if not unproven:
-        return final
+        return []
     order = sorted(unproven, key=lambda n: (-DUR[n] / (batch_cost([n]) + 1), n))
     best0 = best = _pack_lb(final)
     best_j = 0
@@ -1073,28 +1114,7 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         c = ratio * batch_cost(order[:j]) + keep * _pack_lb(final - set(order[:j])) + (1 - keep) * best0
         if c < best:
             best, best_j = c, j
-    if not best_j:
-        return final
-    batch = order[:best_j]
-    if SETTLE_SPENT[0] + batch_cost(batch) > SETTLE_BUDGET[0]:
-        return final  # batch-wide settle budget exhausted: print the unproven tests
-    SETTLE_SPENT[0] += batch_cost(batch)
-    res = yield batch, False
-    ok = {n for n, st in res.items() if st == "P"}
-    bad = {n for n in batch if res.get(n) != "P"}
-    final -= ok
-    if bad:
-        # A new failure: slow tests left out on clean evidence come back unless their own
-        # test file showed all of its runnable candidates passing.
-        allpass = {n for n, st in (seen | res).items() if st == "P"}
-        rest = [n for n in C if not is_heavy(n)]
-        for g in C:
-            if g in final or g in seen or g in res or not is_heavy(g):
-                continue
-            rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
-            if not rel or not all(n in allpass for n in rel):
-                final.add(g)
-    return final
+    return order[:best_j]
 
 
 def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):

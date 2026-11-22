@@ -196,6 +196,19 @@ class VerificationTests(unittest.TestCase):
                     gen.send(response)
                 self.assertEqual(done.exception.value, expected)
 
+    def test_settle_grows_in_chunks_and_rechecks_between_them(self):
+        durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
+        cpu = {0: 1, 1: 1, 2: 100, 3: 9000}
+        with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5,
+                            SETTLE_CHUNK_MS=40):
+            gen = selector.policy([0, 1, 2, 3], durations, False)
+            next(gen)
+            self.assertEqual(gen.send({0: "P"}), ([2], False))  # [2, 1] costs 101 > 2 x 40: first chunk only
+            self.assertEqual(gen.send({2: "P"}), ([1], False))
+            with self.assertRaises(StopIteration) as done:
+                gen.send({1: "P"})
+            self.assertEqual(done.exception.value, {3})
+
     def test_settle_stops_when_the_batch_budget_is_spent(self):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 100, 3: 9000}
