@@ -227,12 +227,20 @@ class RobustnessTests(unittest.TestCase):
     def test_import_time_statement_that_may_raise_selects_importers(self):
         old = 'import re\nP = re.compile("a")\nQ = 1\n'
         fmap = FakeMap({"sqlglot/m.py": 0xF0})
-        (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old.replace('"a"', '"("'))
-        self.assertEqual(mask, 0xF0, why)
-        (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old.replace("Q = 1", "Q = -2"))
-        self.assertEqual(mask, 0, why)  # a literal cannot raise; nobody reads Q
-        (mask, why), _ = self.analyze(fmap, "sqlglot/m.py", old, old + "raise ValueError\n")
-        self.assertEqual(mask, 0xF0, why)
+        # importers are deferred: needed unless the engine's session imports the patch cleanly
+        (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace('"a"', '"("'))
+        self.assertEqual((mask, an.deferred), (0, 0xF0), why)
+        (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("Q = 1", "Q = -2"))
+        self.assertEqual((mask, an.deferred), (0, 0), why)  # a literal cannot raise; nobody reads Q
+        (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("Q = 1", "raise ValueError\nQ = 1"))
+        self.assertEqual(an.deferred, 0xF0, why)
+        # an edited import statement cannot be decided by importing once: static importers
+        (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("import re", "import re2"))
+        self.assertEqual((mask & 0xF0, an.deferred), (0xF0, 0), why)
+        # outside sqlglot/ and tests/ nothing imports it by name: static importers
+        fmap.importers["setup.py"] = 0xF00
+        (mask, why), an = self.analyze(fmap, "setup.py", old, old.replace('"a"', '"("'), all_mask=0xFFF)
+        self.assertEqual((mask, an.deferred), (0xF00, 0), why)
 
     def test_encoding_changes_select_importers_statically(self):
         old = "# caf\u00e9\nX = 1\n"

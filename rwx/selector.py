@@ -441,8 +441,13 @@ class Analyzer:
             else:
                 safe = all(stmt_inert(b, fut, known) for b in rem_new)
             if not safe:
-                why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
-                mask |= self.importers(rel)
+                if self.runtime_checkable(rel, rem_old + rem_new):
+                    # The engine imports the patched module once: if that works, nothing raised.
+                    why.append(f"import-time {o_lo}-{o_hi} may raise -> importers unless it imports")
+                    self.deferred |= self.importers(rel)
+                else:
+                    why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
+                    mask |= self.importers(rel)
                 continue
             # A value whose type changed can make other import-time code that reads it raise
             # (`B = A + 1` in a class body): those readers' modules break for every importer.
@@ -467,6 +472,21 @@ class Analyzer:
             why.append(f"bindings {list(site.names)[:3]} -> {extra.bit_count()}")
             mask |= extra
         return mask
+
+    @staticmethod
+    def runtime_checkable(rel: str, stmts) -> bool:
+        """Can the session's import of the patched module decide "may raise"? Not for edits
+        of import statements (their outcome depends on import order), nor for files the
+        engine does not import by name."""
+        if not rel.startswith(("sqlglot/", "tests/")) or rel.rsplit("/", 1)[-1] == "conftest.py":
+            return False
+        for st in stmts:
+            for sub in ast.walk(st):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    return False
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "__import__":
+                    return False
+        return True
 
     def _scope_site(self, tree, path):
         """An old-file import-time Site for the class (or module) named by `path`."""
@@ -617,6 +637,7 @@ class Analyzer:
         self.sites: set = set()
         self.case_site = None
         self.unverifiable = False
+        self.deferred = 0  # importers needed unless the engine proves the patched modules import
         files = self.merge_repeats(parse_patch(text), why)
         for fp in files:
             if not fp.path and (fp.hunks or fp.binary):
@@ -640,6 +661,9 @@ class Analyzer:
                 mask |= self.other_file(fp, rel, why)
         if self.unverifiable:
             self.py_changes = {}  # nothing the engine runs could stand in for the real import
+        if not self.py_changes:
+            mask |= self.deferred  # no session will import anything
+            self.deferred = 0
         return mask, why
 
     def merge_repeats(self, files, why):
@@ -1127,6 +1151,8 @@ class Scheduler:
                     finished = False
                     if sess in ready:
                         finished = sess.read()
+                    if sess.import_ok is not None and cid not in IMPORT_OK:
+                        IMPORT_OK[cid] = sess.import_ok
                     if not finished and sess.expired():
                         log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
                         sess.kill()
@@ -1201,6 +1227,8 @@ class Scheduler:
                     yield a[0], set(a[1]), "scheduler error"
 
 DUR: dict = {}
+DEFERRED: dict = {}  # commit -> importers mask needed unless its session imported the patch cleanly
+IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
 LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
@@ -1329,8 +1357,11 @@ def main() -> None:
         try:
             mask, why = an.analyze(read_patch(patch))
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
+            if an.deferred:
+                DEFERRED[cid] = an.deferred & valid
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
+            DEFERRED.pop(cid, None)
         try:
             mask &= valid
             C = [n for n in dur if mask >> n & 1]
@@ -1381,6 +1412,11 @@ def main() -> None:
         diag_mode = os.environ.get("RWX_DIAG_MODE", "")
         if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
             final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
+        if DEFERRED.get(cid) and IMPORT_OK.get(cid) is not True:
+            # the patched modules were not shown to import: every importer may fail
+            extra = DEFERRED[cid]
+            final_set = set(final_set) | {n for n in dur if extra >> n & 1}
+            note += f"; +importers ({'import failed' if IMPORT_OK.get(cid) is False else 'import unchecked'})"
         try:
             nums = sorted(n for n in (set(C) if final_set is None else set(final_set)) if n in dur)
         except Exception as e:  # malformed result: everything the analysis named
