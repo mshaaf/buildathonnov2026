@@ -33,6 +33,7 @@ from patchlib import (  # noqa: E402
     known_lookups,
     locate_hunks,
     parse_patch,
+    same_outside_lambdas,
     stmt_inert,
     stmt_safe,
 )
@@ -174,13 +175,15 @@ class Analyzer:
                 mask = m.code_mask(rel, own)
                 if not mask and site.scope_path and site.scope_path[-1][0] == "class":
                     mask = m.span_mask(rel, site.code_key, *site.lines)
-                if stmt.body and stmt.body[0].lineno <= stmt.lineno:
-                    # Body on the def line: coverage never records a code object's first
-                    # line, so callers are invisible. Anyone reaching the binding may call it.
-                    if isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
-                        mask |= self.import_mask(rel, site, why)
-                    else:
-                        mask |= m.span_mask(rel, site.code_key, *site.lines)
+                first = stmt.decorator_list[0].lineno if stmt.decorator_list else stmt.lineno
+                if not isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
+                    # nested def: decorators/defaults run in the enclosing function
+                    mask |= m.span_mask(rel, site.code_key, *site.lines)
+                elif stmt.body and stmt.body[0].lineno <= stmt.lineno and first not in m.code(rel, own):
+                    # Body on the def line and no entry for it: coverage never records a code
+                    # object's first line, so callers are unknown. Anyone reaching the binding
+                    # may call it; nobody known -> importers.
+                    mask |= self.import_mask(rel, site, why) or self.importers(rel)
             why.append(f"header {own} -> {bin(mask).count('1')}")
             return mask
         # blank/unknown position: whole enclosing code object
@@ -386,6 +389,9 @@ class Analyzer:
         loc = Locator(tree)
         mask = 0
         old_changed, added = changed_lines(hunks)
+        if len(old_changed) + len(added) > 3000:
+            why.append(f"{rel}: very large change -> importers")
+            return self.importers(rel)
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
@@ -429,13 +435,16 @@ class Analyzer:
         runs after the statement creating it did: charge such a change to that statement."""
         if not site.scope_path or site.scope_path[-1][0] != "lambda":
             return 0
-        if not inserted and ln != site.scope_path[-1][2]:
+        first = site.scope_path[-1][2]
+        if not inserted and ln != first:
             return 0  # a later line of the lambda: its own coverage is complete
+        if not inserted and first in self.map.code(rel, site.code_key):
+            return 0  # entries (PY_START supplement) record who ran the first line
         outer = loc.locate(ln, lambdas=False)
-        if outer is None:
-            return self.map.file_mask(rel)
-        mask = self.site_mask(rel, outer, why)
-        why.append(f"lambda via {outer.kind} {outer.code_key} -> {mask.bit_count()}")
+        mask = self.site_mask(rel, outer, why) if outer is not None else 0
+        if not mask:
+            mask = self.importers(rel)  # unknown, never "unreached"
+        why.append(f"lambda via {outer.kind if outer else '?'} -> {mask.bit_count()}")
         return mask
 
     def import_blocks(self, rel, tree, new_tree, hunks, loc, why) -> int:
@@ -468,14 +477,33 @@ class Analyzer:
             known = known_lookups(tree, o_lo, _scope_nodes(tree, site))
             rem_new = [b for b in new_stmts if not any(same_syntax(a, b) for a in old_stmts)]
             rem_old = [a for a in old_stmts if not any(same_syntax(a, b) for b in new_stmts)]
+            changed = set(range(o_lo, o_hi + 1))
             if len(rem_old) == len(rem_new):
-                safe = all(stmt_safe(a, b, fut, known) for a, b in zip(rem_old, rem_new))
+                safe = all(same_outside_lambdas(a, b, changed) or stmt_safe(a, b, fut, known)
+                           for a, b in zip(rem_old, rem_new))
             else:
                 safe = all(stmt_inert(b, fut, known) for b in rem_new)
             if not safe:
-                why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
-                mask |= self.importers(rel)
+                if self.runtime_checkable(rel, rem_old + rem_new):
+                    # The engine imports the patched module once: if that works, nothing raised.
+                    why.append(f"import-time {o_lo}-{o_hi} may raise -> importers unless it imports")
+                    self.deferred |= self.importers(rel)
+                else:
+                    why.append(f"import-time {o_lo}-{o_hi} may raise -> importers")
+                    mask |= self.importers(rel)
                 continue
+            # A value whose type changed can make other import-time code that reads it raise
+            # (`B = A + 1` in a class body): those readers' modules break for every importer.
+            retyped = set()
+            for a, b in zip(rem_old, rem_new):
+                if isinstance(a, (ast.Assign, ast.AnnAssign)) and _value_type(a.value) != _value_type(b.value):
+                    retyped.update(bound_names(a))
+            for name in sorted(retyped):
+                for f, _key, kind in self.map.name_refs.get(name, ()):
+                    if kind in ("class", "module"):
+                        mask |= self.map.file_mask(f)
+            if retyped:
+                why.append(f"retyped {sorted(retyped)[:3]}: import-time readers' importers")
             old_names = {n for x in rem_old for n in bound_names(x)}
             new_names = {n for x in rem_new for n in bound_names(x)}
             # Names bound on both sides are the per-line sites' business (with their narrowing).
@@ -487,6 +515,21 @@ class Analyzer:
             why.append(f"bindings {list(site.names)[:3]} -> {extra.bit_count()}")
             mask |= extra
         return mask
+
+    @staticmethod
+    def runtime_checkable(rel: str, stmts) -> bool:
+        """Can the session's import of the patched module decide "may raise"? Not for edits
+        of import statements (their outcome depends on import order), nor for files the
+        engine does not import by name."""
+        if not rel.startswith(("sqlglot/", "tests/")) or rel.rsplit("/", 1)[-1] == "conftest.py":
+            return False
+        for st in stmts:
+            for sub in ast.walk(st):
+                if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                    return False
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "__import__":
+                    return False
+        return True
 
     def _scope_site(self, tree, path):
         """An old-file import-time Site for the class (or module) named by `path`."""
@@ -528,7 +571,7 @@ class Analyzer:
                 except PatchMismatch:
                     content = None
             if (removed and not fp.copy and content is not None and content == self.old_source(removed)
-                    and added.startswith("tests/") and removed.startswith("tests/")):
+                    and added.startswith("tests/") and removed.startswith("tests/") and _in_package(added)):
                 # A test module moved unchanged: its import already ran in every session.
                 why.append(f"moved {removed} -> {added} unchanged")
             else:
@@ -556,10 +599,15 @@ class Analyzer:
     def added_file(self, rel: str, content, binary: bool, why: list) -> int:
         base = rel.rsplit("/", 1)[-1]
         if rel.endswith(".py"):
-            if base == "conftest.py" or "/" not in rel or rel.startswith("sqlglot/"):
-                # conftest: pytest loads it; root level: shadows imports; sqlglot/: dialects and
-                # optimizer passes are imported by computed names.
+            if base == "conftest.py" or "/" not in rel:
+                # conftest: pytest loads it; root level: may shadow any import
                 why.append(f"new {rel} -> ALL")
+                return self.all
+            if rel.startswith("sqlglot/"):
+                return self.new_module(rel, content, why)
+            if not _in_package(rel):
+                # pytest puts a non-package test directory on sys.path (shadowing imports)
+                why.append(f"new {rel} outside a package -> ALL")
                 return self.all
             if _is_test_file(base):
                 if content is not None and _inert_module(content):
@@ -572,11 +620,34 @@ class Analyzer:
         if "/" not in rel and rel in CONFIG_FILES:
             why.append(f"new config {rel} -> ALL")
             return self.all
-        if binary and rel.startswith("sqlglot/"):
-            why.append(f"new binary {rel} -> ALL")
+        if rel.startswith("sqlglot/") and (binary or not rel.endswith(TEXT_SUFFIXES)):
+            # an extension module (.so/.pyd) or a .pyc would shadow a module of the package
+            why.append(f"new {rel} inside the package -> ALL")
             return self.all
         why.append(f"new {rel}: nothing opens it")
         return 0
+
+    def new_module(self, rel: str, content, why: list) -> int:
+        """A new module under sqlglot/. Dialects and optimizer passes are imported by computed
+        names (`sqlglot.dialects.<key>`), so its name could be reached from any string.
+        Only when that name occurs nowhere in sqlglot/ or tests/ (not as a word, not in a
+        string) can nothing import it; then the observers are the directory listers:
+        sqlglotc/setup.py (test_sqlglotc) and, for sqlglot/typing, test_typing."""
+        parts = rel[: -len(".py")].split("/")
+        names = {parts[-1]} if parts[-1] != "__init__" else set()
+        names.add(parts[-2] if parts[-1] == "__init__" else parts[-1])
+        if _is_test_file(rel.rsplit("/", 1)[-1]) or any(n.startswith("_") and n.endswith("_") for n in names):
+            why.append(f"new {rel} -> ALL")
+            return self.all
+        words = source_words()
+        if words is None or any(n in words for n in names) or (SRC / rel[: -len(".py")]).exists():
+            why.append(f"new {rel}: its name is referenced (or shadows a package) -> ALL")
+            return self.all
+        mask = self.file_tests.get("tests/test_sqlglotc.py", 0)
+        if rel.startswith("sqlglot/typing/"):
+            mask |= self.file_tests.get("tests/test_typing.py", 0)
+        why.append(f"new {rel}: name unreferenced -> directory listers {mask.bit_count()}")
+        return mask
 
     def data_mask(self, rel: str, why: list, binary=False) -> int:
         m = self.map.opens.get(rel)
@@ -614,6 +685,7 @@ class Analyzer:
         self.sites: set = set()
         self.case_site = None
         self.unverifiable = False
+        self.deferred = 0  # importers needed unless the engine proves the patched modules import
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
         for fp in files:
@@ -648,6 +720,9 @@ class Analyzer:
                 mask |= self.other_file(fp, rel, why)
         if self.unverifiable:
             self.py_changes = {}  # nothing the engine runs could stand in for the real import
+        if not self.py_changes:
+            mask |= self.deferred  # no session will import anything
+            self.deferred = 0
         return mask, why
 
     def merge_repeats(self, files, why):
@@ -698,6 +773,19 @@ def _import_time(site) -> bool:
             and isinstance(site.scope_node, (ast.Module, ast.ClassDef)))
 
 
+def _value_type(v):
+    """Coarse runtime type of an assigned expression: literal type, or the node type."""
+    if v is None:
+        return None
+    if isinstance(v, ast.Constant):
+        return type(v.value)
+    if isinstance(v, ast.UnaryOp) and isinstance(v.operand, ast.Constant):
+        return type(v.operand.value)
+    if isinstance(v, (ast.Dict, ast.List, ast.Tuple, ast.Set, ast.Lambda)):
+        return type(v)
+    return ("expr", ast.dump(v))  # a lookup or computation: unknown, equal only if identical
+
+
 def _scope_nodes(tree, site) -> list:
     """The class nodes enclosing a site, outermost first (module scope: empty)."""
     out, node = [], tree
@@ -711,6 +799,36 @@ def _scope_nodes(tree, site) -> list:
         out.append(nxt)
         node = nxt
     return out
+
+
+_WORDS: list = []
+
+
+def source_words():
+    """Every identifier-like word in the pinned sqlglot/ and tests/ sources (lazy, once)."""
+    if not _WORDS:
+        words: set = set()
+        try:
+            if not (SRC / "sqlglot" / "__init__.py").is_file():
+                raise FileNotFoundError(SRC / "sqlglot")
+            for top in ("sqlglot", "tests"):
+                for p in (SRC / top).rglob("*"):
+                    if p.suffix in (".py", ".sql", ".json", ".txt", ".toml", ".cfg") and p.is_file():
+                        words.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", p.read_bytes().decode("utf-8", "replace")))
+            _WORDS.append(words)
+        except Exception as e:  # noqa: BLE001
+            log(f"source scan failed: {e!r}")
+            _WORDS.append(None)
+    return _WORDS[0]
+
+
+TEXT_SUFFIXES = (".md", ".txt", ".rst", ".typed", ".json", ".toml", ".cfg", ".ini", ".yaml", ".yml", ".csv", ".sql")
+
+
+def _in_package(rel: str) -> bool:
+    """The file's directory is a package in the pinned tree (pytest imports by package name)."""
+    d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+    return bool(d) and (SRC / d / "__init__.py").is_file()
 
 
 def _is_test_file(base: str) -> bool:
@@ -1312,6 +1430,8 @@ class Scheduler:
                     finished = False
                     if sess in ready:
                         finished = sess.read()
+                    if sess.import_ok is not None and cid not in IMPORT_OK:
+                        IMPORT_OK[cid] = sess.import_ok
                     if not finished and sess.expired():
                         log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
                         sess.kill()
@@ -1408,6 +1528,8 @@ def _drain(gen, first=None):
 
 
 DUR: dict = {}
+DEFERRED: dict = {}  # commit -> importers mask needed unless its session imported the patch cleanly
+IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
 LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
@@ -1464,6 +1586,15 @@ def batch_timeout(batch) -> float:
     return 10.0 + 4.0 * batch_cost(batch) / 1000
 
 
+def safe_pack(nums: list, dur: dict) -> list:
+    """pack(), or a plain round-robin split if packing fails (output must always be valid)."""
+    try:
+        return pack(nums, dur)
+    except Exception as e:  # noqa: BLE001
+        log(f"pack failed: {e!r}")
+        return [w for w in (nums[i::MAX_WORKERS] for i in range(MAX_WORKERS)) if w]
+
+
 def list_patches(d: Path) -> list:
     """Commit patch files: regular files named <id>.patch (anything else is not a commit)."""
     try:
@@ -1505,7 +1636,15 @@ def main() -> None:
     valid = 0
     for n in dur:
         valid |= 1 << n
-    cmap = Map(MAP)
+    try:
+        cmap = Map(MAP)
+    except Exception as e:  # no map: every commit selects every test, statically
+        log(f"map failed: {e!r}")
+        for patch in list_patches(DATA / "commits"):
+            cid = patch.name[: -len(".patch")]
+            out.write(json.dumps({"commit": cid, "workers": safe_pack(sorted(dur), dur)}, separators=(",", ":")) + "\n")
+        out.flush()
+        return
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
@@ -1516,7 +1655,13 @@ def main() -> None:
     file_tests: dict = {}
     for t in tests:
         file_tests[t["file"]] = file_tests.get(t["file"], 0) | 1 << t["number"]
-    an = Analyzer(cmap, valid, lazy, file_tests)
+    try:
+        an = Analyzer(cmap, valid, lazy, file_tests)
+    except Exception as e:  # e.g. an unreadable manifest: analyze without it
+        log(f"analyzer setup failed: {e!r}")
+        global ATTR_NARROW
+        ATTR_NARROW = False
+        an = Analyzer(cmap, valid, lazy, file_tests)
     an.class_masks = class_masks(tests)
     patches = list_patches(DATA / "commits")
     SETTLE_BUDGET[0] = SETTLE_BUDGET_PER_COMMIT_MS * len(patches)
@@ -1526,19 +1671,26 @@ def main() -> None:
         try:
             mask, why = an.analyze(read_patch(patch))
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
+            if an.deferred:
+                DEFERRED[cid] = an.deferred & valid
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
-        mask &= valid
-        C = [n for n in dur if mask >> n & 1]
-        # No patched Python to verify, including analysis failures and unsupported diffs.
-        data_only = not py
-        log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
-        known = set()
-        for rel in data:
-            dm = an.data_masks.get(rel, 0)
-            known |= {n for n in C if dm >> n & 1}
-        score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
-        jobs.append((cid, C, py, data, data_only, score, known, case_site))
+            DEFERRED.pop(cid, None)
+        try:
+            mask &= valid
+            C = [n for n in dur if mask >> n & 1]
+            # No patched Python to verify, including analysis failures and unsupported diffs.
+            data_only = not py
+            log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
+            known = set()
+            for rel in data:
+                dm = an.data_masks.get(rel, 0)
+                known |= {n for n in C if dm >> n & 1}
+            score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
+            jobs.append((cid, C, py, data, data_only, score, known, case_site))
+        except Exception as e:  # never crash: run everything for this commit
+            log(f"{cid}: job error {e!r} -> ALL")
+            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
@@ -1573,8 +1725,17 @@ def main() -> None:
         diag_mode = os.environ.get("RWX_DIAG_MODE", "")
         if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
             final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
-        nums = sorted(final_set)
-        workers = pack(nums, dur)
+        if DEFERRED.get(cid) and IMPORT_OK.get(cid) is not True:
+            # the patched modules were not shown to import: every importer may fail
+            extra = DEFERRED[cid]
+            final_set = set(final_set) | {n for n in dur if extra >> n & 1}
+            note += f"; +importers ({'import failed' if IMPORT_OK.get(cid) is False else 'import unchecked'})"
+        try:
+            nums = sorted(n for n in (set(C) if final_set is None else set(final_set)) if n in dur)
+        except Exception as e:  # malformed result: everything the analysis named
+            log(f"{cid}: bad result {e!r}")
+            nums = sorted(n for n in C if n in dur)
+        workers = safe_pack(nums, dur)
         cost = (max(sum(dur[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost
         out.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")

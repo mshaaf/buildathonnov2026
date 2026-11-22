@@ -488,6 +488,7 @@ class Engine:
 
     def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices):
         self._apply(mode, swaps, py_changes, data_changes)
+        self._check_imports(mode, py_changes, wfd)
         rbuf = b""
         while True:
             while b"\n" not in rbuf:
@@ -506,6 +507,29 @@ class Engine:
             stop_first = parts[0] == "R1"
             self._run_tests([int(x) for x in parts[1:]], wfd, stop_first)
             os.write(wfd, b"D\n")
+
+    def _check_imports(self, mode, py_changes, wfd):
+        """Import every changed module once, right after patching, and report on the result
+        pipe: "M ok" (all imported from the patched source), "M fail <rel>..." or "M skip"
+        (some module was not re-imported here, e.g. swap mode). Import-time statements run
+        exactly once, at import: "M ok" proves none of them raises."""
+        bad, skipped = [], False
+        for rel in py_changes:
+            if not rel.endswith(".py") or not rel.startswith(("sqlglot/", "tests/")):
+                skipped = True
+                continue
+            name = rel[:-3].replace("/", ".")
+            if name.endswith(".__init__"):
+                name = name[: -len(".__init__")]
+            if mode != "reimport" and name in sys.modules:
+                skipped = True  # not re-executed in this session
+                continue
+            try:
+                importlib.import_module(name)
+            except BaseException:  # noqa: BLE001
+                bad.append(rel)
+        msg = f"M fail {' '.join(bad)}" if bad else "M skip" if skipped else "M ok"
+        os.write(wfd, (msg + "\n").encode())
 
     def _child(self, mode, swaps, py_changes, data_changes, numbers, wfd):
         self._apply(mode, swaps, py_changes, data_changes)
@@ -701,6 +725,7 @@ class Session:
         self.cpu: dict = {}
         self.deadline = None
         self.crash = None
+        self.import_ok = None  # set by the child's "M" line: changed modules imported cleanly
         self.total_cpu = 0.0
         self.maxrss_mb = 0.0
 
@@ -737,6 +762,8 @@ class Session:
                 done = True
             elif parts[0] == "X":
                 self.crash = " ".join(parts[1:])
+            elif parts[0] == "M":
+                self.import_ok = parts[1] == "ok"
             else:
                 n = int(parts[0])
                 self.results[n] = parts[1]
