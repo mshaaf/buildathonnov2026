@@ -70,6 +70,8 @@ class Map:
         self.attr_refs: dict = d.get("attr_refs", {})
         self.cmp_sites: dict = d.get("cmp_sites", {})  # file -> {(line, col): (op, {vector: mask_id})}
         self.cmp_unprofiled: int = d["masks"][d["cmp_unprofiled"]] if "cmp_unprofiled" in d else -1
+        self.bool_sites: dict = d.get("bool_sites", {})  # file -> {(line, col): (op, mask_id)}
+        self.bool_unprofiled: int = d["masks"][d["bool_unprofiled"]] if "bool_unprofiled" in d else -1
         # (file, code_key) of a class body -> class key
         self.class_by_code: dict = {}
         for k in self.class_desc:
@@ -557,9 +559,11 @@ class Analyzer:
         if same_syntax(tree, new_tree):
             why.append(f"{rel}: AST unchanged")
             return 0
-        flip = compare_flip(tree, new_tree)
-        if flip is not None:
-            self.cmp_flip = (rel,) + flip
+        flips = compare_flips(tree, new_tree)
+        if flips:
+            self.cmp_flips += [(rel,) + f for f in flips]
+            if self.cmp_flip is None:
+                self.cmp_flip = (rel,) + flips[0]
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
@@ -602,6 +606,8 @@ class Analyzer:
             why.append(f"{rel}: very large change -> importers")
             return mask | self.importers(rel)
         mask |= self.import_blocks(rel, tree, new_tree, hunks, loc, why)
+        if flips and CMP_PROFILE and not BROAD:
+            mask = self.compare_narrow(rel, flips, mask, why)
         return mask
 
     def lambda_outer(self, rel, loc, site, ln, why, inserted=False) -> int:
@@ -861,7 +867,8 @@ class Analyzer:
         self.case_site = None
         self.unverifiable = False
         self.deferred = 0  # importers needed unless the engine proves the patched modules import
-        self.cmp_flip = None  # (rel, line, col, old op, new op) of a pure comparison-operator edit
+        self.cmp_flip = None  # (rel, line, col, old op, new op): first comparison flip seen
+        self.cmp_flips: list = []  # every flip of files whose only change is operator flips
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
         self.fixture_runs: dict = {}  # setup-loaded fixture rel -> [class attr] when pairs line up
@@ -913,29 +920,36 @@ class Analyzer:
         if not self.py_changes:
             mask |= self.deferred  # no session will import anything
             self.deferred = 0
-        if self.cmp_flip is not None and len(files) == 1 and CMP_PROFILE and not BROAD:
-            mask = self.compare_narrow(mask, why)
         return mask, why
 
-    def compare_narrow(self, mask: int, why: list) -> int:
-        """The whole patch flips one comparison operator. A test can only behave differently
-        if it evaluated that site on operands where the old and new operator disagree: keep
-        the candidates whose pinned value profile shows such an evaluation (plus unprofiled)."""
-        rel, line, col, old_op, new_op = self.cmp_flip
-        entry = self.map.cmp_sites.get(rel, {}).get((line, col))
-        if entry is None or entry[0] != old_op or self.map.cmp_unprofiled < 0:
-            return mask
-        fam = CMP_FAMILIES.get(old_op)
-        if fam is None or new_op not in fam:
-            return mask
-        i, j = fam.index(old_op), fam.index(new_op)
+    def compare_narrow(self, rel: str, flips: list, mask: int, why: list) -> int:
+        """This file's only change is operator flips of single-operator comparisons. Every
+        changed file contributes its own set and the commit takes the union, so this is
+        sound in multi-file patches too: consider a test in none of the other files'
+        sets that saw no distinguishing evaluation at any flip here. Up to its first
+        divergent evaluation, its run is the pinned run; that evaluation must be at a
+        changed site; it is not in another file (that test would be in that file's set),
+        and at a flip the operands are the pinned ones, on which old and new operators
+        agree. So it never diverges. Keep this file's candidates whose pinned value
+        profile shows a distinguishing evaluation at some flip (plus unprofiled tests)."""
         keep = self.map.cmp_unprofiled
-        for vec, mid in entry[1].items():
-            if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
-                keep |= self.map.masks[mid]
+        for line, col, old_op, new_op in flips:
+            k = self.flip_keep(rel, line, col, old_op, new_op)
+            if k is None:
+                why.append(f"compare {old_op} -> {new_op} at {line}:{col}: no profile")
+                return mask
+            keep |= k
         narrowed = mask & keep
-        why.append(f"compare {old_op} -> {new_op} at {line}:{col}: {mask.bit_count()} -> {narrowed.bit_count()}")
+        why.append(f"compare flips x{len(flips)} in {rel}: {mask.bit_count()} -> {narrowed.bit_count()}")
         return narrowed
+
+    def flip_keep(self, rel, line, col, old_op, new_op):
+        """Tests that may behave differently under this one operator flip, from the
+        per-site narrower registered for its kind (SITE_NARROWERS); None = cannot narrow."""
+        for kind_ops, narrower in SITE_NARROWERS:
+            if old_op in kind_ops:
+                return narrower(self.map, rel, line, col, old_op, new_op)
+        return None
 
     def merge_repeats(self, files, why):
         """The same file patched by several entries: apply them in order, re-diff once."""
@@ -986,6 +1000,7 @@ def _import_time(site) -> bool:
 
 
 CMP_PROFILE = os.environ.get("RWX_CMP_PROFILE", "1") == "1"
+BOOL_PROFILE = os.environ.get("RWX_BOOL_PROFILE", "0") == "1"  # and/or flips (needs bool_sites)
 CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
            ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
 _ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
@@ -994,9 +1009,55 @@ CMP_FAMILIES = {"<": _ORD, "<=": _ORD, ">": _ORD, ">=": _ORD, "==": _IDE, "!=": 
                 "is": _IDE, "is not": _IDE, "in": _MEM, "not in": _MEM}
 
 
+def _cmp_keep(cmap, rel, line, col, old_op, new_op):
+    """Comparison sites (tools/lab/cmprun.py profiles): tests that evaluated the site on
+    operands where old_op and new_op disagree (or raise / return non-bools), plus unprofiled."""
+    if not CMP_PROFILE:
+        return None
+    entry = cmap.cmp_sites.get(rel, {}).get((line, col))
+    if entry is None or entry[0] != old_op or cmap.cmp_unprofiled < 0:
+        return None
+    fam = CMP_FAMILIES.get(old_op)
+    if fam is None or new_op not in fam:
+        return None
+    i, j = fam.index(old_op), fam.index(new_op)
+    keep = cmap.cmp_unprofiled
+    for vec, mid in entry[1].items():
+        if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
+            keep |= cmap.masks[mid]
+    return keep
+
+
+def _bool_keep(cmap, rel, line, col, old_op, new_op):
+    """and/or sites (tools/lab/boolrun.py profiles): tests that saw an evaluation where the
+    flip could change the result, plus unprofiled."""
+    if not BOOL_PROFILE:
+        return None
+    entry = cmap.bool_sites.get(rel, {}).get((line, col))
+    if entry is None or entry[0] != old_op or cmap.bool_unprofiled < 0:
+        return None
+    return cmap.masks[entry[1]] | cmap.bool_unprofiled
+
+
+# Per-site narrowers for operator flips found by compare_flips(): (old operators handled,
+# fn(map, rel, line, col, old_op, new_op) -> mask of tests to keep, or None = cannot narrow).
+# Analyzer.compare_narrow() takes the union over a file's flips (any None: no narrowing).
+SITE_NARROWERS = [
+    (set(CMP_FAMILIES), _cmp_keep),
+    ({"and", "or"}, _bool_keep),
+]
+
+
 def compare_flip(old_tree, new_tree):
     """(line, col, old op, new op) when the trees differ in exactly one operator of a
     single-operator comparison and nowhere else; None otherwise."""
+    flips = compare_flips(old_tree, new_tree)
+    return flips[0] if flips and len(flips) == 1 else None
+
+
+def compare_flips(old_tree, new_tree):
+    """[(line, col, old op, new op), ...] when the trees differ only in operators of
+    single-operator comparisons (one or more); None when anything else differs."""
     found = []
 
     def walk(a, b):
@@ -1008,14 +1069,21 @@ def compare_flip(old_tree, new_tree):
             if type(a.ops[0]) not in CMP_OPS or type(b.ops[0]) not in CMP_OPS:
                 return False
             found.append((a.lineno, a.col_offset, CMP_OPS[type(a.ops[0])], CMP_OPS[type(b.ops[0])]))
-            return len(found) == 1
+            return True
+        if (isinstance(a, ast.BoolOp) and len(a.values) == 2 and len(b.values) == 2
+                and type(a.op) is not type(b.op)):
+            if not walk(a.values, b.values):
+                return False
+            names = {ast.And: "and", ast.Or: "or"}
+            found.append((a.lineno, a.col_offset, names[type(a.op)], names[type(b.op)]))
+            return True
         if isinstance(a, ast.AST):
             return all(walk(getattr(a, f), getattr(b, f)) for f in a._fields)
         if isinstance(a, list):
             return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
         return a == b
 
-    return found[0] if walk(old_tree, new_tree) and len(found) == 1 else None
+    return found if walk(old_tree, new_tree) and found else None
 
 
 def _value_type(v):

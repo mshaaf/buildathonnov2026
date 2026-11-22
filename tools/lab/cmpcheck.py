@@ -48,8 +48,9 @@ def main():
                 full, _ = an.analyze(text)
             except Exception:  # noqa: BLE001
                 continue
-            if an.cmp_flip is None:
+            if not an.cmp_flips:
                 continue
+            nflips, nfiles = len(an.cmp_flips), len({f[0] for f in an.cmp_flips})
             sel.CMP_PROFILE = True
             narrow, why = an.analyze(text)
             full &= valid
@@ -59,7 +60,8 @@ def main():
             ok = None if fail is None else all(narrow >> n & 1 for n in fail)
             if ok is False:
                 bad += 1
-            print(f"{os.path.basename(d.rstrip('/'))} {cid} {an.cmp_flip[3]}->{an.cmp_flip[4]} "
+            kind = "single" if text.count("diff --git") == 1 and nflips == 1 else f"multi({nflips} flips)"
+            print(f"{os.path.basename(d.rstrip('/'))} {cid} {kind} {an.cmp_flip[3]}->{an.cmp_flip[4]} "
                   f"cands {full.bit_count()} -> {narrow.bit_count()} fail {('?' if fail is None else len(fail))} "
                   f"{'OK' if ok else 'VIOLATION' if ok is False else 'no-truth'}"
                   f"{'' if covers in (None, True) else ' (truth cand set smaller than analyzer full)'}")
