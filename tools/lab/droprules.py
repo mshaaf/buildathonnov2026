@@ -32,7 +32,7 @@ def main():
         names = {t["number"]: t["id"].rsplit("::", 1)[-1] for t in tests}
         dur = E.setup_tests(tests)
         an = sel.Analyzer(E.M, sum(1 << n for n in dur), sum(1 << n for n in sel.NO_RUN))
-        for cid, (F, _, unreliable, tcand) in sorted(E.load_truth(L).items()):
+        for cid, (F, _, unreliable, tcand, skipped) in sorted(E.load_truth(L).items()):
             mask, _ = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             if not an.py_changes:
                 continue
@@ -43,7 +43,7 @@ def main():
             rest = [n for n in C if n not in heavy]
             rf = [n for n in rest if n in F]
             for g in heavy:
-                if dur[g] < E.SLOW or g in sel.NO_RUN:
+                if dur[g] < E.SLOW or g in sel.NO_RUN or g in skipped:  # skipped: outcome unknown
                     continue
                 gf, gc = sel.FILE_OF[g], sel.CLS_OF[g]
                 rel = [n for n in rest if sel.FILE_OF[n] == gf]
