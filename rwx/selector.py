@@ -1044,6 +1044,7 @@ CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==",
            ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
 _ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
 # family recorded for each original operator (tools/lab/cmprun.py), in vector order
+_ORD_RAISING = ("<", "<=", ">", ">=")  # raise together on unorderable operands
 CMP_FAMILIES = {"<": _ORD, "<=": _ORD, ">": _ORD, ">=": _ORD, "==": _IDE, "!=": _IDE,
                 "is": _IDE, "is not": _IDE, "in": _MEM, "not in": _MEM}
 
@@ -1058,6 +1059,10 @@ def _cmp_keep(cmap, rel, line, col, old_op, new_op):
         return None
     fam = CMP_FAMILIES.get(old_op)
     if fam is None or new_op not in fam:
+        return None
+    if old_op in _ORD_RAISING and new_op not in _ORD_RAISING:
+        # An evaluation where old_op raised (None < 1, caught by sqlglot or the test) left
+        # no record, but == / != would not raise there: the profile cannot see that test.
         return None
     i, j = fam.index(old_op), fam.index(new_op)
     keep = cmap.cmp_unprofiled
