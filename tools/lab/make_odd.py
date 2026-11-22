@@ -492,6 +492,39 @@ def _():
     W("tests/fixtures/optimizer/qualify_tables.sql", "\n".join(lines))
 
 
+# ------------------------------------------------------------------ coverage-gap and import-time cases
+@spec("la01", "one-line lambda in a class-body TRANSFORMS dict")
+def _():
+    R("sqlglot/generators/duckdb.py", 'exp.LogicalOr: lambda self, e: self.func("BOOL_OR", _cast_to_boolean(e.this)),',
+      'exp.LogicalOr: lambda self, e: self.func("BOOL_ORX", _cast_to_boolean(e.this)),')
+
+
+@spec("la02", "one-line lambda inside a function body")
+def _():
+    R("sqlglot/helper.py", "lambda obj: inspect.isclass(obj) and issubclass(obj, classes) and obj not in exclude,",
+      "lambda obj: inspect.isclass(obj) and issubclass(obj, classes) and obj in exclude,")
+
+
+@spec("py25", "module-level statement that raises at import")
+def _():
+    R("sqlglot/helper.py", 'CAMEL_CASE_PATTERN = re.compile("(?<!^)(?=[A-Z])")', 'CAMEL_CASE_PATTERN = re.compile("(?<!^)(?=[A-Z]")')
+
+
+@spec("py26", "class-body statement that raises at import")
+def _():
+    R("sqlglot/dialects/redshift.py", "    INDEX_OFFSET = 0\n", "    INDEX_OFFSET = UNDEFINED_ODD\n")
+
+
+@spec("py27", "default argument that raises at import")
+def _():
+    R("sqlglot/dialects/tableau.py", "class Tableau(", "def _odd(x=UNDEFINED_ODD):\n    return x\n\n\nclass Tableau(")
+
+
+@spec("py28", "module-level constant read by few tests that now raises")
+def _():
+    R("sqlglot/helper.py", "PYTHON_VERSION = sys.version_info[:2]\n", "PYTHON_VERSION = sys.version_info[:2][5]\n")
+
+
 def main():
     (OUT / "commits").mkdir(parents=True, exist_ok=True)
     kinds = {}

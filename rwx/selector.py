@@ -343,6 +343,9 @@ class Analyzer:
         loc = Locator(tree)
         mask = 0
         old_changed, added = changed_lines(hunks)
+        if len(old_changed) + len(added) > 3000:
+            why.append(f"{rel}: very large change -> importers")
+            return self.importers(rel)
         for ln in sorted(old_changed):
             site = loc.locate(ln)
             if site is None:
@@ -1169,6 +1172,15 @@ def batch_timeout(batch) -> float:
     return 10.0 + 4.0 * batch_cost(batch) / 1000
 
 
+def safe_pack(nums: list, dur: dict) -> list:
+    """pack(), or a plain round-robin split if packing fails (output must always be valid)."""
+    try:
+        return pack(nums, dur)
+    except Exception as e:  # noqa: BLE001
+        log(f"pack failed: {e!r}")
+        return [w for w in (nums[i::MAX_WORKERS] for i in range(MAX_WORKERS)) if w]
+
+
 def list_patches(d: Path) -> list:
     """Commit patch files: regular files named <id>.patch (anything else is not a commit)."""
     try:
@@ -1207,7 +1219,15 @@ def main() -> None:
     valid = 0
     for n in dur:
         valid |= 1 << n
-    cmap = Map(MAP)
+    try:
+        cmap = Map(MAP)
+    except Exception as e:  # no map: every commit selects every test, statically
+        log(f"map failed: {e!r}")
+        for patch in list_patches(DATA / "commits"):
+            cid = patch.name[: -len(".patch")]
+            out.write(json.dumps({"commit": cid, "workers": safe_pack(sorted(dur), dur)}, separators=(",", ":")) + "\n")
+        out.flush()
+        return
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
@@ -1218,7 +1238,13 @@ def main() -> None:
     file_tests: dict = {}
     for t in tests:
         file_tests[t["file"]] = file_tests.get(t["file"], 0) | 1 << t["number"]
-    an = Analyzer(cmap, valid, lazy, file_tests)
+    try:
+        an = Analyzer(cmap, valid, lazy, file_tests)
+    except Exception as e:  # e.g. an unreadable manifest: analyze without it
+        log(f"analyzer setup failed: {e!r}")
+        global ATTR_NARROW
+        ATTR_NARROW = False
+        an = Analyzer(cmap, valid, lazy, file_tests)
     patches = list_patches(DATA / "commits")
     jobs, final = [], {}
     for patch in patches:
@@ -1228,18 +1254,22 @@ def main() -> None:
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
-        mask &= valid
-        C = [n for n in dur if mask >> n & 1]
-        # No patched Python to verify, including analysis failures and unsupported diffs.
-        data_only = not py
-        log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
-        known = set()
-        for rel in data:
-            mid = cmap.opens.get(rel)
-            if mid is not None:
-                known |= {n for n in C if cmap.masks[mid] >> n & 1}
-        score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
-        jobs.append((cid, C, py, data, data_only, score, known, case_site))
+        try:
+            mask &= valid
+            C = [n for n in dur if mask >> n & 1]
+            # No patched Python to verify, including analysis failures and unsupported diffs.
+            data_only = not py
+            log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
+            known = set()
+            for rel in data:
+                mid = cmap.opens.get(rel)
+                if mid is not None:
+                    known |= {n for n in C if cmap.masks[mid] >> n & 1}
+            score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
+            jobs.append((cid, C, py, data, data_only, score, known, case_site))
+        except Exception as e:  # never crash: run everything for this commit
+            log(f"{cid}: job error {e!r} -> ALL")
+            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
@@ -1274,8 +1304,12 @@ def main() -> None:
         diag_mode = os.environ.get("RWX_DIAG_MODE", "")
         if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
             final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
-        nums = sorted(final_set)
-        workers = pack(nums, dur)
+        try:
+            nums = sorted(n for n in (set(C) if final_set is None else set(final_set)) if n in dur)
+        except Exception as e:  # malformed result: everything the analysis named
+            log(f"{cid}: bad result {e!r}")
+            nums = sorted(n for n in C if n in dur)
+        workers = safe_pack(nums, dur)
         cost = (max(sum(dur[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
         total += cost
         out.write(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")) + "\n")
