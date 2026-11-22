@@ -573,9 +573,11 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (09:45 EST):** the page marks **BB-1BF787EF, `f3c6e42` (C3, 116.1)** as
-"Entered in the final" (picked by hand; before that `343cf5a`, 113.3). Re-pick only a build
-that has scored on the board with 0 misses. Candidates are in the 09:45 update below.
+**FINAL ENTRY (09:55 EST):** the page marks BB-1BF787EF, `f3c6e42` (C3, 116.1) as "Entered in
+the final". **Recommended re-pick: BB-4199A4AB, `8192e1c2bae666200e1a273ecf15cb282e422415`
+(C7, branch `opt-c7`, 111.5, 0 misses)**: all review fixes, fast settings on the edit kinds
+seen in practice, strict settings on every other kind. Details in the 09:55 update below.
+Re-pick only a build that has scored on the board with 0 misses.
 
 ### What the gate is
 
@@ -735,3 +737,23 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
   off the output equals C6. Expected on practice: about 111.7 if every practice commit is a
   one-token kind.
 - If C7 does not hold up, C6 is the fallback for the 10:25 slot (expected 116.1, like C3).
+
+### Update 09:55 EST
+
+- Board: **C7 `8192e1c` scored 111.5** = 101.94 simulated + 9.2 to 9.6 CPU, 0 misses. Every
+  practice commit is a one-token kind (CPU = the 7.2 s base + about 2.3 s for the 500 ms gate).
+- C7 lab, real selector: on s1, s2, s3, multi, multix, cmpx, boolx every commit classifies as
+  one-token, so the output equals the small-probe run of the same code (24 misses over 483
+  commits; 14 with 1000/2000 ms probes on everything: that difference is the trade C7 makes
+  on familiar kinds, where practice + samples show 0 misses in 70). On `odd`, 34 of 81
+  patches are unfamiliar and get the strict settings; on 5 of them (fm05, fm09, py01, py13,
+  py19) the large-probe build C6 printed nothing while C7 saw failures and printed 600 to
+  1,100 tests.
+- C8 `c9f0970` (branch `opt-c8`, pushed): C7 + the gate's guard (4 other executor tests
+  failing) kept on unfamiliar kinds. Output identical to C7 on the samples, all seven corpora
+  and `odd`. Goes into the 10:25 slot; expected 111.5.
+- An agent is reviewing and edge-testing the per-kind code (classifier inputs, threading of
+  the strict flag, tokenizing cost) before the final pick.
+- Fallbacks, all scored with 0 misses: C3 `f3c6e42` 116.1 (large probes everywhere, no review
+  fixes), `343cf5a` 113.3 (gate only). C6 `185b7c7` (C3 + all review fixes) is validated
+  locally but not scored.
