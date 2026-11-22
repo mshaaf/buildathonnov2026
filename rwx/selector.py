@@ -32,6 +32,7 @@ from patchlib import (  # noqa: E402
     known_lookups,
     locate_hunks,
     parse_patch,
+    same_outside_lambdas,
     stmt_inert,
     stmt_safe,
 )
@@ -428,8 +429,10 @@ class Analyzer:
             known = known_lookups(tree, o_lo, _scope_nodes(tree, site))
             rem_new = [b for b in new_stmts if not any(same_syntax(a, b) for a in old_stmts)]
             rem_old = [a for a in old_stmts if not any(same_syntax(a, b) for b in new_stmts)]
+            changed = set(range(o_lo, o_hi + 1))
             if len(rem_old) == len(rem_new):
-                safe = all(stmt_safe(a, b, fut, known) for a, b in zip(rem_old, rem_new))
+                safe = all(same_outside_lambdas(a, b, changed) or stmt_safe(a, b, fut, known)
+                           for a, b in zip(rem_old, rem_new))
             else:
                 safe = all(stmt_inert(b, fut, known) for b in rem_new)
             if not safe:

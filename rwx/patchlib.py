@@ -705,3 +705,18 @@ def known_lookups(tree, line: int, scope_chain) -> frozenset:
                     add(dotted(sub))
                 stack.extend(ast.iter_child_nodes(sub))
     return frozenset(known)
+
+
+def same_outside_lambdas(a, b, changed: set) -> bool:
+    """a and b differ only inside bodies of lambdas whose first line is not in `changed`.
+    Such a body runs only when the lambda is called, and every run of a changed line that
+    is not a code object's first line is recorded by coverage (even calls made at import)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.Lambda):
+        return _same_syntax(a.args, b.args) and (a.lineno not in changed or _same_syntax(a.body, b.body))
+    if isinstance(a, ast.AST):
+        return all(same_outside_lambdas(getattr(a, f), getattr(b, f), changed) for f in a._fields)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_outside_lambdas(x, y, changed) for x, y in zip(a, b))
+    return a == b
