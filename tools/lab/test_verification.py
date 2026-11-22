@@ -45,6 +45,7 @@ class FakeMap:
             self.masks.append(m)
         self.class_desc, self.class_users, self.name_refs, self.attr_refs, self.lines = {}, {}, {}, {}, {}
         self.arg_missing, self.class_by_code = {}, {}
+        self.cmp_sites, self.cmp_unprofiled = {}, -1
 
     def file_mask(self, f):
         return self.importers.get(f, 0)
@@ -538,6 +539,29 @@ class RobustnessTests(unittest.TestCase):
                 self.assertEqual(analyzer.analyze(new.format("fresh"))[0], 0b1)
                 self.assertEqual(analyzer.analyze(new.format("duck"))[0], 0xFF)  # named in a test string
             selector._WORDS.clear()
+
+    def test_comparison_value_profiles(self):
+        old = "def f(a, b):\n    if a < b:\n        return 1\n    return a is b\n"
+        fmap = FakeMap({"sqlglot/m.py": 0xF0})
+        fmap.lines = {"sqlglot/m.py": {"1:f": {2: 0b1111, 3: 0b11, 4: 0b1111}}}
+        # tests 0,1 saw a < b; test 2 saw a == b; test 3 unprofiled
+        fmap.cmp_sites = {"sqlglot/m.py": {(2, 7): ("<", {"TTFFFT": 0, "FTFTTF": 1}),
+                                           (4, 11): ("is", {"FTTF": 2, "TFTF": 3})}}
+        fmap.masks = [0b011, 0b100, 0b001, 0b110]
+        fmap.cmp_unprofiled = 0b1000
+        with patch.object(selector, "CMP_PROFILE", True):
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b"))
+            self.assertEqual(mask, 0b1100, why)  # only the equal-operands test (+unprofiled)
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a > b"))
+            self.assertEqual(mask, 0b1011, why)  # < and > agree (both false) only on equal operands
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a is b", "a == b"))
+            self.assertEqual(mask, 0b1001, why)  # is/== disagreed only for test 0
+            # anything besides the one operator: no narrowing
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b").replace("return 1", "return 2"))
+            self.assertEqual(mask & 0b1111, 0b1111, why)
+        with patch.object(selector, "CMP_PROFILE", False):
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b"))
+            self.assertEqual(mask, 0b1111, why)
 
     def test_headers_without_prefixes(self):
         from patchlib import parse_patch

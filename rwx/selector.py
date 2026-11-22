@@ -67,6 +67,8 @@ class Map:
         self.class_desc: dict = d.get("class_desc", {})
         self.name_refs: dict = d.get("name_refs", {})
         self.attr_refs: dict = d.get("attr_refs", {})
+        self.cmp_sites: dict = d.get("cmp_sites", {})  # file -> {(line, col): (op, {vector: mask_id})}
+        self.cmp_unprofiled: int = d["masks"][d["cmp_unprofiled"]] if "cmp_unprofiled" in d else -1
         # (file, code_key) of a class body -> class key
         self.class_by_code: dict = {}
         for k in self.class_desc:
@@ -385,6 +387,9 @@ class Analyzer:
         if same_syntax(tree, new_tree):
             why.append(f"{rel}: AST unchanged")
             return 0
+        flip = compare_flip(tree, new_tree)
+        if flip is not None:
+            self.cmp_flip = (rel,) + flip
         self.py_changes[rel] = (old, new)
         loc = Locator(tree)
         mask = 0
@@ -686,6 +691,7 @@ class Analyzer:
         self.case_site = None
         self.unverifiable = False
         self.deferred = 0  # importers needed unless the engine proves the patched modules import
+        self.cmp_flip = None  # (rel, line, col, old op, new op) of a pure comparison-operator edit
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
         for fp in files:
@@ -723,7 +729,29 @@ class Analyzer:
         if not self.py_changes:
             mask |= self.deferred  # no session will import anything
             self.deferred = 0
+        if self.cmp_flip is not None and len(files) == 1 and CMP_PROFILE and not BROAD:
+            mask = self.compare_narrow(mask, why)
         return mask, why
+
+    def compare_narrow(self, mask: int, why: list) -> int:
+        """The whole patch flips one comparison operator. A test can only behave differently
+        if it evaluated that site on operands where the old and new operator disagree: keep
+        the candidates whose pinned value profile shows such an evaluation (plus unprofiled)."""
+        rel, line, col, old_op, new_op = self.cmp_flip
+        entry = self.map.cmp_sites.get(rel, {}).get((line, col))
+        if entry is None or entry[0] != old_op or self.map.cmp_unprofiled < 0:
+            return mask
+        fam = CMP_FAMILIES.get(old_op)
+        if fam is None or new_op not in fam:
+            return mask
+        i, j = fam.index(old_op), fam.index(new_op)
+        keep = self.map.cmp_unprofiled
+        for vec, mid in entry[1].items():
+            if vec == "X" or len(vec) != len(fam) or vec[i] != vec[j] or "E" in (vec[i], vec[j]) or "X" in (vec[i], vec[j]):
+                keep |= self.map.masks[mid]
+        narrowed = mask & keep
+        why.append(f"compare {old_op} -> {new_op} at {line}:{col}: {mask.bit_count()} -> {narrowed.bit_count()}")
+        return narrowed
 
     def merge_repeats(self, files, why):
         """The same file patched by several entries: apply them in order, re-diff once."""
@@ -771,6 +799,39 @@ def _undecodable(text: str) -> bool:
 def _import_time(site) -> bool:
     return (site is not None and site.stmt is not None and site.kind in ("import", "header")
             and isinstance(site.scope_node, (ast.Module, ast.ClassDef)))
+
+
+CMP_PROFILE = os.environ.get("RWX_CMP_PROFILE", "1") == "1"
+CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
+           ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
+_ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
+# family recorded for each original operator (tools/lab/cmprun.py), in vector order
+CMP_FAMILIES = {"<": _ORD, "<=": _ORD, ">": _ORD, ">=": _ORD, "==": _IDE, "!=": _IDE,
+                "is": _IDE, "is not": _IDE, "in": _MEM, "not in": _MEM}
+
+
+def compare_flip(old_tree, new_tree):
+    """(line, col, old op, new op) when the trees differ in exactly one operator of a
+    single-operator comparison and nowhere else; None otherwise."""
+    found = []
+
+    def walk(a, b):
+        if type(a) is not type(b):
+            return False
+        if isinstance(a, ast.Compare) and len(a.ops) == 1 and len(b.ops) == 1 and type(a.ops[0]) is not type(b.ops[0]):
+            if not (walk(a.left, b.left) and walk(a.comparators, b.comparators)):
+                return False
+            if type(a.ops[0]) not in CMP_OPS or type(b.ops[0]) not in CMP_OPS:
+                return False
+            found.append((a.lineno, a.col_offset, CMP_OPS[type(a.ops[0])], CMP_OPS[type(b.ops[0])]))
+            return len(found) == 1
+        if isinstance(a, ast.AST):
+            return all(walk(getattr(a, f), getattr(b, f)) for f in a._fields)
+        if isinstance(a, list):
+            return len(a) == len(b) and all(walk(x, y) for x, y in zip(a, b))
+        return a == b
+
+    return found[0] if walk(old_tree, new_tree) and len(found) == 1 else None
 
 
 def _value_type(v):
