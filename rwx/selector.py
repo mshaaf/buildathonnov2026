@@ -1380,6 +1380,13 @@ def _live_evidence(C, rest, heavy, passed, failed):
 
 
 HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
+# Progress watchdog: a batch is hung when no result line arrived for max(WATCH_MIN_S,
+# WATCH_FACTOR x (estimate of the test running now + its class setup)); a fresh child
+# first gets WATCH_STARTUP_S for patching and its import check. Only the running test
+# counts as failing; the batch's later tests continue in a fresh session of the same
+# commit, at most WATCH_RESTARTS times per commit (never for a child silent from start).
+WATCH_FACTOR = 8.0
+WATCH_RESTARTS = 2
 
 
 class Scheduler:
@@ -1388,11 +1395,55 @@ class Scheduler:
         self.lanes = lanes
         self.deadline = deadline
 
+    def _windows(self, nums):
+        """Per-test watchdog windows, or None (plain batch timeout) for engines without
+        run_order (test doubles)."""
+        from engine import WATCH_MIN_S
+
+        run_order = getattr(self.engine, "run_order", None)
+        if run_order is None:
+            return None
+        # Class setup counts for every test of the class: a deferred setup (TestExecutor
+        # in re-import sessions) runs inside whichever test first reads its data.
+        return {n: max(WATCH_MIN_S, WATCH_FACTOR * (CPU_EST.get(n, DUR.get(n, 0))
+                                                   + WATCH_SETUP.get(CLS_OF.get(n), 0)) / 1000)
+                for n in run_order(nums)}
+
+    def _submit(self, a, nums, stop_first):
+        """Send a policy batch to the commit's session under the progress watchdog."""
+        a[6]["stop_first"] = stop_first
+        a[6]["carry"] = {}
+        a[4] = nums
+        self._send(a[3], nums, stop_first)
+
+    def _send(self, sess, nums, stop_first):
+        windows = self._windows(nums)
+        if windows is None:
+            sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first)
+        else:
+            sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first, windows=windows)
+
+    def _restart(self, a) -> bool:
+        """Replace a hung (killed) session by a fresh one of the same commit, if allowed."""
+        ctx = a[6]
+        if not ctx.get("hung") or ctx["restarts"] >= WATCH_RESTARTS or time.monotonic() > self.deadline:
+            return False
+        try:
+            sess = self.engine.session(ctx["py"], ctx["data"], ctx["site"])
+        except Exception as e:  # noqa: BLE001
+            log(f"{a[0]}: restart failed {e!r}"[:300])
+            return False
+        ctx["restarts"] += 1
+        ctx["hung"] = False
+        a[3] = sess
+        return True
+
     def _abandon(self, a):
         """Kill an active commit's session; its final set treats the in-flight batch as
         unproven (reported passes still count)."""
-        cid, C, gen, sess, batch, selected = a
-        partial = {n: st for n, st in getattr(sess, "results", {}).items() if st == "P"}
+        cid, C, gen, sess, batch, selected = a[:6]
+        carry = a[6].get("carry", {}) if len(a) > 6 else {}
+        partial = {n: st for n, st in {**carry, **getattr(sess, "results", {})}.items() if st == "P"}
         try:
             sess.kill()
             sess.close()
@@ -1426,13 +1477,15 @@ class Scheduler:
                     continue
                 try:
                     sess = self.engine.session(py, data, case_site)
-                    sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
+                    a = [cid, C, gen, sess, batch, None,
+                         {"py": py, "data": data, "site": case_site, "restarts": 0, "hung": False}]
+                    self._submit(a, batch, stop_first)
                 except Exception as e:  # one commit's trouble must not stop the others
                     log(f"{cid}: session failed {e!r}"[:300])
                     gen.close()
                     yield cid, set(C), "session failed"
                     continue
-                active.append([cid, C, gen, sess, batch, None])
+                active.append(a)
             if not active:
                 continue
             hard = self.deadline + HARD_GRACE_S
@@ -1446,28 +1499,53 @@ class Scheduler:
             ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
             for a in list(active):
                 try:
-                    cid, C, gen, sess, batch, selected = a
+                    cid, C, gen, sess, batch, selected = a[:6]
+                    ctx = a[6]
                     finished = False
+                    hung_res = None
                     if sess in ready:
                         finished = sess.read()
                     import_ok = getattr(sess, "import_ok", None)
                     if import_ok is not None and cid not in IMPORT_OK:
                         IMPORT_OK[cid] = import_ok
                     if not finished and sess.expired():
-                        log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
-                        sess.kill()
+                        hung = sess.next_unreported() if getattr(sess, "windows", None) is not None else None
+                        if hung is None:
+                            log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
+                            sess.kill()
+                        else:
+                            # The test running now is hung: it fails, reported results stand.
+                            hung_res = {**ctx["carry"], **sess.results, hung: "F"}
+                            progressed = sess.progressed
+                            rest = [] if ctx["stop_first"] else [n for n in sess.order if n not in hung_res]
+                            sess.kill()
+                            sess.close()
+                            ctx["hung"] = progressed  # a child silent from the start would hang again
+                            log(f"{cid}: test {hung} hung after {len(hung_res) - 1} results, {len(rest)} left in the batch")
+                            if rest:
+                                if self._restart(a):
+                                    self._send(a[3], rest, False)
+                                    ctx["carry"] = hung_res
+                                    a[4] = rest
+                                    continue
+                                # no restart left: the rest of the batch stays unproven
+                                final = _drain(gen, hung_res)
+                                active.remove(a)
+                                yield cid, final if final is not None else set(C), "hung: rest of the batch unproven"
+                                continue
                         finished = True
                     if not finished:
                         continue
-                    if not sess.alive and sess.crash is None and len(sess.results) < len(batch) and not sess.expired():
-                        pass
-                    res = dict(sess.results)
+                    if hung_res is not None:
+                        res = hung_res
+                    else:
+                        res = {**ctx["carry"], **sess.results}
+                        if not sess.alive:
+                            # crashed or killed: whatever did not report counts as failing
+                            for n in batch:
+                                res.setdefault(n, "F")
                     if any(st == "F" for st in res.values()):
                         LIVE.add(cid)
-                    if not sess.alive:
-                        # crashed or killed: whatever did not report counts as failing
-                        for n in batch:
-                            res.setdefault(n, "F")
                     executor = self.engine.executor_test
                     if selected is not None:
                         kind, selected = selected
@@ -1487,6 +1565,14 @@ class Scheduler:
                         continue
                     try:
                         nxt, stop_first = gen.send(res)
+                        if not sess.alive and self._restart(a):
+                            sess = a[3]
+                        if not sess.alive and hung_res is not None:
+                            # hung, no restart left: the requested batch stays unproven
+                            final = _drain(gen)
+                            active.remove(a)
+                            yield cid, final if final is not None else set(C), "hung: no restart left"
+                            continue
                         if time.monotonic() > self.deadline or not sess.alive:
                             raise GeneratorExit
                         if time.monotonic() + batch_cost(nxt) / 1000 > self.deadline:
@@ -1496,22 +1582,23 @@ class Scheduler:
                             active.remove(a)
                             yield cid, final if final is not None else set(C), "cut: no time for the next batch"
                             continue
-                        sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
-                        a[4] = nxt
+                        self._submit(a, nxt, stop_first)
                     except StopIteration as e:
                         if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
                                 sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
-                                a[4:] = [[executor], ("verify", e.value)]
+                                ctx["carry"] = {}
+                                a[4], a[5] = [executor], ("verify", e.value)
                                 continue
                         if (executor is not None and executor in C and executor not in e.value
                                 and sess.executor_ms is not None and sess.alive and executor not in res
                                 and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
-                            a[4:] = [[executor], ("gate", e.value)]
+                            ctx["carry"] = {}
+                            a[4], a[5] = [executor], ("gate", e.value)
                             continue
                         sess.close()
                         active.remove(a)
@@ -1555,6 +1642,7 @@ LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
+WATCH_SETUP: dict = {}  # the map's class setup CPU, also where shared/deferred setup can land
 
 
 def class_masks(tests) -> dict:
@@ -1669,6 +1757,7 @@ def main() -> None:
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
+    WATCH_SETUP.update(cmap.cls_setup_ms)
     lazy = 0
     for t in tests:
         if t["id"] in NO_RUN_IDS:

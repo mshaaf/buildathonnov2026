@@ -34,6 +34,8 @@ from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
+WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
+WATCH_STARTUP_S = 10.0  # ... and for the child's first line (patching, re-import, import check)
 
 
 class InlinePool:
@@ -596,6 +598,15 @@ class Engine:
         builtins.open = patched_open
         io.open = patched_open
 
+    def run_order(self, numbers) -> list:
+        """The order in which _run_tests runs (and reports) these tests: grouped by class,
+        classes in order of first appearance."""
+        by_class: dict = {}
+        for n in numbers:
+            path, cls, _ = self.tests[n]["id"].split("::")
+            by_class.setdefault((path, cls), []).append(n)
+        return [n for group in by_class.values() for n in group]
+
     def _run_tests(self, numbers, wfd, stop_first=False):
         by_class: dict = {}
         ids = {}
@@ -719,6 +730,11 @@ class Session:
                 os._exit(code)
         os.close(cmd_r)
         os.close(res_w)
+        self.engine = engine
+        self.order: list = []  # current batch in engine order (progress watchdog only)
+        self.windows: dict | None = None  # test -> seconds it may run without a result line
+        self.mark = 0.0  # last progress: batch submitted or a line arrived
+        self.progressed = False  # any line ever arrived from this child (the first is "M")
         self.pid = pid
         self.cmd = cmd_w
         self.res = res_r
@@ -727,7 +743,7 @@ class Session:
         self.pending: list = []
         self.results: dict = {}
         self.cpu: dict = {}
-        self.deadline = None
+        self._deadline = None
         self.crash = None
         self.import_ok = None  # set by the child's "M" line: changed modules imported cleanly
         self.total_cpu = 0.0
@@ -736,10 +752,16 @@ class Session:
     def fileno(self):
         return self.res
 
-    def submit(self, numbers, timeout: float, stop_first: bool = False, executor_only: bool = False):
+    def submit(self, numbers, timeout: float, stop_first: bool = False, executor_only: bool = False,
+               windows: dict | None = None):
+        """windows: per-test seconds without a result line before the batch counts as hung
+        (progress watchdog, replaces `timeout`); results arrive in run_order()."""
         self.pending = list(numbers)
         self.results = {}
-        self.deadline = time.monotonic() + timeout
+        self.mark = time.monotonic()
+        self._deadline = self.mark + timeout
+        self.windows = windows
+        self.order = self.engine.run_order(numbers) if windows is not None else []
         if not self.alive:
             return
         try:
@@ -759,6 +781,9 @@ class Session:
             return True
         self.buf += chunk
         *lines, self.buf = self.buf.split(b"\n")
+        if lines:
+            self.mark = time.monotonic()
+            self.progressed = True
         done = False
         for line in lines:
             parts = line.decode(errors="replace").split(" ")
@@ -775,8 +800,25 @@ class Session:
                     self.cpu[n] = float(parts[2])
         return done
 
+    @property
+    def deadline(self):
+        if self.windows is None or self._deadline is None:
+            return self._deadline
+        if not self.progressed:
+            return self.mark + WATCH_STARTUP_S
+        nxt = self.next_unreported()
+        return self.mark + (self.windows.get(nxt, WATCH_MIN_S) if nxt is not None else WATCH_MIN_S)
+
+    def next_unreported(self):
+        """The test the child is running now (first unreported in run order), or None."""
+        for n in self.order:
+            if n not in self.results:
+                return n
+        return None
+
     def expired(self) -> bool:
-        return self.deadline is not None and time.monotonic() > self.deadline
+        d = self.deadline
+        return d is not None and time.monotonic() > d
 
     def kill(self):
         if self.alive:

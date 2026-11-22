@@ -89,6 +89,65 @@ class SharedSetup(unittest.TestCase):
         pass
 
 
+class Hangs(unittest.TestCase):  # probe_* methods: not collected by unittest.main()
+    def probe_pass(self):
+        pass
+
+    def probe_hang(self):
+        while True:
+            pass
+
+    def probe_pass2(self):
+        pass
+
+    def probe_fail(self):
+        self.fail("x")
+
+
+def _hang_engine():
+    """A real Engine (no warm-up) whose tests are the Hangs methods, run in forked sessions."""
+    engine = Engine.__new__(Engine)
+    engine.root = "/nonexistent-rwx-root"
+    engine.tests = {i: {"id": f"{__name__}.py::Hangs::{m}"}
+                    for i, m in enumerate(("probe_pass", "probe_hang", "probe_pass2", "probe_fail"))}
+    engine.executor_profile = {}
+    engine.executor_test = None
+    engine.presetup_done = set()
+    engine.warm_keys = set()
+    engine.funcs = {}
+    return engine
+
+
+class WatchdogTests(unittest.TestCase):
+    def _run(self, stop_first):
+        import engine as engine_module
+
+        seen = []
+
+        def fake_policy(C, dur, data_only, focus=None, known=None):
+            res = yield [0, 1, 2, 3], stop_first
+            seen.append(dict(res))
+            return {n for n, st in res.items() if st == "F"} | (set(C) - set(res))
+
+        nums = [0, 1, 2, 3]
+        with patch.object(engine_module, "WATCH_MIN_S", 0.5), patch.object(selector, "policy", fake_policy), \
+                patch.multiple(selector, DUR={n: 1 for n in nums}, CPU_EST={n: 1 for n in nums},
+                               CLS_OF={n: "Hangs" for n in nums}, CLS_SETUP={}):
+            sched = selector.Scheduler(_hang_engine(), lanes=1, deadline=selector.time.monotonic() + 60)
+            out = list(sched.run([("c", nums, {}, {}, False, {}, set(), None)]))
+        return seen, out
+
+    def test_hung_test_fails_alone_and_the_batch_continues(self):
+        seen, out = self._run(stop_first=False)
+        self.assertEqual(seen, [{0: "P", 1: "F", 2: "P", 3: "F"}])
+        self.assertEqual(out[0][1], {1, 3})
+
+    def test_hung_test_ends_a_stop_first_batch(self):
+        seen, out = self._run(stop_first=True)
+        self.assertEqual(seen, [{0: "P", 1: "F"}])
+        self.assertEqual(out[0][1], {1, 2, 3})
+
+
 class VerificationTests(unittest.TestCase):
     def test_session_fixture_is_set_up_once_per_session(self):
         import engine as engine_module
