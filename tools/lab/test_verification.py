@@ -360,7 +360,7 @@ class VerificationTests(unittest.TestCase):
         for mult, first, ask, answer, expected in [(1.0,) + c[1:] for c in cases] + [(0, {1: "P", 0: "F"}, None, None, {0, 2, 3})]:
             with self.subTest(mult=mult, first=first), patch.multiple(
                     selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF=classes, FILE_OF=classes,
-                    SETTLE_RATIO=0.5, SETTLE_FAIL_MULT=mult):
+                    SETTLE_RATIO=0.5, SETTLE_FAIL_MULT=mult, LIVE_FINISH=False):
                 gen = selector.policy([0, 1, 2, 3], durations, False)
                 self.assertEqual(next(gen), ([0, 1, 2], True))
                 with self.assertRaises(StopIteration) as done:
@@ -416,7 +416,7 @@ class VerificationTests(unittest.TestCase):
             def __init__(self):
                 self.sessions = []
 
-            def session(self, py, data, case_site):
+            def session(self, py, data, case_site, fixture=None):
                 self.sessions.append(StuckSession())
                 return self.sessions[-1]
 

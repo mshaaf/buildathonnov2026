@@ -323,6 +323,7 @@ class Engine:
             self.log(f"executor profile unusable: {e!r}")
             self.executor_profile = {}
         self.warm_codes: set = set()
+        self.presetup_keys: set = set()  # code keys a cached setUpClass would have run
         self.presetup_done: set = set()
         install_inline_pool()
         if self.root not in sys.path:
@@ -369,7 +370,7 @@ class Engine:
             mon.set_events(tool, 0)
             mon.register_callback(tool, mon.events.PY_START, None)
             mon.free_tool_id(tool)
-        self.warm_keys = {(c.co_filename, c.co_firstlineno, c.co_qualname) for c in seen}
+        self.warm_keys = {(c.co_filename, c.co_firstlineno, c.co_qualname) for c in seen} | self.presetup_keys
 
     def _presetup(self, ref: str):
         """Run a test class's setUpClass once here, so forked children share its data.
@@ -382,17 +383,30 @@ class Engine:
         if getattr(klass, "__unittest_skip__", False):
             return
         real = getattr(mod, "duckdb", None)
-        if real is not None:
-            mod.duckdb = _LazyDuckModule(real)
-        try:
-            klass.setUpClass()
-        finally:
+        keys = None
+        if os.environ.get("RWX_PRESETUP_CACHE") == "1" and real is not None:
+            try:
+                from presetup_cache import REF, load
+
+                if ref == REF:
+                    keys = load(self.root, klass, real)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"presetup cache unusable: {e!r}")
+                keys = None
+        if keys is not None:
+            self.presetup_keys |= keys
+        else:
             if real is not None:
-                mod.duckdb = real
+                mod.duckdb = _LazyDuckModule(real)
+            try:
+                klass.setUpClass()
+            finally:
+                if real is not None:
+                    mod.duckdb = real
         klass.setUpClass = classmethod(lambda cls: None)
         klass.tearDownClass = classmethod(lambda cls: None)
         self.presetup_done.add(ref)
-        self.log(f"presetup done: {ref}")
+        self.log(f"presetup done: {ref}{' (cached)' if keys is not None else ''}")
 
     def _index_functions(self):
         root = self.root + "/"
@@ -498,11 +512,11 @@ class Engine:
             results.setdefault(n, "F")
         return results, {"mode": mode, "why": swaps if mode == "reimport" else len(swaps), "timeout": timed_out, "crash": crash}
 
-    def session(self, py_changes: dict, data_changes: dict, case_site=None):
-        return Session(self, py_changes, data_changes, case_site)
+    def session(self, py_changes: dict, data_changes: dict, case_site=None, fixture=None):
+        return Session(self, py_changes, data_changes, case_site, fixture)
 
-    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices):
-        self._apply(mode, swaps, py_changes, data_changes)
+    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices, fixture=None):
+        self._apply(mode, swaps, py_changes, data_changes, fixture)
         self._check_imports(mode, py_changes, wfd)
         rbuf = b""
         while True:
@@ -552,12 +566,17 @@ class Engine:
         self._apply(mode, swaps, py_changes, data_changes)
         self._run_tests(numbers, wfd)
 
-    def _apply(self, mode, swaps, py_changes, data_changes):
+    def _apply(self, mode, swaps, py_changes, data_changes, fixture=None):
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
         sys.stdout = sys.stderr = open(os.devnull, "w")
         sources = {f"{self.root}/{rel}": new for rel, (old, new) in py_changes.items()}
+        if sources and os.environ.get("RWX_LAZY_RUN") == "1":
+            # `python -c` children (test_lazy_load) see the patched tree too
+            import srchook
+
+            srchook.wrap_subprocess(sources, self.root, os.path.dirname(os.path.abspath(__file__)))
         if mode == "reimport":
             for name in list(sys.modules):
                 if name.split(".")[0] in PKG_PREFIXES:
@@ -584,7 +603,13 @@ class Engine:
         _case._common_shorten_repr = lambda *args: ("?",) * len(args)
         _case.pprint = types.SimpleNamespace(pformat=lambda *a, **k: "")
         if data_changes:
+            if fixture:
+                import fixture_run
+
+                before = fixture_run.load(fixture)
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
+            if fixture:
+                fixture_run.install(before, fixture_run.load(fixture))
         elif (
             py_changes
             and all(rel.startswith("sqlglot/") for rel in py_changes)
@@ -697,7 +722,7 @@ class _LazyDuckModule:
 class Session:
     """One forked child holding one commit's patched tree; runs test batches on request."""
 
-    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None):
+    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None, fixture=None):
         self.mode, swaps = engine.plan(py_changes)
         self.info = swaps if self.mode == "reimport" else len(swaps)
         executor_indices = None
@@ -737,7 +762,7 @@ class Session:
             os.close(res_r)
             code = 0
             try:
-                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w, executor_indices)
+                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w, executor_indices, fixture)
             except BaseException as e:  # noqa: BLE001
                 try:
                     os.write(res_w, f"X {e!r}\n".encode())

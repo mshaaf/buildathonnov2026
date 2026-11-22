@@ -58,6 +58,7 @@ class Map:
         self.arg_missing: dict = d.get("arg_missing", {})
         self.fixture_attrs: dict = d.get("fixture_attrs", {})
         self.attr_reads: dict = d.get("attr_reads", {})
+        self.line_loaded = d.get("line_loaded")  # None: unknown, title rule off
         self.expected_codes: dict = d.get("expected_codes", {})
         self.cpu_ms: dict = d.get("cpu_ms", {})
         self.cls_setup_ms: dict = d.get("cls_setup_ms", {})
@@ -383,6 +384,11 @@ class Analyzer:
         if len(old_pairs) == len(new_pairs):
             sql_changed = any(o[:2] != n[:2] for o, n in zip(old_pairs, new_pairs))
             exp_changed = any(o[2] != n[2] for o, n in zip(old_pairs, new_pairs))
+            self.fixture_runs[rel] = {
+                "attrs": [(class_id, attr) for class_id, attr in fa],
+                "edited": [i for i, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o != n],
+                "count": len(new_pairs),
+            }
         else:
             sql_changed = exp_changed = True
         for class_id, attr in fa:
@@ -813,6 +819,7 @@ class Analyzer:
         self.cmp_flip = None  # (rel, line, col, old op, new op) of a pure comparison-operator edit
         files = self.merge_repeats(parse_patch(text), why)
         self.data_masks: dict = {}
+        self.fixture_runs: dict = {}  # setup-loaded fixture rel -> [class attr] when pairs line up
         for fp in files:
             if not fp.path and (fp.hunks or fp.binary):
                 return self.all, ["patch entry without a path -> ALL"]
@@ -830,6 +837,19 @@ class Analyzer:
                 if old is None:
                     raise ValueError(f"missing base fixture: {rel}")
                 new_text = apply_hunks(old, locate_hunks(old, fp.hunks))
+                if (FIXTURE_COMMENTS and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
+                        and _filter_comments(old) == _filter_comments(new_text)):
+                    # .sql fixtures are only read through tests/helpers, which drop empty
+                    # lines and "--" comments first: nothing a test sees has changed.
+                    why.append(f"{rel}: only comments/blank lines changed -> nothing")
+                    continue
+                if (FIXTURE_COMMENTS and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
+                        and self.map.line_loaded is not None and rel not in self.map.line_loaded):
+                    # Pair-loaded fixtures: '# title:' only names a subtest.
+                    po, pn = _load_pairs(old), _load_pairs(new_text)
+                    if po is not None and pn is not None and _strip_titles(po) == _strip_titles(pn):
+                        why.append(f"{rel}: only fixture titles changed -> nothing")
+                        continue
                 self.data_changes[rel] = new_text
                 m = self.map.opens.get(rel)
                 fm = self.map.masks[m] if m is not None else 0
@@ -1093,6 +1113,15 @@ def flipped_bool(stmt, before, after):
     return None
 
 
+def _filter_comments(s):
+    """tests/helpers._filter_comments, the first step of both fixture loaders."""
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _strip_titles(pairs):
+    return [(tuple(kv for kv in meta if kv[0] != "title"), sql, exp) for meta, sql, exp in pairs]
+
+
 def _load_pairs(text):
     """tests/helpers.load_sql_fixture_pairs on a string: [(meta, sql, expected)], or None
     if the real loader would raise."""
@@ -1190,9 +1219,16 @@ ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 REF_LINES = os.environ.get("RWX_REF_LINES", "0") == "1"
 DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "1") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
+# Fixture-only commits editing a setup-loaded fixture (tpc-h.sql, tpc-ds.sql): run the
+# loading class's tests on the edited queries instead of printing them unrun.
+FIXTURE_RUN = os.environ.get("RWX_FIXTURE_RUN", "0") == "1"
+FIXTURE_COMMENTS = os.environ.get("RWX_FIXTURE_COMMENTS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
-BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after two passing probes
+BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"
+BET_FINISH_FRAC = float(os.environ.get("RWX_BET_FINISH_FRAC", "1.0"))  # bet: finish verifying only when this cheap
+LIVE_FINISH = os.environ.get("RWX_LIVE_FINISH", "1") == "1"  # sound: finish verifying live commits when cheaper
+BET_LIVE = os.environ.get("RWX_BET_LIVE") == "1"  # experiment: drop unverified candidates on live commits  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
 
 
@@ -1263,7 +1299,14 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
         # test file showed all of its runnable candidates passing.
         allpass = {n for n, st in (seen | settled).items() if st == "P"}
         rest = [n for n in C if not is_heavy(n)]
+        new_fail_files = {FILE_OF.get(n) for n, st in settled.items() if st != "P"}
         for g in left_out:
+            if NARROW_ON or BET_CLEAN:
+                # a bet left g out on its own rule (no failure in g's file): only a new
+                # failure in g's own file overturns that
+                if FILE_OF.get(g) in new_fail_files:
+                    final.add(g)
+                continue
             rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
             if not rel or not all(n in allpass for n in rel):
                 final.add(g)
@@ -1420,15 +1463,26 @@ def _policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None,
     return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}))
 
 
+def fixture_policy(C: list[int], runnable: list[int]):
+    """Fixture-only commit: run the loading class's tests on the edited queries; the
+    other readers stay in unrun. A test that does not report a pass stays in."""
+    res = yield sorted(runnable), False
+    return {n for n in C if n not in runnable or res.get(n) != "P"}
+
+
 FILE_OF: dict = {}
 NO_RUN: set = set()  # tests that start a fresh interpreter: the engine cannot patch it
 NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
+LAZY_RUN = os.environ.get("RWX_LAZY_RUN") == "1"  # run it anyway: the engine hooks `python -c`
+LAZY_RUN_MS = 400  # a fresh interpreter importing sqlglot, patched module compiled from source
 
 
 PROBE2_MS = int(os.environ.get("RWX_PROBE2_MS", "250"))
 PROBE_ORDER = os.environ.get("RWX_PROBE_ORDER", "focus")
 RELATED_EVIDENCE_MS = int(os.environ.get("RWX_RELATED_EVIDENCE_MS", "1200"))
 RELATED_ALL_MS = int(os.environ.get("RWX_RELATED_ALL_MS", "4000"))
+# giants whose own test file must run clean before they can be dropped (empty: all giants)
+EVIDENCE_FILES = {f for f in os.environ.get("RWX_EVIDENCE_FILES", "").split(",") if f}
 MIN_RELATED = int(os.environ.get("RWX_MIN_RELATED", "3"))
 
 
@@ -1500,6 +1554,10 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     probe2, evidenced = [], set()
     for g in giants:
         gf = FILE_OF.get(g, "")
+        if EVIDENCE_FILES and gf not in EVIDENCE_FILES:
+            # the lab never saw this giant fail once the first probe passed
+            evidenced.add(g)
+            continue
         related = [n for n in remaining if FILE_OF.get(n, "") == gf and n not in set(probe2)]
         if not related:
             continue
@@ -1522,7 +1580,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         mandatory = set(heavy) & NO_RUN
         remaining = [n for n in rest if n not in passed]
         savings = _pack_cost(set(C) - passed) - _pack_cost(mandatory)
-        if remaining and batch_cost(remaining) <= FINAL_FRAC * savings:
+        if remaining and batch_cost(remaining) <= BET_FINISH_FRAC * savings:
             final = yield remaining, True
             failed3 = {n for n, st in final.items() if st == "F"}
             clean = {n for n, st in final.items() if st == "P"}
@@ -1557,7 +1615,11 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
 NARROW_SKIP_MS = int(os.environ.get("RWX_NARROW_SKIP_MS", "3000"))
 BREADTH = float(os.environ.get("RWX_BREADTH", "0.25"))
 RELATED_MS = int(os.environ.get("RWX_RELATED_MS", "2000"))
-NARROW_ON = os.environ.get("RWX_NARROW") == "1"  # experiment: off (cost more than it saved in the lab)
+NARROW_ON = os.environ.get("RWX_NARROW") == "1"
+NARROW_FULL_MS = int(os.environ.get("RWX_NARROW_FULL_MS", "4000"))
+NARROW_CHUNKS = os.environ.get("RWX_NARROW_CHUNKS", "1") == "1"
+NARROW_SAMEFILE = os.environ.get("RWX_NARROW_SAMEFILE") == "1"
+NARROW_CHUNK_MS = int(os.environ.get("RWX_NARROW_CHUNK_MS", "600"))  # experiment: off (cost more than it saved in the lab)
 
 
 NOGIANT_FRAC = float(os.environ.get("RWX_NOGIANT_FRAC", "0"))
@@ -1590,9 +1652,65 @@ def _live(C, rest, heavy, passed, failed):
         return (yield from _live_evidence(C, rest, heavy, passed, failed))
     skippable = [n for n in heavy if dur[n] >= NARROW_SKIP_MS and n not in NO_RUN]
     if not NARROW_ON or not skippable:
+        if LIVE_FINISH or BET_LIVE:
+            # Something failed. Finish verifying the runnable candidates when that costs
+            # less than printing them unverified; only then (or under the live bet)
+            # print just what failed plus the tests that cannot be run here.
+            remaining = [n for n in rest if n not in passed and n not in failed]
+            keep = set(failed) | set(heavy)
+            savings = _pack_cost(set(C) - passed) - _pack_cost(keep)
+            if remaining and LIVE_FINISH and batch_cost(remaining) <= FINAL_FRAC * savings:
+                res = yield remaining, False
+                failed = set(failed) | {n for n, st in res.items() if st == "F"}
+                unreported = {n for n in remaining if n not in res}
+                return set(failed) | set(heavy) | unreported
+            if BET_LIVE:
+                return set(failed) | set(heavy)
         return set(C) - passed
     done = passed | failed
     unrun = [n for n in rest if n not in done]
+    if unrun and batch_cost(unrun) <= NARROW_FULL_MS:
+        # Full knowledge of the runnable candidates, then decide the slow tests on it.
+        # Run in chunks, the slow tests' own files first, and stop as soon as the
+        # answer cannot change: every droppable test already has a failure in its
+        # file, or failures are already broad whatever the rest would show.
+        sfiles = {FILE_OF.get(g, "") for g in skippable}
+        if NARROW_SAMEFILE:
+            # only the slow tests' own files decide; the rest is printed unverified
+            others = [n for n in unrun if FILE_OF.get(n, "") not in sfiles]
+            same = [n for n in unrun if FILE_OF.get(n, "") in sfiles]
+            if same:
+                res = yield same, False
+                passed = passed | {n for n, st in res.items() if st == "P"}
+                failed = failed | {n for n in same if res.get(n) != "P"}
+            fail_files = {FILE_OF.get(n, "") for n in failed}
+            drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
+            return set(failed) | set(others) | (set(heavy) - drop)
+        order = sorted(unrun, key=lambda n: (FILE_OF.get(n, "") not in sfiles, CPU_EST.get(n, dur[n]), n))
+        total = len(passed) + len(failed) + len(order)
+        while order:
+            if NARROW_CHUNKS:
+                chunk, budget = [], max(NARROW_CHUNK_MS, batch_cost(order[:1]))
+                while order and batch_cost(chunk + order[:1]) <= budget:
+                    chunk.append(order.pop(0))
+                # keep a file's tests together with the slow tests' files first
+            else:
+                chunk, order = order, []
+            res = yield chunk, False
+            passed = passed | {n for n, st in res.items() if st == "P"}
+            failed = failed | {n for n in chunk if res.get(n) != "P"}
+            if not order:
+                break
+            fail_files = {FILE_OF.get(n, "") for n in failed}
+            if all(FILE_OF.get(g, "") in fail_files for g in skippable) or len(failed) >= BREADTH * total:
+                # nothing can be dropped any more: keep every slow test, unverified rest included
+                return set(C) - passed
+        breadth = len(failed) / max(1, len(passed) + len(failed))
+        fail_files = {FILE_OF.get(n, "") for n in failed}
+        drop = set()
+        if breadth < BREADTH:
+            drop = {g for g in skippable if FILE_OF.get(g, "") not in fail_files}
+        return set(failed) | (set(heavy) - drop)
     gfiles = {FILE_OF.get(n, "") for n in skippable}
     related = [n for n in unrun if FILE_OF.get(n, "") in gfiles]
     bp = _spread(related, RELATED_MS, 8)
@@ -1776,7 +1894,7 @@ class Scheduler:
         if not ctx.get("hung") or ctx["restarts"] >= WATCH_RESTARTS or time.monotonic() > self.deadline:
             return False
         try:
-            sess = self.engine.session(ctx["py"], ctx["data"], ctx["site"])
+            sess = self.engine.session(ctx["py"], ctx["data"], ctx["site"], ctx.get("fixture"))
         except Exception as e:  # noqa: BLE001
             log(f"{a[0]}: restart failed {e!r}"[:300])
             return False
@@ -1811,8 +1929,13 @@ class Scheduler:
         active = []  # [cid, C, gen, session, batch, selected before executor verification]
         while queue or active:
             while queue and len(active) < self.lanes:
-                cid, C, py, data, data_only, focus, known, case_site = queue.pop(0)
-                gen = policy(C, DUR, data_only, focus, known)
+                job = queue.pop(0)
+                cid, C, py, data, data_only, focus, known, case_site = job[:8]
+                fixture = job[8] if len(job) > 8 else None
+                if fixture:
+                    gen = fixture_policy(C, fixture[1])
+                else:
+                    gen = policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -1823,12 +1946,18 @@ class Scheduler:
                     yield cid, set(C), "out of time"
                     continue
                 try:
-                    sess = self.engine.session(py, data, case_site)
+                    fx = fixture[0] if fixture else None
+                    sess = self.engine.session(py, data, case_site, fx)
                     if getattr(sess, "executor_ms", None) is not None and getattr(sess, "executor_partial", True) is False:
                         EXEC_VERIFIABLE.add(commit_key(C))
                     a = [cid, C, gen, sess, batch, None,
-                         {"py": py, "data": data, "site": case_site, "restarts": 0, "hung": False}]
-                    self._submit(a, batch, stop_first)
+                         {"py": py, "data": data, "site": case_site, "fixture": fx, "restarts": 0, "hung": False}]
+                    if fixture:
+                        # fixture runs: the per-query tests get their own time limit
+                        a[6]["stop_first"], a[6]["carry"] = stop_first, {}
+                        sess.submit(batch, timeout=fixture_timeout(fixture, self.engine), stop_first=stop_first)
+                    else:
+                        self._submit(a, batch, stop_first)
                 except Exception as e:  # one commit's trouble must not stop the others
                     log(f"{cid}: session failed {e!r}"[:300])
                     gen.close()
@@ -1897,6 +2026,7 @@ class Scheduler:
                                 res.setdefault(n, "F")
                     if any(st == "F" for st in res.values()):
                         LIVE.add(cid)
+                    OBSERVED.setdefault(cid, set()).update(n for n, st in res.items() if st == "F")
                     executor = self.engine.executor_test
                     if selected is not None:
                         kind, selected = selected
@@ -2006,10 +2136,12 @@ DEFERRED: dict = {}  # commit -> importers mask needed unless its session import
 IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
 CMAP: list = []  # [the Map], for importer masks found at run time
 LIVE: set = set()  # commits where some run reported a failure
+OBSERVED: dict = {}  # commit -> tests a run reported failing (engine-run commits only)
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
 WATCH_SETUP: dict = {}  # the map's class setup CPU, also where shared/deferred setup can land
+TEST_ID_OF: dict = {}  # test number -> full test id
 
 
 def class_masks(tests) -> dict:
@@ -2096,6 +2228,29 @@ def read_patch(p: Path) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
+EXEC_CLS = "tests/test_executor.py::TestExecutor"
+PER_QUERY = {"test_execute_tpch": "tpch_sqls", "test_optimized_tpch": "tpch_sqls", "test_execute_tpcds": "tpcds_sqls"}
+
+
+def fixture_timeout(fixture, engine) -> float:
+    """Expected CPU of the edited queries, with slack. An edit can make a query far slower
+    (a dropped join condition); a timeout leaves the unreported tests in."""
+    spec, runnable, edits = fixture
+    by_attr = {attr: edits[fx] for fx, attr in spec}
+    ms = (engine.executor_profile or {}).get("ms") or []
+    est = CLS_SETUP.get(EXEC_CLS, 0)
+    for n in runnable:
+        attr = PER_QUERY.get(TEST_ID_OF.get(n, "").rsplit("::", 1)[-1])
+        e = by_attr.get(attr)
+        if e is None:
+            est += CPU_EST.get(n, DUR.get(n, 0))
+        elif attr == "tpcds_sqls" and len(ms) == e["count"]:
+            est += sum(ms[i] for i in e["edited"])
+        else:
+            est += 3 * CPU_EST.get(n, DUR.get(n, 0)) * max(1, len(e["edited"])) / max(1, e["count"])
+    return 3.0 + 3.0 * est / 1000
+
+
 def main() -> None:
     t0 = time.monotonic()
     # Start-up allocates mostly long-lived objects (map, trees, warm-up modules): the
@@ -2108,7 +2263,8 @@ def main() -> None:
     dur = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
     DUR.update(dur)
     FILE_OF.update({t["number"]: t["file"] for t in tests})
-    NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
+    if not LAZY_RUN:
+        NO_RUN.update(t["number"] for t in tests if t["id"] in NO_RUN_IDS)
     valid = 0
     for n in dur:
         valid |= 1 << n
@@ -2123,7 +2279,13 @@ def main() -> None:
         out.flush()
         return
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
+    if LAZY_RUN:
+        # the engine runs test_lazy_load's fresh interpreter on the patched tree
+        for t in tests:
+            if t["id"] in NO_RUN_IDS:
+                CPU_EST[t["number"]] = max(CPU_EST.get(t["number"], 0), LAZY_RUN_MS)
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
+    TEST_ID_OF.update({t["number"]: t["id"] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
     WATCH_SETUP.update(cmap.cls_setup_ms)
     lazy = 0
@@ -2150,9 +2312,11 @@ def main() -> None:
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
             if an.deferred:
                 DEFERRED[cid] = an.deferred & valid
+            fruns = dict(an.fixture_runs)
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
             DEFERRED.pop(cid, None)
+            fruns = {}
         try:
             mask &= valid
             C = [n for n in dur if mask >> n & 1]
@@ -2164,27 +2328,36 @@ def main() -> None:
                 dm = an.data_masks.get(rel, 0)
                 known |= {n for n in C if dm >> n & 1}
             score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
-            jobs.append((cid, C, py, data, data_only, score, known, case_site))
+            fixture = None
+            if FIXTURE_RUN and data_only and data and C and set(data) <= set(fruns):
+                runnable = [n for n in C if CLS_OF.get(n) == EXEC_CLS and n not in NO_RUN]
+                spec = sorted({(rel.removeprefix("tests/fixtures/"), attr)
+                               for rel in data for cls_id, attr in fruns[rel]["attrs"] if cls_id == EXEC_CLS})
+                if runnable and spec and _pack_cost(C) > _pack_cost([n for n in C if n not in runnable]):
+                    fixture = (spec, runnable, {rel.removeprefix("tests/fixtures/"): fruns[rel] for rel in data})
+                    log(f"{cid}: fixture run: {len(runnable)} {EXEC_CLS} tests on the edited queries")
+            jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture))
         except Exception as e:  # never crash: run everything for this commit
             log(f"{cid}: job error {e!r} -> ALL")
-            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
+            jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None, None))
     set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
     if SETTLE_GIANT_MS > 0:
         grant_giants([C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
         HEAVY_BATCH.update(n for n in dur if n not in NO_RUN and SETTLE_MAX_MS < batch_cost([n]) <= SETTLE_GIANT_MS)
-    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
+    need_engine = USE_ENGINE and any((job[1] and not job[4]) or job[8] for job in jobs)
     results = {}
     if need_engine:
         try:
             from engine import Engine
 
-            exec_cls = "tests/test_executor.py::TestExecutor"
+            exec_cls = EXEC_CLS
             runnable_exec = any(
                 CLS_OF.get(n) == exec_cls and n not in NO_RUN and CPU_EST.get(n, dur[n]) <= RUN_MAX_MS
                 for _, C, _, _, data_only, *_ in jobs if not data_only for n in C
-            )
+            ) or any(job[8] for job in jobs)
             # Warm up only the test modules some commit may actually run.
             needed = {n for _, C, _, _, data_only, *_ in jobs if not data_only for n in C}
+            needed |= {n for job in jobs if job[8] for n in job[8][1]}
             eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else (),
                          needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:
@@ -2207,6 +2380,15 @@ def main() -> None:
         diag_mode = os.environ.get("RWX_DIAG_MODE", "")
         if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
             final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
+        if diag_mode == "blind" and cid in OBSERVED:
+            # diagnostic: on commits the engine ran, print only what a run saw failing
+            final_set, note = set(OBSERVED[cid]), "diagnostic (blind): observed failures only"
+        if diag_mode == "heavy" and cid in OBSERVED:
+            # diagnostic: on commits the engine ran, leave out every unrun slow test
+            seen = OBSERVED[cid]
+            final_set = {n for n in final_set if n in seen or not (
+                n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
+            note = "diagnostic (heavy): unrun slow tests left out"
         if DEFERRED.get(cid) and IMPORT_OK.get(cid) is not True:
             # the patched modules were not shown to import: every importer may fail
             extra = DEFERRED[cid]

@@ -42,6 +42,8 @@ Run `python3 tools/lab/test_verification.py` for the focused regressions and
 
 ---
 
+See also **RESEARCH.md** for the measurements behind the current plan.
+
 ## 1. The problem in one screen
 
 For each patch to sqlglot (pinned at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`),
@@ -322,3 +324,98 @@ tests still have to be printed); stand-ins for the giants (tiny gain).
   workflow) now measures CPU with `getrusage` when cgroup `cpu.stat` is absent, and finds
   its marker even when duckdb's leak report (no trailing newline) precedes it. The
   selector now exits with `os._exit`, so that leak report no longer appears.
+
+## 11. Practice results with the real generator (Nov 22)
+
+| Commit (branch) | Simulated | CPU | Board | What it adds |
+|---|---|---|---|---|
+| `53171bc` (bet-clean) | 151.3 | 8.4 | 159.8 | treat a commit as clean after both probes pass |
+| `e539940` (bet) | 151.3 | 9.4 | 160.7 | + TPC fixture refinement (practice has none), finish affordable verification first |
+| **`d44ba30` (bet-narrow)** | **129.7** | **14.6** | **144.8** | + on live commits, finish verifying and leave out giants when failures are narrow and none in the giant's file |
+
+0 misses on every run. **Final pick: `d44ba302dc5cbd9bdea4a5708aeb62bec802ad7c`.**
+
+- Practice decomposition (diagnostic branches, bet version): live commits 16 / 91.4 s,
+  static commits 13 / 57.5 s, everything else 11 / 2.4 s. The narrow rule then cut the live
+  part by 21.6 s.
+- The bets hold on the real generator (samples + practice) but not on my synthetic lab or
+  Astra's: real mutations tend to break broadly or not at all. Samples are the arbiter.
+- Rejected on evidence: live bet (5 sample misses), skipping mid-weight tests under the
+  narrow rule (6 new lab misses for 23 s), lowering the bet's finishing threshold (brings
+  back Astra's miss).
+
+## 12. Where things stand (Nov 22, ~03:45 UTC) and how to keep going
+
+**Board:** our best is **141.0** (`2ac5328`, branch `bet-narrow-mid-fx`). The leader
+is at 103. The board keeps the best submission automatically.
+
+**Branches that matter** (always paste the full hash on the submit form; an empty box
+scores the newest commit on `main`, which is old):
+
+| Branch | Commit | What it is |
+|---|---|---|
+| `rwx` | latest | development line, all flags off by default |
+| `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
+| `bet-narrow-mid` | `bec9335` | **141.8**: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
+| `fast-v1` | `8849616` | **candidate**: 141.0 settings + `RWX_PRESETUP_CACHE=1` (build-time setUpClass snapshot, ~0.5 s less parent CPU; -1.3 s CPU on samples in paired runs) + `RWX_LAZY_RUN=1` (test_lazy_load runs on the patched tree). Sample output identical |
+| `diag-heavy` | `9fac365` | DIAGNOSTIC ONLY: 141.0 output minus unrun heavy tests on engine commits (see RESEARCH.md) |
+| `bet-narrow-mid-fx` | `2ac5328` | **141.0 (current best)**: bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0`. Practice: 125.762 s simulated (unchanged: no practice fixture commit benefits), CPU 15.09 / 15.19 / 15.42 |
+| `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
+| `diag-*` | | diagnostics only, never pick these |
+
+Submission variants are just `rwx` plus an `ENV` line in the Dockerfile. The switches
+(all in `rwx/selector.py`, read from the environment):
+
+| Variable | Effect |
+|---|---|
+| `RWX_BET_CLEAN=1` | after both probes pass, finish verifying if cheap, else treat the commit as clean |
+| `RWX_NARROW=1` | live commits: verify the runnable candidates fully, then drop slow tests when failures are narrow (< 25%) and none is in that test's file |
+| `RWX_NARROW_SKIP_MS` | which slow tests the narrow rule may drop (3000 = giants; 1000 = mid-weight too) |
+| `RWX_DIAG_MODE=live/static`, `RWX_DIAG_MIN/MAX` | diagnostics: print nothing for a category; misses = how many in it break |
+| `RWX_PROBE_ORDER=rare` | rarity-ranked probes (tested, not better) |
+| `RWX_FIXTURE_RUN=1` | fixture-only TPC edits: run TestExecutor's per-query tests on the edited queries |
+| `RWX_PRESETUP_CACHE=1` | load the build-time snapshot of TestExecutor.setUpClass (`rwx/presetup_cache.py`) |
+| `RWX_LAZY_RUN=1` | run test_lazy_load: `python -c` children get an import hook with the patched sources (`rwx/srchook.py`) |
+| `RWX_DIAG_MODE=heavy/blind` | diagnostics: drop unrun heavy tests / print only observed failures on engine commits |
+
+**What practice looks like** (from the diagnostics on the bet version, 40 commits):
+16 live commits, 13 static commits (all of them break something: fixture edits), 11 that
+break nothing. Since the leader is at 103, roughly 25-30 s of our 129.7 s simulated must be
+tests we print on breaking commits that do not actually fail (most likely mid-weight tests
+included blind), plus about 15 s CPU.
+
+**How to try an idea safely:**
+1. Implement it behind an environment switch in `rwx/selector.py`.
+2. `python3 tools/lab/simulate.py RWXblast-radius-sample/sample` must show 0 misses (the
+   samples are the real generator; the lab sets are harsher than reality).
+3. Build the real image (`tools/lab/build_local.sh` here, or `docker build .`) and run it
+   with the scorer flags from the `Makefile` on the samples twice: same output, 0 misses.
+4. Branch from `rwx`, add the `ENV` line, push, submit the full hash.
+
+**Ideas not yet tried:** making the slow optimizer tests cheaper to verify (run only the
+fixture entries that reach the changed code, like Astra's per-query TPC-DS check);
+cutting CPU in the bet's finishing step for large clean commits.
+
+### Nov 22, ~05:30 UTC: TPC fixture runs (`RWX_FIXTURE_RUN=1`)
+
+Practice has 13 fixture-only commits that cost 57.5 s (4.4 s each), against 2.2 s each
+for the samples' fixture commits. The only fixtures that can cost much more are
+`tpc-h.sql` and `tpc-ds.sql`: their readers include `test_execute_tpch` (3.9 s),
+`test_optimized_tpch` (3.5 s) and `test_execute_tpcds` (21.5 s), and fixture-only
+commits were never run, so they were printed blind.
+
+Now the session swaps in the edited file's query pairs (`rwx/fixture_run.py`) and runs
+TestExecutor's per-query tests on the edited queries only. The other queries are
+byte-identical with no code changed, so they pass as at the pinned commit. A pass drops
+the test. TestOptimizer readers (`test_tpch`, `test_tpcds`) stay printed. Lab:
+`tpcfix` 219.4 -> 196.1 s, `tpcfix2` (sample-style edits) 196.2 -> 190.2 s. Both are
+exact (equal to the oracle) with 0 misses. Sample output is byte-identical.
+
+Other things measured this round:
+- gc tuning in sessions (off, high thresholds): no change, within noise.
+- Parent CPU is ~1.8 s: test-module imports 0.56 s, the TestExecutor presetup 0.74 s
+  (TPC-DS tables 0.59 s of it), map + analysis ~0.2 s. A build-time pickle of the
+  presetup state would load in 0.14 s (saves ~0.6 s), but it needs a manifest of the
+  code setUpClass runs (as warm keys). Not built yet.
+- The largest sample session is 2haz (6 s): `is` -> `==` on an enum, which breaks
+  nothing. The bet's finishing step verifies its 64 runnable candidates.

@@ -31,4 +31,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 OPENBLAS_NU
 RUN python /app/rwx/executor_fixture.py /sqlglot && chmod a+r /sqlglot/.rwx-executor.json
 RUN python /app/rwx/tokenizer_coverage.py /sqlglot && chmod a+r /sqlglot/.rwx-tokenizer.json
 RUN python /app/rwx/executor_cases.py /sqlglot && chmod a+r /sqlglot/.rwx-executor-cases.json
+# optional: without the snapshot the engine runs setUpClass itself
+RUN python /app/rwx/presetup_cache.py /sqlglot > /dev/null 2>&1; chmod a+r /sqlglot/.rwx-presetup.pkl 2>/dev/null; true
 CMD ["python", "/app/rwx/selector.py"]
