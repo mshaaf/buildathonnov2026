@@ -55,6 +55,9 @@ class Map:
         self.lines: dict = d["lines"]
         self.opens: dict = d["opens"]
         self.arg_missing: dict = d.get("arg_missing", {})
+        self.fixture_attrs: dict = d.get("fixture_attrs", {})
+        self.attr_reads: dict = d.get("attr_reads", {})
+        self.expected_codes: dict = d.get("expected_codes", {})
         self.cpu_ms: dict = d.get("cpu_ms", {})
         self.cls_setup_ms: dict = d.get("cls_setup_ms", {})
         self.focus: dict = d.get("focus", {})
@@ -239,6 +242,45 @@ class Analyzer:
             refs.extend(m.name_refs.get(name, ()))
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
+
+    def refine_fixture(self, rel, old, new, fm, why):
+        """A fixture a test class loads in setUpClass (into cls.ATTR) only reaches the
+        tests that read ATTR; tests that never unpack the expected part of the pairs
+        cannot see an edit confined to expected outputs. Anything unusual keeps every
+        opener (including an edit that would make the shared setup itself raise)."""
+        fa = self.map.fixture_attrs.get(rel)
+        cm = getattr(self, "class_masks", None)
+        if not fa or not cm or not FIXTURE_REFINE:
+            return fm
+        old_pairs, new_pairs = _load_pairs(old), _load_pairs(new)
+        if old_pairs is None or new_pairs is None:
+            why.append(f"{rel}: fixture would not load -> every opener")
+            return fm
+        if len(old_pairs) == len(new_pairs):
+            sql_changed = any(o[:2] != n[:2] for o, n in zip(old_pairs, new_pairs))
+            exp_changed = any(o[2] != n[2] for o, n in zip(old_pairs, new_pairs))
+        else:
+            sql_changed = exp_changed = True
+        for class_id, attr in fa:
+            in_class = cm.get(class_id, 0)
+            file = class_id.split("::")[0]
+            if attr in self.map.attr_reads:
+                # recorded: the tests that actually read cls.ATTR (tools/lab/attrrun.py)
+                readers = self.map.masks[self.map.attr_reads[attr]]
+            else:
+                readers = 0
+                for f, key, kind in self.map.name_refs.get(attr, ()):
+                    if f == file and kind == "func":
+                        readers |= self.map.code_mask(f, key)
+            exp_users = 0
+            for key in self.map.expected_codes.get(file, ()):
+                exp_users |= self.map.code_mask(file, key)
+            keep = (readers if sql_changed else 0) | ((readers & exp_users) if exp_changed else 0)
+            before = bin(fm & in_class).count("1")
+            fm = (fm & ~in_class) | (fm & in_class & keep)
+            why.append(f"{rel}: {class_id} readers of {attr} {before} -> {bin(fm & in_class).count('1')}"
+                       f" (sql {'changed' if sql_changed else 'same'}, expected {'changed' if exp_changed else 'same'})")
+        return fm
 
     def arg_flip_mask(self, rel: str, site, ck: str, why: list):
         """arg_types entries whose truthiness flipped only change required_args, which only
@@ -573,6 +615,7 @@ class Analyzer:
         self.case_site = None
         self.unverifiable = False
         files = self.merge_repeats(parse_patch(text), why)
+        self.data_masks: dict = {}
         for fp in files:
             if not fp.path and (fp.hunks or fp.binary):
                 return self.all, ["patch entry without a path -> ALL"]
@@ -589,8 +632,18 @@ class Analyzer:
                 old = self.old_source(rel)
                 if old is None:
                     raise ValueError(f"missing base fixture: {rel}")
-                self.data_changes[rel] = apply_hunks(old, locate_hunks(old, fp.hunks))
-                mask |= self.data_mask(rel, why)
+                new_text = apply_hunks(old, locate_hunks(old, fp.hunks))
+                self.data_changes[rel] = new_text
+                m = self.map.opens.get(rel)
+                fm = self.map.masks[m] if m is not None else 0
+                fm = self.refine_fixture(rel, old, new_text, fm, why)
+                self.data_masks[rel] = fm
+                if fm == 0:
+                    # nobody (left) reads it directly: every opener, else its directory's users
+                    fm = self.data_mask(rel, why)
+                else:
+                    why.append(f"data {rel} -> {fm.bit_count()}")
+                mask |= fm
             else:
                 mask |= self.other_file(fp, rel, why)
         if self.unverifiable:
@@ -742,6 +795,29 @@ def flipped_bool(stmt, before, after):
     return None
 
 
+def _load_pairs(text):
+    """tests/helpers.load_sql_fixture_pairs on a string: [(meta, sql, expected)], or None
+    if the real loader would raise."""
+    try:
+        lines = [line for line in text.splitlines() if line and not line.startswith("--")]
+        statements = "\n".join(lines).split(";")
+        out = []
+        for i in range(0, len(statements), 2):
+            if i + 1 < len(statements):
+                sql = statements[i].strip()
+                sql_lines = sql.split("\n")
+                meta = {}
+                j = 0
+                while sql_lines[j].startswith("#"):
+                    key, val = sql_lines[j].split(":", maxsplit=1)
+                    meta[key.lstrip("#").strip()] = val.strip()
+                    j += 1
+                out.append((tuple(sorted(meta.items())), "\n".join(sql_lines[j:]), statements[i + 1].strip()))
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _base_name(b) -> str:
     if isinstance(b, ast.Name):
         return b.id
@@ -813,6 +889,7 @@ USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
 BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
+FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
 BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"  # experiment: clean after two passing probes
@@ -1037,8 +1114,18 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
     if failed2 or len(passed2) < len(probe2):
         return (yield from _live(C, rest, heavy, passed, failed2))
     if BET_CLEAN:
-        # EXPERIMENT (off by default): both probes passed -> treat the commit as clean.
-        return set(heavy) & NO_RUN
+        # Both probes passed. If finishing the verification is affordable, finish it;
+        # only when it is not do we bet that the commit is clean.
+        mandatory = set(heavy) & NO_RUN
+        remaining = [n for n in rest if n not in passed]
+        savings = _pack_cost(set(C) - passed) - _pack_cost(mandatory)
+        if remaining and batch_cost(remaining) <= FINAL_FRAC * savings:
+            final = yield remaining, True
+            failed3 = {n for n, st in final.items() if st == "F"}
+            clean = {n for n, st in final.items() if st == "P"}
+            if failed3 or len(clean) < len(remaining):
+                return (yield from _live(C, rest, heavy, passed | clean, failed3))
+        return mandatory
     # A giant goes only when its own test file showed clean evidence (or has no runnable
     # candidates at all, the case the lab saw no failures in).
     has_related = {g for g in giants if any(FILE_OF.get(n, "") == FILE_OF.get(g, "") for n in rest)}
@@ -1327,6 +1414,14 @@ CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
 
 
+def class_masks(tests) -> dict:
+    out: dict = {}
+    for t in tests:
+        k = t["id"].rsplit("::", 1)[0]
+        out[k] = out.get(k, 0) | (1 << t["number"])
+    return out
+
+
 def commit_rarity(cmap, C, sites) -> dict:
     """Per candidate: sum over lines of the changed code objects it ran of 1/(tests running
     that line). Tests taking rare paths through the changed code fail most often."""
@@ -1422,6 +1517,7 @@ def main() -> None:
     for t in tests:
         file_tests[t["file"]] = file_tests.get(t["file"], 0) | 1 << t["number"]
     an = Analyzer(cmap, valid, lazy, file_tests)
+    an.class_masks = class_masks(tests)
     patches = list_patches(DATA / "commits")
     SETTLE_BUDGET[0] = SETTLE_BUDGET_PER_COMMIT_MS * len(patches)
     jobs, final = [], {}
@@ -1439,9 +1535,8 @@ def main() -> None:
         log(f"{cid}: {len(C)} candidates | " + "; ".join(why)[:200])
         known = set()
         for rel in data:
-            mid = cmap.opens.get(rel)
-            if mid is not None:
-                known |= {n for n in C if cmap.masks[mid] >> n & 1}
+            dm = an.data_masks.get(rel, 0)
+            known |= {n for n in C if dm >> n & 1}
         score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
         jobs.append((cid, C, py, data, data_only, score, known, case_site))
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)

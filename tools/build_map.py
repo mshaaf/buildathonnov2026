@@ -19,6 +19,45 @@ import zlib
 ROOT = "/sqlglot/"
 
 
+def build_fixture_attrs(src_root):
+    """Fixtures a test class loads in setUpClass into a class attribute, and the test code
+    that unpacks the expected (third) element of fixture pairs."""
+    import ast
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "rwx"))
+    from patchlib import _code_key
+
+    attrs: dict = {}
+    expected_codes: dict = {}
+    tdir = os.path.join(src_root, "tests")
+    for d, _, fs in os.walk(tdir):
+        for f in fs:
+            if not f.endswith(".py"):
+                continue
+            rel = os.path.relpath(os.path.join(d, f), src_root)
+            tree = ast.parse(open(os.path.join(d, f)).read())
+            for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+                for fn in cls.body:
+                    if isinstance(fn, ast.FunctionDef) and fn.name == "setUpClass":
+                        for st in ast.walk(fn):
+                            if (isinstance(st, ast.Assign) and len(st.targets) == 1
+                                    and isinstance(st.targets[0], ast.Attribute)
+                                    and isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == "cls"):
+                                for call in ast.walk(st.value):
+                                    if (isinstance(call, ast.Call) and getattr(call.func, "id", "") in ("load_sql_fixture_pairs", "load_sql_fixtures")
+                                            and call.args and isinstance(call.args[0], ast.Constant)):
+                                        fx = "tests/fixtures/" + call.args[0].value
+                                        attrs.setdefault(fx, []).append((f"{rel}::{cls.name}", st.targets[0].attr))
+            for fn in ast.walk(tree):
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for st in ast.walk(fn):
+                        tgt = st.target if isinstance(st, (ast.For, ast.comprehension)) else (st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else None)
+                        for t in ([tgt] + ([e for e in tgt.elts] if isinstance(tgt, ast.Tuple) else [])) if tgt is not None else []:
+                            if isinstance(t, ast.Tuple) and len(t.elts) == 3 and not (isinstance(t.elts[2], ast.Name) and t.elts[2].id == "_"):
+                                expected_codes.setdefault(rel, set()).add(_code_key(fn))
+    return attrs, {k: sorted(v) for k, v in expected_codes.items()}
+
+
 def build_refs(src_root):
     """Static index of where names and Class.attr pairs are referenced, per code object."""
     import ast
@@ -174,6 +213,17 @@ def main():
         payload["arg_missing"] = {k: mid(m) for k, m in missing.items()}
         print(f"arg_missing pairs {len(missing)}", file=sys.stderr)
     if src_root:
+        payload["fixture_attrs"], payload["expected_codes"] = build_fixture_attrs(src_root)
+        reads_path = os.path.join(os.path.dirname(cov_dir.rstrip("/")), "attr_reads.json")
+        if os.path.exists(reads_path):
+            # attribute -> tests that really read it (tools/lab/attrrun.py)
+            ar: dict = {}
+            for n, names in json.load(open(reads_path)).items():
+                for a in names:
+                    ar[a] = ar.get(a, 0) | (1 << int(n))
+            payload["attr_reads"] = {a: mid(m) for a, m in ar.items()}
+            print(f"setup attribute readers {{{', '.join(f'{a}: {bin(m).count(chr(49))}' for a, m in ar.items())}}}", file=sys.stderr)
+        print(f"setup-loaded fixtures {payload['fixture_attrs']}", file=sys.stderr)
         payload["name_refs"], payload["attr_refs"] = build_refs(src_root)
         print(f"name refs {len(payload['name_refs'])}, attr refs {len(payload['attr_refs'])}", file=sys.stderr)
     blob = zlib.compress(pickle.dumps(payload, protocol=5), 9)

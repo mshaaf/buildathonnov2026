@@ -13,6 +13,7 @@ import time
 sys.path.insert(0, "/app/rwx")
 os.environ.setdefault("RWX_SRC", "/sqlglot")
 os.environ.setdefault("RWX_BROAD", "1")
+os.environ.setdefault("RWX_FIXTURE_REFINE", "0")
 import selector as sel  # noqa: E402
 from engine import Engine  # noqa: E402
 
