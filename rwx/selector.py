@@ -887,6 +887,7 @@ class Scheduler:
                 res = dict(sess.results)
                 if any(st == "F" for st in res.values()):
                     LIVE.add(cid)
+                OBSERVED.setdefault(cid, set()).update(n for n, st in res.items() if st == "F")
                 if not sess.alive:
                     # crashed or killed: whatever did not report counts as failing
                     for n in batch:
@@ -941,6 +942,7 @@ class Scheduler:
 
 DUR: dict = {}
 LIVE: set = set()  # commits where some run reported a failure
+OBSERVED: dict = {}  # commit -> tests a run reported failing (engine-run commits only)
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
@@ -1109,6 +1111,15 @@ def main() -> None:
         diag_mode = os.environ.get("RWX_DIAG_MODE", "")
         if (diag_mode == "live" and cid in LIVE) or (diag_mode == "static" and C and note == "static"):
             final_set, note = set(), f"diagnostic ({diag_mode}): printed nothing"
+        if diag_mode == "blind" and cid in OBSERVED:
+            # diagnostic: on commits the engine ran, print only what a run saw failing
+            final_set, note = set(OBSERVED[cid]), "diagnostic (blind): observed failures only"
+        if diag_mode == "heavy" and cid in OBSERVED:
+            # diagnostic: on commits the engine ran, leave out every unrun slow test
+            seen = OBSERVED[cid]
+            final_set = {n for n in final_set if n in seen or not (
+                n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
+            note = "diagnostic (heavy): unrun slow tests left out"
         nums = sorted(final_set)
         workers = pack(nums, dur)
         cost = (max(sum(dur[n] for n in w) for w in workers) + WORKER_MS * len(workers)) if workers else 0
