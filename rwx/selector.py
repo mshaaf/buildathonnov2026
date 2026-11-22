@@ -210,7 +210,7 @@ class Analyzer:
         if ck is not None:
             broad = isinstance(node, ast.ClassDef) and (
                 any(_base_name(b) in self.BROAD_BASES or _base_name(b).endswith(("Error", "Exception")) for b in node.bases)
-                or node.keywords
+                or (node.keywords and not (META_STATIC and self.static_metaclass(rel, node, site.names)))
                 or node.decorator_list
             )
             if ck not in m.class_desc:
@@ -261,6 +261,51 @@ class Analyzer:
             refs.extend(m.name_refs.get(name, ()))
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
+
+    def static_metaclass(self, rel, node, names) -> bool:
+        """`class X(metaclass=M)` with M defined in the same module, where M's code reads class
+        attributes only by literal names, none of them the edited ones: then M cannot observe
+        the edit, and the class is no broader than a plain one. Dynamic access (getattr/setattr/
+        hasattr with a computed name, vars(), dir(), iterating a __dict__) disqualifies M, except
+        getattr/dir on a module object just returned by importlib.import_module."""
+        if len(node.keywords) != 1 or node.keywords[0].arg != "metaclass" or not isinstance(node.keywords[0].value, ast.Name):
+            return False
+        text = self.old_source(rel)
+        if text is None:
+            return False
+        tree = self.tree(rel, text)
+        metas = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == node.keywords[0].value.id]
+        if len(metas) != 1:
+            return False
+        meta = metas[0]
+        modules = {t.id for n in ast.walk(meta) if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                   and isinstance(n.value.func, ast.Attribute) and n.value.func.attr == "import_module"
+                   for t in n.targets if isinstance(t, ast.Name)}
+        wanted = set(names or ())
+        for n in ast.walk(meta):
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+                f = n.func.id
+                if f in ("vars", "dir") and not (n.args and isinstance(n.args[0], ast.Name) and n.args[0].id in modules):
+                    return False
+                if f in ("getattr", "setattr", "hasattr", "delattr") and len(n.args) >= 2 and not isinstance(n.args[1], ast.Constant):
+                    if not (isinstance(n.args[0], ast.Name) and n.args[0].id in modules):
+                        return False
+            if isinstance(n, ast.Attribute) and n.attr == "__dict__":
+                parent_ok = False
+                for p in ast.walk(meta):
+                    if (isinstance(p, ast.Call) and isinstance(p.func, ast.Attribute) and p.func.value is n
+                            and p.func.attr == "get" and p.args and isinstance(p.args[0], ast.Constant)):
+                        parent_ok = True
+                        break
+                if not parent_ok:
+                    return False
+            if isinstance(n, ast.Name) and n.id in wanted:
+                return False
+            if isinstance(n, ast.Attribute) and n.attr in wanted:
+                return False
+            if isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in wanted:
+                return False
+        return True
 
     def only_constant_defaults(self, rel, site) -> bool:
         """The def statement differs only in default values, each a constant before and after.
@@ -1217,6 +1262,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 REF_LINES = os.environ.get("RWX_REF_LINES", "0") == "1"
+META_STATIC = os.environ.get("RWX_META_STATIC", "0") == "1"  # metaclass reading only literal names: not broad
 DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "1") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 # Fixture-only commits editing a setup-loaded fixture (tpc-h.sql, tpc-ds.sql): run the
