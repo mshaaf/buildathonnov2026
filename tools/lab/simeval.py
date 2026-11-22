@@ -92,7 +92,8 @@ def exec_info(eng, py, data, case_site):
         return mode, None, None
     ms = eng.executor_profile["ms"]
     case_ms = sum(ms[i] for i in idx)
-    if case_ms <= 5000:
+    import engine as _eng
+    if case_ms <= _eng.TPCDS_VERIFY_MS:
         return mode, case_ms, False
     return mode, None, None  # RWX_TPCDS_SAMPLE_MS=0: no partial gate
 
@@ -126,12 +127,14 @@ def replay(C, F, data_only, focus, known, cost, info, exec_n):
     note = ""
     if batches and exec_n is not None and exec_ms is not None and exec_n not in ran:
         ecpu = exec_ms + sel.CLS_SETUP.get(EXEC_CLS, 0)
-        if exec_n in out and not partial and sel._pack_cost(out) - sel._pack_cost(out - {exec_n}) >= 3 * ecpu:
+        saving = sel._pack_cost(out) - sel._pack_cost(out - {exec_n})
+        if exec_n in out and not partial and (saving >= 3 * ecpu or (sel.TPCDS_SETTLE and sel.SETTLE_RATIO > 0
+                                                                  and sel.SETTLE_RATIO * ecpu < saving)):
             cpu += ecpu
             note = "verify"
             if exec_n not in F:
                 out.discard(exec_n)
-        elif exec_n in C and exec_n not in out:
+        elif exec_n in C and exec_n not in out and exec_ms <= sel.TPCDS_GATE_MS:
             cpu += ecpu
             note = "gate"
             if exec_n in F:

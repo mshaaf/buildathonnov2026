@@ -1867,6 +1867,12 @@ def _live_evidence(C, rest, heavy, passed, failed):
     return selected
 
 
+# Per-query TPC-DS check after the policy: with RWX_TPCDS_SETTLE the settle rule decides (ratio x
+# CPU < worker time saved) instead of "saving >= 3 x CPU"; pair it with RWX_TPCDS_VERIFY_MS (engine)
+# to let sessions prepare larger affected-query sets. The gate (TPC-DS already left out) keeps
+# its old 5 s bound so a larger verify cap does not add CPU to clean commits.
+TPCDS_SETTLE = os.environ.get("RWX_TPCDS_SETTLE", "0") == "1"
+TPCDS_GATE_MS = int(os.environ.get("RWX_TPCDS_GATE_MS", "5000"))
 HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
 # Progress watchdog: a batch is hung when no result line arrived for max(WATCH_MIN_S,
 # WATCH_FACTOR x (estimate of the test running now + its class setup)); a fresh child
@@ -2114,14 +2120,15 @@ class Scheduler:
                         if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
-                            if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
+                            saving = _pack_cost(e.value) - _pack_cost(e.value - {executor})
+                            if saving >= 3 * cpu or (TPCDS_SETTLE and SETTLE_RATIO > 0 and SETTLE_RATIO * cpu < saving):
                                 sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
                                 ctx["carry"] = {}
                                 a[4], a[5] = [executor], ("verify", e.value)
                                 continue
                         if (executor is not None and executor in C and executor not in e.value
-                                and sess.executor_ms is not None and sess.alive and executor not in res
-                                and time.monotonic() < self.deadline):
+                                and sess.executor_ms is not None and sess.executor_ms <= TPCDS_GATE_MS
+                                and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
                             ctx["carry"] = {}

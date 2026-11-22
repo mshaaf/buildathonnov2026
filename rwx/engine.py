@@ -34,6 +34,7 @@ from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
+TPCDS_VERIFY_MS = int(os.environ.get("RWX_TPCDS_VERIFY_MS", "5000"))  # most affected-query CPU (est ms) a session prepares to verify
 CPU_DUMP = os.environ.get("RWX_CPU_DUMP", "")  # lab only: per-session CPU breakdown file
 WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
 # ... and for the child's first line ("M", after patching, re-import and the import
@@ -737,7 +738,7 @@ class Session:
             if case_indices is not None:
                 ms = engine.executor_profile["ms"]
                 case_ms = sum(ms[i] for i in case_indices)
-                if case_ms <= 5000:
+                if case_ms <= TPCDS_VERIFY_MS:
                     executor_indices = case_indices
                     self.executor_ms = case_ms
                     self.executor_partial = False
