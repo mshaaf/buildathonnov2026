@@ -34,6 +34,7 @@ from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
+TPCDS_STAGES = os.environ.get("RWX_TPCDS_STAGES", "0") == "1"  # planner-input check for TPC-DS (tpcds_stages.py)
 TPCDS_VERIFY_MS = int(os.environ.get("RWX_TPCDS_VERIFY_MS", "5000"))  # most affected-query CPU (est ms) a session prepares to verify
 CPU_DUMP = os.environ.get("RWX_CPU_DUMP", "")  # lab only: per-session CPU breakdown file
 WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
@@ -355,6 +356,19 @@ class Engine:
         except (OSError, ValueError) as e:  # a bad manifest only loses this optimization
             self.log(f"executor profile unusable: {e!r}")
             self.executor_profile = {}
+        self.stage_profile = {}
+        if TPCDS_STAGES and self.executor_profile:
+            from tpcds_stages import PROFILE as STAGE_PROFILE
+
+            try:
+                stages = Path(self.root) / STAGE_PROFILE
+                if stages.is_file():
+                    self.stage_profile = json.loads(stages.read_text())
+                    if self.stage_profile.get("count") != len(self.executor_profile["ms"]):
+                        self.stage_profile = {}
+            except (OSError, ValueError, KeyError) as e:  # a bad manifest only loses this optimization
+                self.log(f"stage profile unusable: {e!r}")
+                self.stage_profile = {}
         self.warm_codes: set = set()
         self.presetup_keys: set = set()  # code keys a cached setUpClass would have run
         self.presetup_done: set = set()
@@ -563,9 +577,14 @@ class Engine:
             if not parts or parts[0] == "Q":
                 return
             if parts[0] == "E":
-                from executor_cases import install
+                if isinstance(executor_indices, tuple) and executor_indices[0] == "stage":
+                    from tpcds_stages import install as install_stage
 
-                install(executor_indices)
+                    install_stage(executor_indices[1], self.stage_profile)
+                else:
+                    from executor_cases import install
+
+                    install(executor_indices)
             stop_first = parts[0] == "R1"
             self._run_tests([int(x) for x in parts[1:]], wfd, stop_first)
             os.write(wfd, b"D\n")
@@ -764,6 +783,7 @@ class Session:
         executor_indices = None
         self.executor_ms = None
         self.executor_partial = None
+        self.executor_stage = False  # the check is tpcds_stages (planner input), not the queries
         if (engine.executor_profile and not data_changes and len(py_changes) == 1
                 and self.mode == "swap" and swaps
                 and next(iter(py_changes)).startswith("sqlglot/")):
@@ -773,10 +793,22 @@ class Session:
             if case_indices is not None:
                 ms = engine.executor_profile["ms"]
                 case_ms = sum(ms[i] for i in case_indices)
+                stage_ms = None
+                if case_ms > TPCDS_VERIFY_MS and engine.stage_profile:
+                    from tpcds_stages import applicable
+
+                    stage_ms = applicable(engine.stage_profile, engine.root, swaps, case_indices)
                 if case_ms <= TPCDS_VERIFY_MS:
                     executor_indices = case_indices
                     self.executor_ms = case_ms
                     self.executor_partial = False
+                elif stage_ms is not None and stage_ms < case_ms:
+                    # Too many to run: check instead that the patch leaves the planner's
+                    # input of every affected query as it is at the pinned commit.
+                    executor_indices = ("stage", case_indices)
+                    self.executor_ms = stage_ms
+                    self.executor_partial = False
+                    self.executor_stage = True
                 elif case_indices:
                     # Too many to verify: keep the cheapest affected queries as a gate
                     # for the case where the policy would leave TPC-DS out unrun.

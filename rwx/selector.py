@@ -2024,6 +2024,7 @@ def _live_evidence(C, rest, heavy, passed, failed):
 # to let sessions prepare larger affected-query sets. The gate (TPC-DS already left out) keeps
 # its old 5 s bound so a larger verify cap does not add CPU to clean commits.
 TPCDS_SETTLE = os.environ.get("RWX_TPCDS_SETTLE", "0") == "1"
+STAGE_LAB = os.environ.get("RWX_STAGE_LAB", "0") == "1"  # lab only: force and log the TPC-DS planner-input check
 TPCDS_GATE_MS = int(os.environ.get("RWX_TPCDS_GATE_MS", "5000"))
 HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
 # Progress watchdog: a batch is hung when no result line arrived for max(WATCH_MIN_S,
@@ -2238,6 +2239,8 @@ class Scheduler:
                     executor = self.engine.executor_test
                     if selected is not None:
                         kind, selected = selected
+                        if STAGE_LAB and getattr(sess, "executor_stage", False):
+                            log(f"STAGELAB {cid} {res.get(executor)} cpu {sess.executor_ms}")
                         if kind == "verify":
                             # every affected query was run: a pass clears TPC-DS
                             if sess.alive and res.get(executor) == "P":
@@ -2273,6 +2276,14 @@ class Scheduler:
                             continue
                         self._submit(a, nxt, stop_first)
                     except StopIteration as e:
+                        if (STAGE_LAB and getattr(sess, "executor_stage", False) and executor not in res
+                                and sess.alive and time.monotonic() < self.deadline):
+                            # lab only: run the planner-input check wherever it applies, and log it
+                            cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
+                            sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
+                            ctx["carry"] = {}
+                            a[4], a[5] = [executor], ("verify", e.value)
+                            continue
                         if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
@@ -2284,6 +2295,7 @@ class Scheduler:
                                 continue
                         if (executor is not None and executor in C and executor not in e.value
                                 and sess.executor_ms is not None and sess.executor_ms <= TPCDS_GATE_MS
+                                and not getattr(sess, "executor_stage", False)
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
