@@ -683,6 +683,11 @@ def known_lookups(tree, line: int, scope_chain) -> frozenset:
             for i in range(1, len(parts) + 1):
                 known.add(".".join(parts[:i]))
 
+    def forget(name):
+        # a rebound or deleted name: lookups through it may no longer work
+        for k in [k for k in known if k == name or k.startswith(name + ".")]:
+            known.discard(k)
+
     for body in [tree.body] + [c.body for c in scope_chain if isinstance(c, ast.ClassDef)]:
         for st in body:
             end = getattr(st, "end_lineno", st.lineno) or st.lineno
@@ -690,21 +695,82 @@ def known_lookups(tree, line: int, scope_chain) -> frozenset:
                 break
             if isinstance(st, (ast.If, ast.Try, ast.For, ast.While, ast.With, ast.AsyncFor, ast.AsyncWith, ast.Match)):
                 continue
-            for name in bound_names(st):
-                known.add(name)
+            if isinstance(st, ast.Delete):
+                for t in st.targets:
+                    d = dotted(t) if isinstance(t, (ast.Name, ast.Attribute)) else None
+                    if d:
+                        forget(d)
+                    else:
+                        for sub in ast.walk(t):
+                            if isinstance(sub, ast.Name):
+                                forget(sub.id)
+                continue
             if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 nodes = def_time_parts(st, True)
             else:
                 nodes = [st]
+            loads = []
             stack = [n for n in nodes if n is not None]
             while stack:
                 sub = stack.pop()
-                if isinstance(sub, ast.Lambda):
-                    continue  # its body runs only when called
+                stack.extend(_evaluated_children(sub))
                 if isinstance(sub, (ast.Name, ast.Attribute)) and isinstance(sub.ctx, ast.Load):
-                    add(dotted(sub))
-                stack.extend(ast.iter_child_nodes(sub))
+                    loads.append(dotted(sub))
+            for text in loads:
+                add(text)
+            for name in definitely_bound(st):
+                forget(name)
+                known.add(name)
     return frozenset(known)
+
+
+def _evaluated_children(node) -> list:
+    """Children of node that certainly evaluate whenever node does (import-time lookups):
+    nothing inside lambdas or comprehensions (own scope; may run zero times), only the
+    test of `x if c else y`, only the first operand of `and`/`or`, and no annotations
+    (they may not be evaluated at all)."""
+    if isinstance(node, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return []
+    if isinstance(node, ast.IfExp):
+        return [node.test]
+    if isinstance(node, ast.BoolOp):
+        return node.values[:1]
+    if isinstance(node, ast.AnnAssign):
+        return [x for x in (node.target, node.value) if x is not None]
+    return list(ast.iter_child_nodes(node))
+
+
+def definitely_bound(stmt) -> tuple:
+    """Names a straight-line import-time statement certainly binds: assignment and import
+    targets, def/class names, walrus targets on certainly evaluated paths. Not `del`
+    targets, comprehension variables, or bindings inside lambdas or skipped branches."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return (stmt.name,)
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return tuple(dict.fromkeys((a.asname or a.name).split(".")[0] for a in stmt.names if a.name != "*"))
+    names = []
+    targets = []
+    if isinstance(stmt, ast.Assign):
+        targets = list(stmt.targets)
+    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)) and getattr(stmt, "value", None) is not None:
+        targets = [stmt.target]
+    for t in targets:
+        stack = [t]
+        while stack:
+            sub = stack.pop()
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                names.append(sub.id)
+            elif isinstance(sub, (ast.Tuple, ast.List)):
+                stack.extend(sub.elts)
+            elif isinstance(sub, ast.Starred):
+                stack.append(sub.value)
+    stack = [stmt]
+    while stack:
+        sub = stack.pop()
+        if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+            names.append(sub.target.id)
+        stack.extend(_evaluated_children(sub))
+    return tuple(dict.fromkeys(names))
 
 
 def same_outside_lambdas(a, b, changed: set) -> bool:
