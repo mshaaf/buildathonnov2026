@@ -111,7 +111,7 @@ class VerificationTests(unittest.TestCase):
             self.assertEqual(engine.plan({"example.py": (old, old.replace("1", "2"))})[0], "reimport")
 
     def test_partial_clean_batch_keeps_unreported_and_heavy_tests(self):
-        with patch.dict(selector.DUR, {0: 1, 1: 1, 2: 9000}, clear=True):
+        with patch.dict(selector.DUR, {0: 1, 1: 1, 2: 9000}, clear=True), patch.object(selector, "SETTLE_RATIO", 0):
             gen = selector.policy([0, 1, 2], selector.DUR, False)
             self.assertEqual(next(gen), ([0, 1], True))
             with self.assertRaises(StopIteration) as result:
@@ -132,15 +132,26 @@ class VerificationTests(unittest.TestCase):
                     gen.send(response)
                 self.assertEqual(done.exception.value, expected)
 
-    def test_settle_is_off_after_a_failure_by_default(self):
-        durations = {0: 1, 1: 3000, 2: 9000}
-        cpu = {0: 1, 1: 100, 2: 9000}
-        with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5):
-            gen = selector.policy([0, 1, 2], durations, False)
-            self.assertEqual(next(gen), ([0, 1], True))
-            with self.assertRaises(StopIteration) as done:
-                gen.send({0: "F"})
-            self.assertEqual(done.exception.value, {0, 1, 2})
+    def test_settle_after_a_failure(self):
+        durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
+        cpu = {0: 1, 1: 1, 2: 1500, 3: 9000}
+        classes = {0: "a", 1: "b", 2: "c", 3: "d"}
+        cases = [
+            # 2 runs, 1 failure: pass chance 1/2 x 2 s saved beats 0.5 x 1.5 s CPU (test 0's class is skipped)
+            (0, {1: "P", 0: "F"}, ([2], False), {2: "P"}, {0, 3}),
+            (0, {1: "F"}, None, None, {0, 1, 2, 3}),  # all runs failed: pass chance 1/3 does not pay
+        ]
+        for mult, first, ask, answer, expected in [(1.0,) + c[1:] for c in cases] + [(0, {1: "P", 0: "F"}, None, None, {0, 2, 3})]:
+            with self.subTest(mult=mult, first=first), patch.multiple(
+                    selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF=classes, FILE_OF=classes,
+                    SETTLE_RATIO=0.5, SETTLE_FAIL_MULT=mult):
+                gen = selector.policy([0, 1, 2, 3], durations, False)
+                self.assertEqual(next(gen), ([0, 1, 2], True))
+                with self.assertRaises(StopIteration) as done:
+                    got = gen.send(first)
+                    self.assertEqual(got, ask)
+                    gen.send(answer)
+                self.assertEqual(done.exception.value, expected)
 
     def test_a_batch_cut_for_time_prints_everything_unproven(self):
         durations = {0: 1, 1: 3000, 2: 9000}

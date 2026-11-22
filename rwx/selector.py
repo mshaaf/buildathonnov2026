@@ -830,10 +830,10 @@ def is_heavy(n) -> bool:
     return cpu > RUN_MAX_MS and cpu > RUN_GAIN * DUR[n]
 
 
-SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0"))  # assumed scorer CPU per estimated CPU ms; 0: off
+SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
-SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "0"))  # settle may also run tests this costly (e.g. generator_memory)
-SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "0"))  # ratio multiplier once something failed; 0: no settling then
+SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may also run tests this costly (e.g. generator_memory)
+SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
