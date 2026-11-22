@@ -434,9 +434,9 @@ Other things measured this round:
 | `e715cb2` (opt-merge-narrow, older) | 123.394 | 32.8 | 156.2 | no BET_CLEAN: clean commits verified instead of bet |
 | `132624f` (diag-blind-merge) | 2490.2 (8 misses) | 7.2 | diagnostic | observed failures only: 90.2 s + 8 of 16 live commits need more |
 
-Not yet scored (screen was locked, nobody could submit): `4acf4a6` (opt-merge-bet, current),
-`fb9f612` (opt-merge-bet2 = + REF_LINES, META_STATIC), `ca468a7` (opt-merge-bet-probe =
-bet2 + PROBE_MS 1000 / PROBE2_MS 2000), `8a119cc` (opt-merge-narrow = no BET_CLEAN).
+Scored since this section was written: `4acf4a6`, `fb9f612`, `e715cb2` (see section 15).
+Still not scored: `ca468a7` (opt-merge-bet-probe = bet2 + PROBE_MS 1000 / PROBE2_MS 2000),
+`8a119cc` (opt-merge-narrow = no BET_CLEAN).
 
 **What `opt` added to the team line**
 - Soundness: one-line lambdas/defs had no coverage (LINE events never fire on a code
@@ -485,9 +485,86 @@ about +0.25 s est CPU per commit.
   `test_lazy_load` is the common part (both have `RWX_LAZY_RUN`), so the stand-in and the
   TPC-DS budget saved nothing on practice. `diag-heavy` (28 s with 1 miss) is then mostly
   one commit that really needs its slow tests plus test_lazy_load. On the samples every
-  live commit with TPC-DS candidates really fails both TPC-DS tests. Slow tests are not
-  where the remaining practice cost is.
+  live commit with TPC-DS candidates really fails both TPC-DS tests. (Superseded by
+  section 15: one slow test, `test_execute_tpcds`, is about 21.5 s of the remaining
+  practice cost; `test_max_nodes` is not.)
 - Kernel time is 8% of CPU (copy-on-write after fork); gc in sessions makes no
   difference. The remaining cost is runnable tests printed unverified on live commits;
   running them costs more CPU than it saves (RESEARCH.md on the rwx line). Precision (the
   profiles) is the lever.
+
+## 15. Overnight board results (Nov 22) and the final-entry warning
+
+Practice board, 40 commits, 3 identical runs each. Format: simulated s / CPU s / misses.
+
+**WARNING: do not let `3b7f152` be the final entry.** It scored 109.6, so the site marks it
+"Entered in the final (your best score)". It is a diagnostic: it leaves `test_execute_tpcds`
+out whenever that test was not observed failing. On the 30 official samples it misses 2
+commits (`2jrq`, `3utz`, where the test really fails): 661.1 s with 2 misses. Before the
+cutoff, either a safe build must beat 130.5 on the board, or a safe entry must be picked by
+hand (`00762c6` at 130.5 or `4acf4a6` at 131.1). The site takes the best practice score
+unless another is chosen. Diagnostics are never final entries.
+
+### Safe candidates
+
+| Commit (branch) | Simulated | CPU | Misses | Score | Notes |
+|---|---|---|---|---|---|
+| `00762c6` (opt-merge-fast) | 123.394 | 7.1 | 0 | **130.5** | has `RWX_MAXNODES_PROXY=1`; best safe |
+| `d17c048` (opt-merge-bet, old) | 123.394 | 7.3 | 0 | 130.7 | merged line + BET_CLEAN, NARROW 1000, CHUNKS 0, FIXTURE_RUN, PRESETUP_CACHE, LAZY_RUN |
+| `e222881` (opt-merge-tv40) | 123.394 | 7.4 | 0 | 130.8 | `RWX_TPCDS_VERIFY_MS=40000 RWX_TPCDS_SETTLE=1`: no change on practice |
+| `4acf4a6` (opt-merge-bet) | 123.394 | 7.7 | 0 | 131.1 | same switches on newer opt-merge (pollution sentinels, multi-change comparison narrowing, fresh+shared profiles) |
+| `9168129` (exp-settle-deep) | 121.024 | 11.4 | 0 | 132.5 | `RWX_SETTLE_RATIO=0.1`, MAX_MS 9000: not worth it |
+| `fb9f612` (opt-merge-bet2) | 123.394 | 11.6 | 0 | 135.0 | + `RWX_REF_LINES`, `RWX_META_STATIC`: about 4 s CPU, saves nothing on practice; leave off |
+| `cdbef83` (fast-v2, rwx line) | 123.394 | 19.5 | 0 | 142.9 | stand-in changes nothing on practice |
+| `e715cb2` (no BET_CLEAN, older) | 123.394 | 32.8 | 0 | 156.2 | verifying instead of betting costs about 25 s CPU for the same simulated time |
+
+Every safe variant sits at 123.394 simulated except the deep-settle one. Differences
+between them are CPU only.
+
+### Diagnostics (never final)
+
+| Commit | Variant | Simulated | CPU | Misses | Result |
+|---|---|---|---|---|---|
+| `132624f` | blind: only observed failures printed on engine-run commits | 2490.231 | 7.2 | 8 | 90.2 s + 8 misses |
+| `8c2bacc` | heavy: unrun slow tests left out on engine-run commits | 397.708 | 10 | 1 | 97.7 s + 1 miss |
+| `3b7f152` (diag-heavy-merge) | `RWX_DIAG_MODE=heavy RWX_DIAG_HEAVY_IDS=test_execute_tpcds`: only unrun `test_execute_tpcds` left out | 101.94 | 7.7 | 0 | 109.6 (but 2 misses on samples, see warning) |
+
+### What the board says
+
+Exactly one kind of waste is left on practice, about 21.5 s (123.394 vs 101.94):
+`test_execute_tpcds` is printed unrun on some engine-run commit(s) where it passes, and the
+per-query check (`RWX_FIXTURE_RUN`, `RWX_TPCDS_VERIFY_MS`) does not apply there or does not
+clear it. Uncapped per-query verification (`e222881`) changed nothing, so the check is
+"not applicable" on those commits, not "too small a budget". The `test_max_nodes` stand-in
+(`00762c6`, `cdbef83`) also changes nothing on practice.
+
+### In progress (lead's session, not merged)
+
+An evidence rule for the "per-query check not applicable" case: run a cheap subset of
+TPC-DS queries in the session as a gate before leaving `test_execute_tpcds` out. It must
+keep TPC-DS on `2jrq` and `3utz` (samples) and be validated on the lab corpus before any
+submission.
+
+### What the `opt` work added (short; details in section 13)
+
+Coverage for one-line lambdas/defs (code-object map entries), runtime import check, robust
+patch parsing and file-level rules, comparison-site operand profiles (fresh + shared-process
+union, also multi-change patches), pollution sentinels (`RWX_PROFILE_SENTINEL`), settle
+step, progress watchdog, hard deadline. and/or profiles exist in the lab but are OFF:
+cross-test pollution on lab commit `boolx/b009` (a test that is not itself affected fails
+after an affected test ran in the same process).
+
+### Lab findings
+
+- `RWX_BET_CLEAN` misses 20 of 405 lab commits (synthetic mutants); 0 misses on the 70 real
+  practice + sample commits. `RWX_NARROW` misses 0.
+- The engine's truth runs wrongly mark `test_max_nodes` as failing in re-import sessions
+  (the child dies on the 1.5 GB test). Plain pytest passes it on 5 of 5 such commits. With
+  those corrected, the stand-in agrees with real outcomes on 84 lab commits.
+
+### Operations
+
+- Submissions: 4 per hour, shared by the whole team. Always paste the full commit hash.
+- Ali's session submits through a Codex agent driving the browser; it only works while the
+  Mac screen is unlocked.
+- Cutoff: Sunday 11:00 AM EST.
