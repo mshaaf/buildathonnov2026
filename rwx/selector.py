@@ -605,6 +605,21 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}))
 
 
+def checked_policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None):
+    """policy(), then a stand-in run for each slow test it would still print unrun
+    (rwx/proxies.py): a pass leaves the test out. The decision itself is unchanged."""
+    final = yield from policy(C, dur, data_only, focus, known)
+    if not STANDIN_TESTS or data_only:
+        return final
+    final = set(final)
+    pick = [n for n in sorted(final) if n in STANDIN_TESTS and not (known and n in known)
+            and _pack_cost(final) - _pack_cost(final - {n}) > STANDIN_TESTS[n]]
+    if not pick:
+        return final
+    res = yield pick, False
+    return final - {n for n in pick if res.get(n) == "P"}
+
+
 def fixture_policy(C: list[int], runnable: list[int]):
     """Fixture-only commit: run the loading class's tests on the edited queries; the
     other readers stay in unrun. A test that does not report a pass stays in."""
@@ -615,6 +630,8 @@ def fixture_policy(C: list[int], runnable: list[int]):
 FILE_OF: dict = {}
 NO_RUN: set = set()  # tests that start a fresh interpreter: the engine cannot patch it
 NO_RUN_IDS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
+STANDINS = os.environ.get("RWX_STANDINS") == "1"  # run cheap stand-ins for some slow tests
+STANDIN_TESTS: dict = {}  # test number -> stand-in CPU (ms)
 LAZY_RUN = os.environ.get("RWX_LAZY_RUN") == "1"  # run it anyway: the engine hooks `python -c`
 LAZY_RUN_MS = 400  # a fresh interpreter importing sqlglot, patched module compiled from source
 
@@ -754,7 +771,33 @@ NARROW_SAMEFILE = os.environ.get("RWX_NARROW_SAMEFILE") == "1"
 NARROW_CHUNK_MS = int(os.environ.get("RWX_NARROW_CHUNK_MS", "600"))  # experiment: off (cost more than it saved in the lab)
 
 
+TPCDS_VERIFY_RATIO = float(os.environ.get("RWX_TPCDS_VERIFY_RATIO", "3"))  # saving / CPU for the TPC-DS query check
+LIVE_HEAVY = os.environ.get("RWX_LIVE_HEAVY") == "1"
+LIVE_HEAVY_MS = int(os.environ.get("RWX_LIVE_HEAVY_MS", "4500"))  # slow tests cheap enough to run
+LIVE_HEAVY_RATIO = float(os.environ.get("RWX_LIVE_HEAVY_RATIO", "1.5"))  # saving / CPU needed
+
+
 def _live(C, rest, heavy, passed, failed):
+    """Decide a live commit, then run the slow tests still printed whose saving (if they
+    pass) clearly beats their CPU: a pass leaves them out."""
+    final = yield from _live_core(C, rest, heavy, passed, failed)
+    if not LIVE_HEAVY:
+        return final
+    final = set(final)
+    pick = []
+    for h in sorted((h for h in heavy if h in final and h not in NO_RUN), key=lambda h: (-DUR[h], h)):
+        cpu = CPU_EST.get(h, DUR[h]) + CLS_SETUP.get(CLS_OF.get(h), 0)
+        if cpu > LIVE_HEAVY_MS:
+            continue
+        if _pack_cost(final - set(pick)) - _pack_cost(final - set(pick) - {h}) >= LIVE_HEAVY_RATIO * cpu:
+            pick.append(h)
+    if not pick:
+        return final
+    res = yield pick, False
+    return final - {h for h in pick if res.get(h) == "P"}
+
+
+def _live_core(C, rest, heavy, passed, failed):
     """Something failed. Keep everything not proven passing, except slow tests that a
     narrow failure (few tests failing, none in the slow test's own file) cannot reach."""
     dur = DUR
@@ -855,7 +898,7 @@ class Scheduler:
                 if fixture:
                     gen = fixture_policy(C, fixture[1])
                 else:
-                    gen = policy(C, DUR, data_only, focus, known)
+                    gen = checked_policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -921,7 +964,7 @@ class Scheduler:
                     if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
                             and sess.alive and executor not in res and time.monotonic() < self.deadline):
                         cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
-                        if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
+                        if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= TPCDS_VERIFY_RATIO * cpu:
                             sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
                             a[4:] = [[executor], ("verify", e.value)]
                             continue
@@ -1040,6 +1083,13 @@ def main() -> None:
         valid |= 1 << n
     cmap = Map(MAP)
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
+    if STANDINS:
+        # slow tests the engine replaces with a cheap stand-in (rwx/proxies.py)
+        from proxies import STANDINS as _standins
+
+        for t in tests:
+            if t["id"] in _standins:
+                STANDIN_TESTS[t["number"]] = _standins[t["id"]][1]
     if LAZY_RUN:
         # the engine runs test_lazy_load's fresh interpreter on the patched tree
         for t in tests:

@@ -463,6 +463,7 @@ class Engine:
         os.dup2(devnull, 2)
         sys.stdout = sys.stderr = open(os.devnull, "w")
         sources = {f"{self.root}/{rel}": new for rel, (old, new) in py_changes.items()}
+        self.patched_files = set(py_changes) | set(data_changes)
         if sources and os.environ.get("RWX_LAZY_RUN") == "1":
             # `python -c` children (test_lazy_load) see the patched tree too
             import srchook
@@ -541,6 +542,10 @@ class Engine:
                 for meth in meths:
                     os.write(wfd, f"{ids[f'{mod}.{cls}.{meth}']} F\n".encode())
                 continue
+            if os.environ.get("RWX_STANDINS") == "1":
+                import proxies
+
+                proxies.install(klass, f"{mod.replace('.', '/')}.py::{cls}", meths, self.patched_files)
             suite = unittest.TestSuite([klass(meth) for meth in meths])
             result = StreamResult(wfd, ids)
             result.stop_first = stop_first
@@ -611,7 +616,7 @@ class Session:
             if case_indices is not None:
                 ms = engine.executor_profile["ms"]
                 case_ms = sum(ms[i] for i in case_indices)
-                if case_ms <= 5000:
+                if case_ms <= int(os.environ.get("RWX_TPCDS_VERIFY_MS", "5000")):
                     executor_indices = case_indices
                     self.executor_ms = case_ms
                     self.executor_partial = False

@@ -32,7 +32,7 @@ def engine_order(batch, tests):
 
 
 def replay(C, F, data_only, tests, est, focus=None, known=None):
-    gen = sel.policy(C, sel.DUR, data_only, focus, known)
+    gen = sel.checked_policy(C, sel.DUR, data_only, focus, known)
     cpu = 0
     sess = False
     try:
@@ -45,7 +45,7 @@ def replay(C, F, data_only, tests, est, focus=None, known=None):
             seen_cls = set()
             for n in engine_order(batch, tests):
                 res[n] = "F" if n in F else "P"
-                cpu += est(n)
+                cpu += sel.STANDIN_TESTS.get(n) or est(n)
                 c = sel.CLS_OF.get(n)
                 if c not in seen_cls:
                     seen_cls.add(c)
@@ -67,7 +67,12 @@ def main():
         sel.FILE_OF.update({t["number"]: t["file"] for t in tests})
         sel.CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
         sel.NO_RUN.update(t["number"] for t in tests if t["id"] in sel.NO_RUN_IDS)
-        est = lambda n: CALIB.get(n, dur[n])  # noqa: E731
+        calib = dict(CALIB)
+        if sel.STANDINS:
+            from proxies import STANDINS
+            sel.STANDIN_TESTS.clear()
+            sel.STANDIN_TESTS.update({t["number"]: STANDINS[t["id"]][1] for t in tests if t["id"] in STANDINS})
+        est = lambda n: calib.get(n, dur[n])  # noqa: E731
         sel.CPU_EST.clear(); sel.CPU_EST.update({n: est(n) for n in dur})
         valid = 0
         for n in dur:
