@@ -53,6 +53,7 @@ def setup_tests(tests):
     sel.DUR.clear(); sel.DUR.update(dur)
     sel.FILE_OF.clear(); sel.FILE_OF.update({t["number"]: t["file"] for t in tests})
     sel.CLS_OF.clear(); sel.CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
+    sel.FRESH_PROCESS.clear(); sel.FRESH_PROCESS.update(t["number"] for t in tests if t["id"] in sel.NO_RUN_IDS)
     sel.NO_RUN.clear()
     if not getattr(sel, "LAZY_RUN", False):
         sel.NO_RUN.update(t["number"] for t in tests if t["id"] in sel.NO_RUN_IDS)
@@ -92,13 +93,14 @@ def exec_info(eng, py, data, case_site):
         return mode, None, None
     ms = eng.executor_profile["ms"]
     case_ms = sum(ms[i] for i in idx)
-    if case_ms <= 5000:
+    import engine as _eng
+    if case_ms <= _eng.TPCDS_VERIFY_MS:
         return mode, case_ms, False
     return mode, None, None  # RWX_TPCDS_SAMPLE_MS=0: no partial gate
 
 
-def replay(C, F, data_only, focus, known, cost, info, exec_n):
-    gen = sel.policy(C, sel.DUR, data_only, focus, known)
+def replay(C, F, data_only, focus, known, cost, info, exec_n, dropped=None):
+    gen = sel.policy(C, sel.DUR, data_only, focus, known, *([dropped] if dropped else []))
     cpu, ran, batches = 0, set(), 0
     mode, exec_ms, partial = info
     try:
@@ -126,12 +128,14 @@ def replay(C, F, data_only, focus, known, cost, info, exec_n):
     note = ""
     if batches and exec_n is not None and exec_ms is not None and exec_n not in ran:
         ecpu = exec_ms + sel.CLS_SETUP.get(EXEC_CLS, 0)
-        if exec_n in out and not partial and sel._pack_cost(out) - sel._pack_cost(out - {exec_n}) >= 3 * ecpu:
+        saving = sel._pack_cost(out) - sel._pack_cost(out - {exec_n})
+        if exec_n in out and not partial and (saving >= 3 * ecpu or (sel.TPCDS_SETTLE and sel.SETTLE_RATIO > 0
+                                                                  and sel.SETTLE_RATIO * ecpu < saving)):
             cpu += ecpu
             note = "verify"
             if exec_n not in F:
                 out.discard(exec_n)
-        elif exec_n in C and exec_n not in out:
+        elif exec_n in C and exec_n not in out and exec_ms <= sel.TPCDS_GATE_MS:
             cpu += ecpu
             note = "gate"
             if exec_n in F:
@@ -222,7 +226,16 @@ def main():
             if getattr(sel, "FIXTURE_RUN", False) and data_only and data and set(data) <= set(getattr(an, "fixture_runs", {})):
                 fixture_eligible[0] += 1  # the engine's per-query fixture run is not modelled: printed as static
             deferred = getattr(an, "deferred", 0) & valid
-            out, cpu, ran, note, batches = replay(C, F, data_only, focus, known, cost, info, exec_n)
+            dropped = None
+            if getattr(sel, "PROFILE_SENTINEL", False) and C and not data_only and getattr(an, "profile_dropped", 0) & valid:
+                dropped = sorted(n for n in dur if (an.profile_dropped & valid) >> n & 1)
+            sel.SENTINEL_CLEARED.discard(sel.commit_key(C))
+            out, cpu, ran, note, batches = replay(C, F, data_only, focus, known, cost, info, exec_n, dropped)
+            if dropped and sel.commit_key(C) not in sel.SENTINEL_CLEARED:
+                out |= set(dropped)
+                note += f" +{len(dropped)} profile-dropped"
+            elif dropped:
+                note += f" sentinels ok ({len(dropped)} dropped)"
             if deferred:
                 # main adds the importers unless the session showed the patched modules import;
                 # in a truth record an import failure shows as every candidate failing

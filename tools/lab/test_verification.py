@@ -348,6 +348,67 @@ class VerificationTests(unittest.TestCase):
                     gen.send({10: "P"})
                 self.assertEqual(done.exception.value, {9})
 
+    def _sentinel_env(self):
+        durations = {n: 10 for n in range(6)}
+        classes = {0: "A", 1: "A", 2: "A", 3: "B", 4: "B", 5: "C"}
+        files = {0: "f", 1: "f", 2: "f", 3: "f", 4: "f", 5: "g"}
+        return durations, patch.multiple(selector, DUR=durations, CPU_EST=durations, CLS_SETUP={}, CLS_OF=classes,
+                                         FILE_OF=files, SETTLE_RATIO=0, SENTINEL_CLEARED=set(), PROFILE_SENTINEL=True)
+
+    def test_sentinels_pass_keep_the_profile_drop(self):
+        durations, env = self._sentinel_env()
+        with env:
+            gen = selector.policy([0, 1], durations, False, None, None, [2, 3, 4, 5])
+            self.assertEqual(next(gen), ([0, 1], True))
+            batch, stop = gen.send({0: "P", 1: "P"})
+            self.assertEqual((batch[:3], stop), ([2, 3, 4], True))  # same class first, then same file
+            with self.assertRaises(StopIteration) as done:
+                gen.send({n: "P" for n in batch})
+            self.assertEqual(done.exception.value, set())
+            self.assertIn(selector.commit_key([0, 1]), selector.SENTINEL_CLEARED)
+
+    def test_sentinel_failure_puts_the_dropped_tests_back(self):
+        durations, env = self._sentinel_env()
+        with env:
+            gen = selector.policy([0, 1], durations, False, None, None, [2, 3, 4, 5])
+            next(gen)
+            batch, _ = gen.send({0: "P", 1: "P"})
+            with self.assertRaises(StopIteration) as done:
+                gen.send({2: "P", 3: "F"})  # stop at the first failure: 4, 5 unreported
+            self.assertEqual(done.exception.value, {3, 4, 5})
+            self.assertNotIn(selector.commit_key([0, 1]), selector.SENTINEL_CLEARED)
+
+    def test_sentinels_after_a_dead_session_leave_the_commit_uncleared(self):
+        durations, env = self._sentinel_env()
+        with env:
+            gen = selector.policy([0, 1], durations, False, None, None, [2, 3, 4, 5])
+            next(gen)
+            gen.send({0: "P", 1: "P"})
+            self.assertEqual(selector._drain(gen), {2, 3, 4, 5})  # nothing reported: all unproven
+            self.assertNotIn(selector.commit_key([0, 1]), selector.SENTINEL_CLEARED)
+
+    def test_no_sentinels_without_a_profile_drop_or_infected_tests(self):
+        durations, env = self._sentinel_env()
+        with env:
+            gen = selector.policy([], durations, False, None, None, [2, 3])
+            with self.assertRaises(StopIteration) as done:
+                next(gen)
+            self.assertEqual(done.exception.value, set())  # N empty: nothing infected, R stays dropped
+            gen = selector.policy([0, 1], durations, False)
+            next(gen)
+            with self.assertRaises(StopIteration) as done:
+                gen.send({0: "P", 1: "P"})
+            self.assertEqual(done.exception.value, set())
+
+    def test_no_sentinels_when_only_fresh_interpreter_tests_are_infected(self):
+        durations, env = self._sentinel_env()
+        with env, patch.object(selector, "NO_RUN", {0}):
+            gen = selector.policy([0], durations, False, None, None, [2, 3])
+            with self.assertRaises(StopIteration) as done:
+                next(gen)
+            self.assertEqual(done.exception.value, {0})
+            self.assertIn(selector.commit_key([0]), selector.SENTINEL_CLEARED)
+
     def test_settle_after_a_failure(self):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 1500, 3: 9000}
@@ -614,6 +675,16 @@ class RobustnessTests(unittest.TestCase):
             # anything besides the one operator: no narrowing
             (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b").replace("return 1", "return 2"))
             self.assertEqual(mask & 0b1111, 0b1111, why)
+            # two flips in one file: union of both sites' distinguishing tests
+            (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b").replace("a is b", "a == b"))
+            self.assertEqual(mask, 0b1101, why)
+            # a flip plus a comment-only file: the comment contributes nothing
+            analyzer = selector.Analyzer(fmap, 0xFF)
+            other = "X = 1\n"
+            text = _diff("sqlglot/m.py", old, old.replace("a < b", "a <= b")) + _diff("sqlglot/n.py", other, "# c\n" + other)
+            with patch.object(analyzer, "old_source", side_effect=lambda rel: old if rel.endswith("m.py") else other):
+                mask, why = analyzer.analyze(text)
+            self.assertEqual(mask, 0b1100, why)
         with patch.object(selector, "CMP_PROFILE", False):
             (mask, why), an = self.analyze(fmap, "sqlglot/m.py", old, old.replace("a < b", "a <= b"))
             self.assertEqual(mask, 0b1111, why)
