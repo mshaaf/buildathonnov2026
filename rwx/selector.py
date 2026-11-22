@@ -2025,6 +2025,9 @@ def _live_evidence(C, rest, heavy, passed, failed):
 # its old 5 s bound so a larger verify cap does not add CPU to clean commits.
 TPCDS_SETTLE = os.environ.get("RWX_TPCDS_SETTLE", "0") == "1"
 TPCDS_BLIND = int(os.environ.get("RWX_TPCDS_BLIND_MS", "0")) > 0  # evidence gate when the affected queries are unknown
+# The evidence gate never clears TPC-DS when another test of its file was seen failing
+# (lab s1/m41010113: cheap queries pass, 11 other executor tests and TPC-DS fail).
+TPCDS_BLIND_GUARD = os.environ.get("RWX_TPCDS_BLIND_GUARD", "1") == "1"
 
 
 TPCDS_GATE_MS = int(os.environ.get("RWX_TPCDS_GATE_MS", "5000"))
@@ -2278,6 +2281,8 @@ class Scheduler:
                     except StopIteration as e:
                         if (TPCDS_BLIND and executor in e.value and sess.executor_ms is not None
                                 and sess.executor_partial
+                                and not (TPCDS_BLIND_GUARD and any(
+                                    FILE_OF.get(n) == FILE_OF.get(executor) for n in OBSERVED.get(cid, ())))
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             # Bet with evidence: the cheapest TPC-DS queries run on the patched
                             # tree; a pass leaves the full test out.
@@ -2297,6 +2302,7 @@ class Scheduler:
                                 continue
                         if (executor is not None and executor in C and executor not in e.value
                                 and sess.executor_ms is not None and sess.executor_ms <= TPCDS_GATE_MS
+                                and not (TPCDS_BLIND and sess.executor_partial)
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
