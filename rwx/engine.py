@@ -177,6 +177,42 @@ class PatchedFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 # ------------------------------------------------------------------ test running
 
 
+# Class fixtures kept alive for the whole session once set up: later batches of the
+# same session reuse them instead of paying setUpClass again (about 1.5 s for
+# TestExecutor, which a re-import session would otherwise repeat per batch). This is
+# what the parent's shared setup already does for swap sessions, and what pytest does
+# within one run: one setUpClass for all of a class's tests.
+SESSION_FIXTURES = ("tests/test_executor.py::TestExecutor",)
+
+
+def _class_ref(cls) -> str:
+    return f"{cls.__module__.replace('.', '/')}.py::{cls.__qualname__}"
+
+
+class _SessionSuite(unittest.TestSuite):
+    ready: set = set()  # classes whose setUpClass succeeded in this process
+
+    def _handleClassSetUp(self, test, result):
+        cls = test.__class__
+        if cls in self.ready:
+            if getattr(result, "_previousTestClass", None) is not cls:
+                try:
+                    cls._classSetupFailed = False
+                except TypeError:
+                    pass
+            return
+        super()._handleClassSetUp(test, result)
+        if (_class_ref(cls) in SESSION_FIXTURES and not getattr(cls, "_classSetupFailed", False)
+                and not getattr(result, "_moduleSetUpFailed", False)
+                and not getattr(cls, "__unittest_skip__", False)):
+            self.ready.add(cls)
+
+    def _tearDownPreviousClass(self, test, result):
+        if getattr(result, "_previousTestClass", None) in self.ready:
+            return  # keep it set up for the session's later batches
+        super()._tearDownPreviousClass(test, result)
+
+
 class _StopTest(Exception):
     """Raised from addSubTest to end a test at its first failing subtest."""
 
@@ -516,10 +552,10 @@ class Engine:
                 for meth in meths:
                     os.write(wfd, f"{ids[f'{mod}.{cls}.{meth}']} F\n".encode())
                 continue
-            suite = unittest.TestSuite([klass(meth) for meth in meths])
+            suite = _SessionSuite([klass(meth) for meth in meths])
             result = StreamResult(wfd, ids)
             result.stop_first = stop_first
-            unittest.TestSuite([suite]).run(result)
+            _SessionSuite([suite]).run(result)
             if result.fixture_error:
                 # unittest reports setup/teardown errors against a synthetic
                 # holder. A teardown error can arrive after a passing result.
