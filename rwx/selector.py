@@ -1734,6 +1734,25 @@ def main() -> None:
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)
             for cid, final_set, note in sched.run(jobs):
                 results[cid] = (final_set, note)
+            calib = int(os.environ.get("RWX_CALIB_MS", "0"))
+            if calib:
+                # DIAGNOSTIC ONLY: run a fixed, known workload on the unpatched tree so the
+                # board's CPU delta against the same commit without it gives real CPU per
+                # estimated ms. Selections are already final at this point.
+                import resource
+
+                pick: list = []
+                for n in sorted(dur):
+                    if n % 2 == 0 and n not in NO_RUN and not is_heavy(n):
+                        pick.append(n)
+                        if batch_cost(pick) >= calib:
+                            break
+                r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                res, info = eng.run({}, {}, pick, timeout=150)
+                r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+                used = (r1.ru_utime + r1.ru_stime) - (r0.ru_utime + r0.ru_stime)
+                log(f"calibration: {len(pick)} tests, est {batch_cost(pick)} ms, cpu {used:.2f} s, "
+                    f"failing {sum(st != 'P' for st in res.values())}, {info}")
         except Exception as e:  # engine trouble: fall back to the static sets
             log(f"engine failed: {e!r}")
     total = 0
