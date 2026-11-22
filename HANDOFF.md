@@ -344,7 +344,7 @@ tests still have to be printed); stand-ins for the giants (tiny gain).
 
 ## 12. Where things stand (Nov 22, ~03:45 UTC) and how to keep going
 
-**Board:** our best is **144.8** (`d44ba30`, branch `bet-narrow`), about 43rd. The leader
+**Board:** our best is **141.0** (`2ac5328`, branch `bet-narrow-mid-fx`). The leader
 is at 103. The board keeps the best submission automatically.
 
 **Branches that matter** (always paste the full hash on the submit form; an empty box
@@ -355,7 +355,7 @@ scores the newest commit on `main`, which is old):
 | `rwx` | latest | development line, all flags off by default |
 | `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
 | `bet-narrow-mid` | `bec9335` | **141.8**: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
-| `bet-narrow-mid-fx` | `2ac5328` | bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0` |
+| `bet-narrow-mid-fx` | `2ac5328` | **141.0 (current best)**: bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0`. Practice: 125.762 s simulated (unchanged: no practice fixture commit benefits), CPU 15.09 / 15.19 / 15.42 |
 | `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
 | `diag-*` | | diagnostics only, never pick these |
 
