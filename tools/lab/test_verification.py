@@ -118,6 +118,48 @@ def _hang_engine():
     return engine
 
 
+class Slow(unittest.TestCase):  # probe_* methods: not collected by unittest.main()
+    def probe_slow(self):
+        import time
+
+        time.sleep(0.4)
+
+    def probe_quick(self):
+        pass
+
+
+class HeavyGateTests(unittest.TestCase):
+    def test_giant_batches_never_overlap(self):
+        import time
+
+        engine = _hang_engine()
+        engine.tests = {0: {"id": f"{__name__}.py::Slow::probe_slow"}, 1: {"id": f"{__name__}.py::Slow::probe_quick"}}
+        events = []
+
+        def fake_policy(C, dur, data_only, focus=None, known=None):
+            res = yield [1], True
+            res = yield [0], False
+            events.append(("done", time.monotonic()))
+            return set()
+
+        sched = selector.Scheduler(engine, lanes=2, deadline=time.monotonic() + 60)
+        real_send = sched._send
+
+        def send(sess, nums, stop_first):
+            if nums == [0]:
+                events.append(("start", time.monotonic()))
+            real_send(sess, nums, stop_first)
+
+        sched._send = send
+        jobs = [(c, [0, 1], {}, {}, False, {}, set(), None) for c in ("a", "b")]
+        with patch.object(selector, "policy", fake_policy), patch.object(selector, "HEAVY_BATCH", {0}), \
+                patch.multiple(selector, DUR={0: 400, 1: 1}, CPU_EST={0: 400, 1: 1}, CLS_OF={0: "Slow", 1: "Slow"},
+                               CLS_SETUP={}):
+            out = list(sched.run(jobs))
+        self.assertEqual(sorted(o[0] for o in out), ["a", "b"])
+        self.assertEqual([e[0] for e in sorted(events, key=lambda e: e[1])], ["start", "done", "start", "done"])
+
+
 class WatchdogTests(unittest.TestCase):
     def _run(self, stop_first):
         import engine as engine_module
