@@ -1430,8 +1430,9 @@ class Scheduler:
                     finished = False
                     if sess in ready:
                         finished = sess.read()
-                    if sess.import_ok is not None and cid not in IMPORT_OK:
-                        IMPORT_OK[cid] = sess.import_ok
+                    import_ok = getattr(sess, "import_ok", None)
+                    if import_ok is not None and cid not in IMPORT_OK:
+                        IMPORT_OK[cid] = import_ok
                     if not finished and sess.expired():
                         log(f"{cid}: batch timed out after {len(sess.results)}/{len(batch)} tests")
                         sess.kill()
