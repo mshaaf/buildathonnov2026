@@ -166,7 +166,7 @@ def locate_hunks(old_text: str, hunks: list[Hunk]) -> list[Hunk]:
         block = _old_block(h)
         start = (h.old_start - 1 if h.old_len > 0 else h.old_start) + shift
         if not block:
-            out.append(h if not shift else Hunk(h.old_start + shift, h.old_len, h.new_start, h.new_len, h.lines))
+            out.append(h if not shift else Hunk(h.old_start + shift, h.old_len, h.new_start + shift, h.new_len, h.lines))
             continue
         if not _matches(old_lines, start, block):
             found = [i for i in range(floor, len(old_lines) - len(block) + 1) if _matches(old_lines, i, block)]
