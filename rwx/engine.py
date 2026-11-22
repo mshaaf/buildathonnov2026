@@ -263,6 +263,11 @@ class StreamResult(unittest.TestResult):
     def _num(self, test):
         return self.ids.get(test.id())
 
+    def _exc_info_to_string(self, err, test):
+        # A failure only needs to be known, not explained: unittest would format the
+        # full traceback (source lines, chained exceptions) for every failing test.
+        return ""
+
     def startTest(self, test):
         super().startTest(test)
         self.cur_bad = False
@@ -561,6 +566,13 @@ class Engine:
         difflib.ndiff = lambda *a, **k: iter(())
         difflib.unified_diff = lambda *a, **k: iter(())
         difflib.context_diff = lambda *a, **k: iter(())
+        # ... nor the reprs/pprints unittest's assert methods put into messages before
+        # raising (only unittest.case's own names: sqlglot's messages are untouched).
+        import unittest.case as _case
+
+        _case.safe_repr = lambda obj, short=False: "?"
+        _case._common_shorten_repr = lambda *args: ("?",) * len(args)
+        _case.pprint = types.SimpleNamespace(pformat=lambda *a, **k: "")
         if data_changes:
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
         elif (
