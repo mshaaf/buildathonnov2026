@@ -1451,7 +1451,10 @@ def _live_evidence(C, rest, heavy, passed, failed):
 HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
 # Progress watchdog: a batch is hung when no result line arrived for max(WATCH_MIN_S,
 # WATCH_FACTOR x (estimate of the test running now + its class setup)); a fresh child
-# first gets WATCH_STARTUP_S for patching and its import check. Only the running test
+# first gets max(4 s, 8 x estimated start-up) for patching and its import check; silence
+# past that in a re-import session is an import-time hang, reported as an import
+# failure (every test that loads a changed module fails, as pytest would report the
+# importers of a module whose import never returns). Only the running test
 # counts as failing; the batch's later tests continue in a fresh session of the same
 # commit, at most WATCH_RESTARTS times per commit (never for a child silent from start).
 WATCH_FACTOR = 8.0
@@ -1516,6 +1519,18 @@ class Scheduler:
             sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first)
         else:
             sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first, windows=windows)
+
+    def _import_hang(self, cid, py):
+        """The patched tree never finished importing: every importer of a changed module fails."""
+        mask = 0
+        try:
+            for rel in py:
+                mask |= CMAP[0].file_mask(rel) if CMAP else 0
+        except Exception as e:  # noqa: BLE001
+            log(f"{cid}: importer mask failed {e!r}"[:200])
+        IMPORT_OK[cid] = False
+        DEFERRED[cid] = DEFERRED.get(cid, 0) | mask
+        log(f"{cid}: no import check line: import-time hang, {mask.bit_count()} importers fail")
 
     def _restart(self, a) -> bool:
         """Replace a hung (killed) session by a fresh one of the same commit, if allowed."""
@@ -1620,6 +1635,8 @@ class Scheduler:
                             sess.kill()
                             sess.close()
                             ctx["hung"] = progressed  # a child silent from the start would hang again
+                            if not progressed and getattr(sess, "mode", None) == "reimport" and ctx["py"]:
+                                self._import_hang(cid, ctx["py"])
                             log(f"{cid}: test {hung} hung after {len(hung_res) - 1} results, {len(rest)} left in the batch")
                             if rest:
                                 if self._restart(a):
@@ -1748,6 +1765,7 @@ def _drain(gen, first=None):
 DUR: dict = {}
 DEFERRED: dict = {}  # commit -> importers mask needed unless its session imported the patch cleanly
 IMPORT_OK: dict = {}  # commit -> the session's import check result (True/False)
+CMAP: list = []  # [the Map], for importer masks found at run time
 LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
@@ -1857,6 +1875,7 @@ def main() -> None:
         valid |= 1 << n
     try:
         cmap = Map(MAP)
+        CMAP[:] = [cmap]
     except Exception as e:  # no map: every commit selects every test, statically
         log(f"map failed: {e!r}")
         for patch in list_patches(DATA / "commits"):

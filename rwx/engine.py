@@ -35,7 +35,10 @@ from pathlib import Path
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
 WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
-WATCH_STARTUP_S = 10.0  # ... and for the child's first line (patching, re-import, import check)
+# ... and for the child's first line ("M", after patching, re-import and the import
+# check): WATCH_FACTOR x the estimated start-up, which is about 1 s for a re-import.
+STARTUP_EST_S = {"reimport": 1.0, "swap": 0.1}
+WATCH_STARTUP_FACTOR = 8.0
 
 
 class InlinePool:
@@ -747,6 +750,7 @@ class Session:
         self.windows: dict | None = None  # test -> seconds it may run without a result line
         self.mark = 0.0  # last progress: batch submitted or a line arrived
         self.progressed = False  # any line ever arrived from this child (the first is "M")
+        self.startup_window = max(WATCH_MIN_S, WATCH_STARTUP_FACTOR * STARTUP_EST_S.get(self.mode, 1.0))
         self.pid = pid
         self.cmd = cmd_w
         self.res = res_r
@@ -817,7 +821,7 @@ class Session:
         if self.windows is None or self._deadline is None:
             return self._deadline
         if not self.progressed:
-            return self.mark + WATCH_STARTUP_S
+            return self.mark + self.startup_window
         nxt = self.next_unreported()
         return self.mark + (self.windows.get(nxt, WATCH_MIN_S) if nxt is not None else WATCH_MIN_S)
 
