@@ -573,17 +573,13 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (10:51 EST):** two builds have scored with 101.94 simulated and 0 misses and
-differ only in the probe sizes on the ENV line:
-- **C14, BB-4B2DCD7C, `b52a7d580eea70793b01776946f72b866cb9e778` (branch `opt-c14`), 111.2**
-  (small 150/250 ms probes on one-token mutations). Marked "Entered in the final" at 10:38.
-- **C13, BB-72B1475C, `0751d97e2e294430a08060ecc155b7e017d4b45e` (branch `opt-c13`), 116.7**
-  (1000/2000 ms probes on every commit; lab misses 14 instead of 24 over 483 commits).
-  The lead session and an independent agent recommend C13 for the final (about 8 s of certain
-  cost on 60 commits against a lower chance of a 300 s miss); Ali decides which one stays
-  picked. Whichever of these two is marked at 11:00 is intended.
-Never pick: `3b7f152` (109.6, blind diagnostic, misses 2 of 30 samples) or `6507ffd` (C11,
-130.8, gate blocked). The yellow "not your best score" warning refers to the 109.6.
+**FINAL ENTRY (10:51 EST, confirmed from the page): BB-72B1475C, commit
+`0751d97e2e294430a08060ecc155b7e017d4b45e` (C13, branch `opt-c13`), 116.7 s = 101.94 simulated +
+14.7 to 14.9 CPU, 0 misses.** Picked by hand by Ali; the page shows "Entered in the final (your
+pick)". Leave it. The yellow "not your best score" warning is expected (the 109.6 is the blind
+diagnostic `3b7f152`, never to be picked). Runner-up, same code with small probes on one-token
+mutations: BB-4B2DCD7C, `b52a7d5` (C14), 111.2. A mid-probe variant C15 `a599108` (branch
+`opt-c15`, 400/800 ms) was built and sample-checked but deliberately not submitted.
 
 ### What the gate is
 
