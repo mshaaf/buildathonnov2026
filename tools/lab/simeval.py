@@ -134,14 +134,22 @@ def replay(C, F, data_only, focus, known, cost, info, exec_n):
 def load_truth(L):
     if os.path.exists(f"{L}/answers.json"):
         return {c: (set(v["failing"]), {}, False) for c, v in json.load(open(f"{L}/answers.json"))["commits"].items()}
-    truth = {}
+    last = {}
     for f in sorted(glob.glob(f"{L}/truth.*.jsonl")):
         for line in open(f):
             r = json.loads(line)
-            if (r.get("timeout") or r.get("crash")) and os.environ.get("KEEP_UNRELIABLE") != "1":
-                continue  # unreported tests were marked failing: not ground truth
-            truth[r["commit"]] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()},
-                                  bool(r.get("timeout") or r.get("crash")))
+            last[r["commit"]] = r  # a re-run ("redo") is appended later: the last record wins
+    truth = {}
+    for cid, r in last.items():
+        bad = bool(r.get("timeout") or r.get("crash"))
+        if bad and os.environ.get("KEEP_UNRELIABLE") != "1":
+            continue  # unreported tests were marked failing: not ground truth
+        truth[cid] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()}, bad)
+    if os.path.exists(f"{L}/pytest.jsonl"):  # real-pytest failing sets override the engine's
+        for line in open(f"{L}/pytest.jsonl"):
+            r = json.loads(line)
+            if "fail" in r and r["commit"] in truth:
+                truth[r["commit"]] = (set(r["fail"]),) + truth[r["commit"]][1:]
     return truth
 
 
