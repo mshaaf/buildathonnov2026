@@ -322,3 +322,22 @@ tests still have to be printed); stand-ins for the giants (tiny gain).
   workflow) now measures CPU with `getrusage` when cgroup `cpu.stat` is absent, and finds
   its marker even when duckdb's leak report (no trailing newline) precedes it. The
   selector now exits with `os._exit`, so that leak report no longer appears.
+
+## 11. Practice results with the real generator (Nov 22)
+
+| Commit (branch) | Simulated | CPU | Board | What it adds |
+|---|---|---|---|---|
+| `53171bc` (bet-clean) | 151.3 | 8.4 | 159.8 | treat a commit as clean after both probes pass |
+| `e539940` (bet) | 151.3 | 9.4 | 160.7 | + TPC fixture refinement (practice has none), finish affordable verification first |
+| **`d44ba30` (bet-narrow)** | **129.7** | **14.6** | **144.8** | + on live commits, finish verifying and leave out giants when failures are narrow and none in the giant's file |
+
+0 misses on every run. **Final pick: `d44ba302dc5cbd9bdea4a5708aeb62bec802ad7c`.**
+
+- Practice decomposition (diagnostic branches, bet version): live commits 16 / 91.4 s,
+  static commits 13 / 57.5 s, everything else 11 / 2.4 s. The narrow rule then cut the live
+  part by 21.6 s.
+- The bets hold on the real generator (samples + practice) but not on my synthetic lab or
+  Astra's: real mutations tend to break broadly or not at all. Samples are the arbiter.
+- Rejected on evidence: live bet (5 sample misses), skipping mid-weight tests under the
+  narrow rule (6 new lab misses for 23 s), lowering the bet's finishing threshold (brings
+  back Astra's miss).

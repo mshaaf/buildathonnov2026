@@ -527,6 +527,7 @@ FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
 BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"
+BET_FINISH_FRAC = float(os.environ.get("RWX_BET_FINISH_FRAC", "1.0"))  # bet: finish verifying only when this cheap
 LIVE_FINISH = os.environ.get("RWX_LIVE_FINISH", "1") == "1"  # sound: finish verifying live commits when cheaper
 BET_LIVE = os.environ.get("RWX_BET_LIVE") == "1"  # experiment: drop unverified candidates on live commits  # experiment: clean after two passing probes
 FINAL_FRAC = float(os.environ.get("RWX_FINAL_FRAC", "1.0"))  # share of the possible saving the final clean-proof may spend
@@ -662,7 +663,7 @@ def _probe_then_decide(C, rest, heavy, dur, focus):
         mandatory = set(heavy) & NO_RUN
         remaining = [n for n in rest if n not in passed]
         savings = _pack_cost(set(C) - passed) - _pack_cost(mandatory)
-        if remaining and batch_cost(remaining) <= FINAL_FRAC * savings:
+        if remaining and batch_cost(remaining) <= BET_FINISH_FRAC * savings:
             final = yield remaining, True
             failed3 = {n for n, st in final.items() if st == "F"}
             clean = {n for n, st in final.items() if st == "P"}
