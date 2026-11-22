@@ -1459,10 +1459,6 @@ HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this 
 # commit, at most WATCH_RESTARTS times per commit (never for a child silent from start).
 WATCH_FACTOR = 8.0
 WATCH_RESTARTS = 2
-# Tests settle may run alone as a "giant" batch ([g], False). test_max_nodes peaks near
-# 1.8 GB, so two such batches must never run at once in the 4 GB container: a giant
-# batch waits until no other lane runs one. Filled by the policy flag; empty = no gate.
-HEAVY_BATCH: set = set()
 
 
 class Scheduler:
@@ -1497,29 +1493,8 @@ class Scheduler:
         """Send a policy batch to the commit's session under the progress watchdog."""
         a[6]["stop_first"] = stop_first
         a[6]["carry"] = {}
-        a[6]["heavy"] = _is_heavy(nums)
         a[4] = nums
         self._send(a[3], nums, stop_first)
-
-    def _heavy_running(self, active, me) -> bool:
-        return any(o is not me and o[6].get("heavy") and not o[6].get("held") for o in active)
-
-    def _release_held(self, active):
-        """Start held giant batches whose turn has come, or settle them if out of time."""
-        for a in list(active):
-            ctx = a[6]
-            if not ctx.get("held"):
-                continue
-            nxt, stop_first = ctx["held"]
-            if time.monotonic() + batch_cost(nxt) / 1000 > self.deadline:
-                ctx["held"] = None
-                final = _drain(a[2])
-                a[3].close()
-                active.remove(a)
-                yield a[0], final if final is not None else set(a[1]), "cut: no time for the held giant batch"
-            elif not self._heavy_running(active, a):
-                ctx["held"] = None
-                self._submit(a, nxt, stop_first)
 
     def _send(self, sess, nums, stop_first):
         windows = self._windows(nums, sess)
@@ -1560,8 +1535,7 @@ class Scheduler:
         unproven (reported passes still count)."""
         cid, C, gen, sess, batch, selected = a[:6]
         carry = a[6].get("carry", {}) if len(a) > 6 else {}
-        held = len(a) > 6 and a[6].get("held")
-        partial = {} if held else {n: st for n, st in {**carry, **getattr(sess, "results", {})}.items() if st == "P"}
+        partial = {n: st for n, st in {**carry, **getattr(sess, "results", {})}.items() if st == "P"}
         try:
             sess.kill()
             sess.close()
@@ -1613,13 +1587,9 @@ class Scheduler:
                     yield self._abandon(a)
                     active.remove(a)
                 continue
-            yield from self._release_held(active)
-            running = [a for a in active if not a[6].get("held")]
-            if not running:
-                continue
-            timeout = max(0.05, min(min(a[3].deadline for a in running), hard) - time.monotonic())
-            ready, _, _ = _sel.select([a[3] for a in running], [], [], timeout)
-            for a in running:
+            timeout = max(0.05, min(min(a[3].deadline for a in active), hard) - time.monotonic())
+            ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
+            for a in list(active):
                 try:
                     cid, C, gen, sess, batch, selected = a[:6]
                     ctx = a[6]
@@ -1706,11 +1676,6 @@ class Scheduler:
                             active.remove(a)
                             yield cid, final if final is not None else set(C), "cut: no time for the next batch"
                             continue
-                        if _is_heavy(nxt) and self._heavy_running(active, a):
-                            ctx["held"] = (nxt, stop_first)  # wait for the other lane's giant
-                            ctx["heavy"] = True
-                            a[4] = nxt
-                            continue
                         self._submit(a, nxt, stop_first)
                     except StopIteration as e:
                         if (executor in e.value and sess.executor_ms is not None and not sess.executor_partial
@@ -1719,7 +1684,6 @@ class Scheduler:
                             if _pack_cost(e.value) - _pack_cost(e.value - {executor}) >= 3 * cpu:
                                 sess.submit([executor], timeout=2.0 + 2.0 * cpu / 1000, executor_only=True)
                                 ctx["carry"] = {}
-                                ctx["heavy"] = False
                                 a[4], a[5] = [executor], ("verify", e.value)
                                 continue
                         if (executor is not None and executor in C and executor not in e.value
@@ -1728,7 +1692,6 @@ class Scheduler:
                             cpu = sess.executor_ms + CLS_SETUP.get(CLS_OF.get(executor), 0)
                             sess.submit([executor], timeout=10.0 + 3.0 * cpu / 1000, executor_only=True)
                             ctx["carry"] = {}
-                            ctx["heavy"] = False
                             a[4], a[5] = [executor], ("gate", e.value)
                             continue
                         sess.close()
@@ -1764,10 +1727,6 @@ def _dump_cpu(cid, sess):
                                 "startup": sess.startup_cpu, "tests": sess.cpu}) + "\n")
     except Exception as e:  # noqa: BLE001
         log(f"cpu dump failed {e!r}")
-
-
-def _is_heavy(nums) -> bool:
-    return len(nums) == 1 and nums[0] in HEAVY_BATCH
 
 
 def _drain(gen, first=None):
