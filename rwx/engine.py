@@ -19,6 +19,7 @@ import builtins
 import gc
 import importlib
 import importlib.abc
+import importlib.machinery
 import importlib.util
 import io
 import json
@@ -101,6 +102,10 @@ def _sig(code):
         if isinstance(c, types.CodeType)
         else ("<firstlineno>",)
         if body and type(c) is int and c == code.co_firstlineno
+        # A frozenset's repr follows its hash/insertion order, which differs between a
+        # .pyc-loaded and a freshly compiled copy of the same source: compare contents.
+        else ("frozenset", tuple(sorted(map(repr, c))))
+        if type(c) is frozenset
         else (type(c).__name__, repr(c))
         for c in code.co_consts
     )
@@ -119,13 +124,37 @@ def _sig(code):
     )
 
 
+_OLD_CODES: dict = {}  # path -> (source, code) of pinned sources compiled once
+NEW_CODES: dict = {}  # path -> (source, code) of the patched sources the last plan compiled
+
+
+def _pinned_code(path: str, src: str):
+    """Code object of a pinned source: from its build-time .pyc when that matches the
+    file and the file matches src (same code compile() makes), else compiled. Cached."""
+    hit = _OLD_CODES.get(path)
+    if hit is not None and hit[0] == src:
+        return hit[1]
+    code = None
+    try:
+        loader = importlib.machinery.SourceFileLoader("_rwx_pinned", path)
+        if importlib.util.decode_source(loader.get_data(path)) == src:
+            code = loader.get_code("_rwx_pinned")
+    except Exception:  # noqa: BLE001
+        code = None
+    if code is None:
+        code = compile(src, path, "exec", dont_inherit=True)
+    _OLD_CODES[path] = (src, code)
+    return code
+
+
 def diff_codes(path: str, old_src: str, new_src: str):
     """Returns (changed list of (old_code, new_code), body_changed: bool) or None if unpairable."""
     try:
-        old_root = compile(old_src, path, "exec", dont_inherit=True)
+        old_root = _pinned_code(path, old_src)
         new_root = compile(new_src, path, "exec", dont_inherit=True)
     except SyntaxError:
         return None
+    NEW_CODES[path] = (new_src, new_root)
     body_changed = _sig(old_root) != _sig(new_root)
     old = _walk_codes(old_root, {})
     new = _walk_codes(new_root, {})
@@ -169,7 +198,9 @@ class PatchedFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
     def exec_module(self, module):
         path = module.__spec__.origin
-        code = compile(self.by_path[path], path, "exec", dont_inherit=True)
+        src = self.by_path[path]
+        hit = NEW_CODES.get(path)  # compiled by the parent's plan() before the fork
+        code = hit[1] if hit is not None and hit[0] is src else compile(src, path, "exec", dont_inherit=True)
         module.__file__ = path
         exec(code, module.__dict__)
 
@@ -290,6 +321,7 @@ class Engine:
         # the collector ignores frozen objects.
         gc.collect()
         gc.freeze()
+        gc.enable()  # main() runs start-up with the collector off; children get it on
 
     def _warm(self, mods, presetup=()):
         mon = sys.monitoring
@@ -670,6 +702,7 @@ class Session:
         self.deadline = None
         self.crash = None
         self.total_cpu = 0.0
+        self.maxrss_mb = 0.0
 
     def fileno(self):
         return self.res
@@ -728,6 +761,7 @@ class Session:
             try:
                 _, _, ru = os.wait4(self.pid, 0)
                 self.total_cpu = ru.ru_utime + ru.ru_stime
+                self.maxrss_mb = ru.ru_maxrss / (2**20 if sys.platform == "darwin" else 2**10)
             except ChildProcessError:
                 pass
 

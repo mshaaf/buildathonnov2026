@@ -33,7 +33,62 @@ class BrokenTeardown(unittest.TestCase):
         pass
 
 
+class SharedSetup(unittest.TestCase):
+    calls: list = []
+
+    @classmethod
+    def setUpClass(cls):
+        cls.calls.append("setup")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.calls.append("teardown")
+
+    def probe(self):
+        pass
+
+    def probe2(self):
+        pass
+
+
 class VerificationTests(unittest.TestCase):
+    def test_session_fixture_is_set_up_once_per_session(self):
+        import engine as engine_module
+
+        engine = Engine.__new__(Engine)
+        engine.tests = {i: {"id": f"{__name__}.py::SharedSetup::{m}"} for i, m in enumerate(("probe", "probe2"))}
+        for shared, expected in ((False, ["setup", "teardown"] * 2), (True, ["setup"])):
+            with self.subTest(shared=shared):
+                SharedSetup.calls = []
+                ref = f"{__name__.replace('.', '/')}.py::SharedSetup"
+                with patch.object(engine_module, "SESSION_FIXTURES", (ref,) if shared else ()), \
+                        patch.object(engine_module._SessionSuite, "ready", set()):
+                    fd = os.open(os.devnull, os.O_WRONLY)
+                    try:
+                        engine._run_tests([0], fd)
+                        engine._run_tests([1], fd)
+                    finally:
+                        os.close(fd)
+                self.assertEqual(SharedSetup.calls, expected)
+
+    def test_pinned_code_matches_compile_and_frozensets_compare_by_content(self):
+        import tempfile
+        import engine as engine_module
+
+        src = "def f(x):\n    return x in {'a', 'b', 'c'}\n"
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "m.py")
+            with open(path, "w") as f:
+                f.write(src)
+            code = engine_module._pinned_code(path, src)
+            self.assertIs(engine_module._pinned_code(path, src), code)
+        fresh = compile(src, path, "exec", dont_inherit=True)
+        self.assertEqual(engine_module._sig(code.co_consts[0]), engine_module._sig(fresh.co_consts[0]))
+        reordered = compile(src.replace("'a', 'b', 'c'", "'c', 'a', 'b'"), path, "exec", dont_inherit=True)
+        self.assertEqual(engine_module._sig(reordered.co_consts[0]), engine_module._sig(fresh.co_consts[0]))
+        other = compile(src.replace("'c'", "'d'"), path, "exec", dont_inherit=True)
+        self.assertNotEqual(engine_module._sig(other.co_consts[0]), engine_module._sig(fresh.co_consts[0]))
+
     def test_unused_and_repeated_fixtures(self):
         calls = []
 
