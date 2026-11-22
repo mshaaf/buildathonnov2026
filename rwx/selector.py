@@ -7,6 +7,7 @@ Logs go to stderr.
 from __future__ import annotations
 
 import ast
+import gc
 import json
 import os
 import pickle
@@ -738,7 +739,7 @@ class Scheduler:
                         continue
                     sess.close()
                     active.remove(a)
-                    yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
+                    yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s rss {sess.maxrss_mb:.0f}MB batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
                 except GeneratorExit:
                     gen.close()
                     sess.close()
@@ -797,6 +798,9 @@ def batch_timeout(batch) -> float:
 
 def main() -> None:
     t0 = time.monotonic()
+    # Start-up allocates mostly long-lived objects (map, trees, warm-up modules): the
+    # collector would only rescan them. Engine re-enables it after gc.freeze().
+    gc.disable()
     out = os.fdopen(os.dup(1), "w")
     os.dup2(2, 1)  # anything else printing to stdout goes to stderr
     sys.stdout = sys.stderr
