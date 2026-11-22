@@ -912,9 +912,12 @@ class Analyzer:
         for fp in files:
             if not fp.path and (fp.hunks or fp.binary):
                 return self.all, ["patch entry without a path -> ALL"]
+        blind = 0  # tests reached through changes no session applies (file-level, config)
         for fp in files:
             if fp.binary or fp.created or fp.deleted or fp.copy or fp.old_path != fp.new_path:
-                mask |= self.file_level(fp, why)
+                fm = self.file_level(fp, why)
+                blind |= fm
+                mask |= fm
                 continue
             rel = fp.path
             if not rel:
@@ -922,7 +925,9 @@ class Analyzer:
             if rel.endswith(".py"):
                 mask |= self.python_file(fp, rel, why, single_file=len(files) == 1)
             elif _is_config(rel):
-                mask |= self.other_file(fp, rel, why)  # e.g. tests/pytest.ini: config, not a fixture
+                fm = self.other_file(fp, rel, why)  # e.g. tests/pytest.ini: config, not a fixture
+                blind |= fm
+                mask |= fm
             elif rel.startswith("tests/"):
                 old = self.old_source(rel)
                 if old is None:
@@ -953,7 +958,19 @@ class Analyzer:
                     why.append(f"data {rel} -> {fm.bit_count()}")
                 mask |= fm
             else:
-                mask |= self.other_file(fp, rel, why)
+                fm = self.other_file(fp, rel, why)
+                blind |= fm
+                mask |= fm
+        if blind or self.unverifiable:
+            # A session applies only the in-place .py and fixture edits: the rest of the tree
+            # would be in its old state there, so tests reached through these changes could
+            # pass and be dropped. Such commits are not narrowed at all: static set.
+            if self.py_changes or self.data_changes:
+                why.append("engine cannot apply every change -> static")
+            mask |= self.deferred | self.profile_dropped
+            self.py_changes, self.data_changes, self.fixture_runs = {}, {}, {}
+            self.deferred = self.profile_dropped = 0
+            self.case_site, self.case_sites = None, {}
         if self.unverifiable:
             self.py_changes = {}  # nothing the engine runs could stand in for the real import
         if not self.py_changes:
