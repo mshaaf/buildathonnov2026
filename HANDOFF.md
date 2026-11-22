@@ -573,11 +573,13 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (09:55 EST):** the page marks BB-1BF787EF, `f3c6e42` (C3, 116.1) as "Entered in
-the final". **Recommended re-pick: BB-4199A4AB, `8192e1c2bae666200e1a273ecf15cb282e422415`
-(C7, branch `opt-c7`, 111.5, 0 misses)**: all review fixes, fast settings on the edit kinds
-seen in practice, strict settings on every other kind. Details in the 09:55 update below.
-Re-pick only a build that has scored on the board with 0 misses.
+**FINAL ENTRY (10:12 EST):** the page marks BB-1BF787EF, `f3c6e42` (C3, 116.1) as "Entered in
+the final (your pick)" and warns it is not our best score. **Interim recommendation: re-pick
+BB-4199A4AB, `8192e1c` (C7, 111.5).** **Intended final: C10
+`4ab0a81a244120bc747b4c255eb4d98269dea542` (branch `opt-c10`)**, once it has scored with 0
+misses (submitting at 10:25). Lock the pick by 10:50; nothing new after that.
+PLEASE do not use a submission slot before 10:50 without checking with Ali: the four slots
+at 10:25, 10:33, 10:40 and 10:45 are the last ones.
 
 ### What the gate is
 
@@ -757,3 +759,28 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
 - Fallbacks, all scored with 0 misses: C3 `f3c6e42` 116.1 (large probes everywhere, no review
   fixes), `343cf5a` 113.3 (gate only). C6 `185b7c7` (C3 + all review fixes) is validated
   locally but not scored.
+
+### Update 10:12 EST
+
+- mshaaf's BB-93C65337 (`f7ed5a1`, branch `opt-gate-ng-exp`) scored 111.2 = 101.94 + 9.2 to
+  9.3 CPU: `343cf5a` + build-time duckdb answers for the TPC-DS gate (`rwx/tpcds_expected.py`,
+  `RWX_TPCDS_EXPECTED=1`). Reviewed: sound (the test still transpiles with the patched code;
+  the recorded frame is used only when the duckdb SQL string is identical). It saves about
+  2.1 s of board CPU per gate run at the 1500 ms budget. It does not have the review fixes or
+  the per-kind probes.
+- A second agent reviewed the per-kind code: threading correct, classifier never raises, but
+  it ignored statement structure (a re-indented or moved statement counted as familiar).
+  Fixed in **C9 `f98d3cb` (branch `opt-c9`)**: NEWLINE/INDENT/DEDENT tokens count; equal token
+  lists are unfamiliar; classification is lazy (only commits that reach the probe step or
+  the gate tokenize their files; `sqlglot/parser.py` costs about 0.1 s natively). C9 output
+  equals C8 (= C7 + guard on unfamiliar kinds) on samples, all seven corpora and `odd`.
+- **C10 `4ab0a81` (branch `opt-c10`, pushed) = C9 + mshaaf's `f7ed5a1`**, gate budget 500 ms.
+  Contents: TPC-DS evidence gate with build-time duckdb answers; per-query manifest fix; and/or
+  profiles; all eight review fixes; per-kind probes (small for one-token mutations, strict for
+  everything else) with the reviewer's patch; gate guard on unfamiliar kinds. Validation:
+  samples byte-identical to C9 (94.581 s, 0 misses; 2jrq and 3utz keep TPC-DS); real selector
+  output identical to C9 on s1, s2, s3, multi, multix, cmpx, boolx and the 81 odd patches; no
+  time-guard hits; native session CPU on the lab 189.6 s against 223.7 s for C9.
+  Expected on practice: about 110.4.
+- A fresh agent is profiling the final build for output-identical CPU cuts (report 10:32);
+  anything from it goes in only if trivially safe.
