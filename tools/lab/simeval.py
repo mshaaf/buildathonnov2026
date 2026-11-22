@@ -162,6 +162,7 @@ def load_truth(L):
 
 def main():
     rows, drops = [], {}
+    unknown_drops = [0]
     skipped = [0]
     any_engine = False
     for L in sys.argv[1:]:
@@ -208,7 +209,10 @@ def main():
             any_engine |= bool(cpu)
             # tests the truth run skipped have no known outcome: always printed, never dropped
             forced = (skipped_t & set(C)) - out
-            if forced:
+            if forced and os.environ.get("SKIPPED_MODE") == "policy":
+                unknown_drops[0] += len(forced)  # left out by the policy; truth has no outcome
+                note += f" dropped {len(forced)} unknown-outcome"
+            elif forced:
                 out |= forced
                 note += f" +{len(forced)} unknown-outcome"
             sim = sel._pack_cost(out)
@@ -224,6 +228,8 @@ def main():
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
+    if unknown_drops[0]:
+        print(f"unknown-outcome tests left out by the policy (SKIPPED_MODE=policy): {unknown_drops[0]}")
     print(f"records skipped (current candidates not a subset of the truth run's): {skipped[0]}")
 
 
