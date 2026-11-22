@@ -1449,11 +1449,11 @@ PROXY_OF: dict = {}  # slow test number -> number of its stand-in (filled by mai
 
 
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
-           dropped=None, proxy_ok: bool = True):
+           dropped=None, proxy_ok: bool = True, cid=None):
     """The settled policy, then (RWX_MAXNODES_PROXY) a stand-in run for a slow test that is
     still printed unrun: when the scaled-down copy of the test passes on the patched tree,
     the slow test is left out. Evidence, not proof (like the other bets)."""
-    final = yield from _policy_settled(C, dur, data_only, focus, known, dropped)
+    final = yield from _policy_settled(C, dur, data_only, focus, known, dropped, cid)
     if not (MAXNODES_PROXY and proxy_ok and PROXY_OF) or data_only:
         return final
     final = set(final)
@@ -1468,7 +1468,7 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
 
 
 def _policy_settled(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
-                    dropped=None):
+                    dropped=None, cid=None):
     """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
     runnable tests whose estimated CPU is worth less than the worker time they add."""
     gen = _policy(C, dur, data_only, focus, known)
@@ -1482,7 +1482,7 @@ def _policy_settled(C: list[int], dur: dict, data_only: bool, focus: dict | None
     except StopIteration as e:
         final = set(e.value)
     if dropped and C and not data_only and PROFILE_SENTINEL:
-        final = yield from _sentinels(C, final, seen, set(dropped), focus or {})
+        final = yield from _sentinels(C, final, seen, set(dropped), focus or {}, cid)
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
     left_out = {g for g in C if g not in final and g not in seen and is_heavy(g)}
@@ -1626,10 +1626,10 @@ SENTINEL_CLEARED: set = set()  # commit keys whose sentinels all passed
 FRESH_PROCESS: set = set()  # tests that run their checks in a fresh interpreter (test_lazy_load)
 
 
-def _sentinels(C, final, seen, R, focus):
+def _sentinels(C, final, seen, R, focus, cid=None):
     if all(n in NO_RUN or n in FRESH_PROCESS for n in C):
         # the only infected tests start their own interpreter: nothing in this process is touched
-        SENTINEL_CLEARED.add(commit_key(C))
+        SENTINEL_CLEARED.add(("cid", cid) if cid is not None else commit_key(C))
         return final
     seen = dict(seen)
     infected_unrun = [n for n in C if n not in seen and not is_heavy(n)]
@@ -1658,7 +1658,7 @@ def _sentinels(C, final, seen, R, focus):
         return final | R
     res = yield picks, True
     if all(res.get(n) == "P" for n in picks):
-        SENTINEL_CLEARED.add(commit_key(C))
+        SENTINEL_CLEARED.add(("cid", cid) if cid is not None else commit_key(C))
         return final
     return final | (R - {n for n in picks if res.get(n) == "P"})
 
@@ -2220,7 +2220,7 @@ class Scheduler:
                     kw = {}
                     if MAXNODES_PROXY and any(rel.startswith("tests/") for rel in (py or ())):
                         kw["proxy_ok"] = False  # the patch edits test code: the stand-in copies the pinned test
-                    gen = policy(C, DUR, data_only, focus, known, *extra, **kw)
+                    gen = policy(C, DUR, data_only, focus, known, *extra, cid=cid, **kw)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -2713,7 +2713,7 @@ def main() -> None:
                 n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
             note = "diagnostic (heavy): unrun slow tests left out"
         dropped = job[9] if len(job) > 9 else None
-        if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
+        if dropped and C and ("cid", cid) not in SENTINEL_CLEARED:
             # profile-dropped candidates whose sentinels did not all pass (or never ran)
             final_set = set(final_set) | set(dropped)
             note += f"; +{len(dropped)} profile-dropped (sentinels not passed)"
