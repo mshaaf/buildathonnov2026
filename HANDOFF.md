@@ -573,10 +573,10 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY, still open at 09:10 EST:** the page still marks `3b7f152` (109.6, the blind
-diagnostic, 2 misses on the 30 samples) as "Entered in the final". Someone has to click
-"Pick as our final entry" on a safe build. Best safe candidate right now: **BB-A0EE91C1,
-`343cf5a1c8044a1d6c6ff463822e1a4815cfe200`, branch `opt-gate-ng`, 113.3**.
+**FINAL ENTRY (09:30 EST):** the page now marks **BB-A0EE91C1, `343cf5a` (113.3)** as
+"Entered in the final", picked by hand; the blind 109.6 diagnostic is no longer the entry.
+A better-protected build is being prepared (see the 09:30 update below); re-pick only a
+build that has scored on the board with 0 misses.
 
 ### What the gate is
 
@@ -678,3 +678,36 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
 - Note for local runs on zsh: `env $FLAGS cmd` does not split `$FLAGS`; use bash
   (`blast-lab/scratch-lead/srun.sh`, `e2e/e2e.sh`). Ali's session's first sample checks this
   morning ran with default flags because of this and were redone.
+
+### Update 09:30 EST
+
+- Board: **C3 `f3c6e42` (branch `opt-c3`) scored 116.1** = 101.94 simulated + 14.1 to 14.3
+  CPU, 0 misses. C3 = `343cf5a` + probes 1000/2000 + 500 ms gate + `RWX_BOOL_PROFILE=1` +
+  the per-query manifest fix (`executor_cases.py` records PY_START; a code object missing
+  from the manifest is "unknown", not "no queries"). Its image build works on the scorer.
+  The larger probes cost about 4.5 s of board CPU on practice (the samples suggested 1 s).
+- Lab, real selector over 483 commits (misses): `343cf5a` settings 28; C1 (probes + 500 ms
+  gate) 18; C2/C3 (+ and/or profiles) 14; no miss involves TPC-DS; C3 output equals C2 on
+  every corpus.
+- `RWX_BET_FINISH_FRAC=2` (agent measurement): lab misses 18 -> 6, all 13 clean-bet misses
+  gone; left are 4 where the truth run disagrees with our session, 1 narrow rule, 1 slow test
+  dropped after a full clean run. Samples byte-identical; native CPU +4 s, all on `4d63`.
+  **C4 `2dc87c2` (branch `opt-c4`) = C3 + that setting, submitted at 9:32** to get its
+  real practice cost.
+- Cloud code review of `343cf5a` against `main` came back with 10 findings. Two are the
+  known bets (unguarded gate, clean bet). The rest are being fixed on top of C3, each fix
+  only ever selecting more tests:
+  - done on `opt-fix-a` (local, agent): commits with a change no session applies (deleted /
+    renamed / binary file, config, unverifiable encoding) mixed with an in-place edit now get
+    the static set instead of engine narrowing on a tree that still has the old file;
+    `pytest.toml`, `.pytest.toml` and every config name under `tests/` count as pytest
+    config (ALL); `locate_hunks` shifts `new_start` for a pure insertion after a relocated
+    hunk; profile sentinels are cleared per commit id, not per candidate set. Samples and
+    s1, s3, multi, odd outputs unchanged.
+  - in progress on `opt-fix-b` (local, agent): import-time safety analysis (`known_lookups`
+    counts comprehension variables, `del` targets and not-taken branches as bound; `_hashable`
+    accepts any name as a dict key; `stmt_safe` ignores unpacking arity) and comparison
+    profiles (nothing recorded when the original operator raised, so no narrowing for flips
+    from an ordering/membership operator to another family).
+- Plan: C5 = C3 + both fix sets, validated on samples + corpora, into the 9:40/9:44 slots
+  (held for it); 10:25 onward are spare.
