@@ -58,6 +58,25 @@ def build_fixture_attrs(src_root):
     return attrs, {k: sorted(v) for k, v in expected_codes.items()}
 
 
+def build_line_loaded(src_root):
+    """.sql fixtures read with load_sql_fixtures (where '#' lines are prepended to the next
+    statement, unlike the pair loader). None if any call's argument is not a constant."""
+    import ast
+
+    out = set()
+    for d, _, fs in os.walk(os.path.join(src_root, "tests")):
+        for f in fs:
+            if f.endswith(".py"):
+                for n in ast.walk(ast.parse(open(os.path.join(d, f)).read())):
+                    if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", "")) == "load_sql_fixtures":
+                        if not (n.args and isinstance(n.args[0], ast.Constant)):
+                            if f != "helpers.py":
+                                return None
+                            continue
+                        out.add("tests/fixtures/" + n.args[0].value)
+    return sorted(out)
+
+
 def build_refs(src_root):
     """Static index of where names and Class.attr pairs are referenced, per code object."""
     import ast
@@ -214,6 +233,8 @@ def main():
         print(f"arg_missing pairs {len(missing)}", file=sys.stderr)
     if src_root:
         payload["fixture_attrs"], payload["expected_codes"] = build_fixture_attrs(src_root)
+        payload["line_loaded"] = build_line_loaded(src_root)
+        print(f"line-loaded fixtures {payload['line_loaded']}", file=sys.stderr)
         reads_path = os.path.join(os.path.dirname(cov_dir.rstrip("/")), "attr_reads.json")
         if os.path.exists(reads_path):
             # attribute -> tests that really read it (tools/lab/attrrun.py)

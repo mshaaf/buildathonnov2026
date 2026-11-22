@@ -40,6 +40,7 @@ class Map:
         self.arg_missing: dict = d.get("arg_missing", {})
         self.fixture_attrs: dict = d.get("fixture_attrs", {})
         self.attr_reads: dict = d.get("attr_reads", {})
+        self.line_loaded = d.get("line_loaded")  # None: unknown, title rule off
         self.expected_codes: dict = d.get("expected_codes", {})
         self.cpu_ms: dict = d.get("cpu_ms", {})
         self.cls_setup_ms: dict = d.get("cls_setup_ms", {})
@@ -395,7 +396,21 @@ class Analyzer:
                 old = self.old_source(rel)
                 if old is None:
                     raise ValueError(f"missing base fixture: {rel}")
-                self.data_changes[rel] = apply_hunks(old, fp.hunks)
+                new_text = apply_hunks(old, fp.hunks)
+                if (FIXTURE_COMMENTS and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
+                        and _filter_comments(old) == _filter_comments(new_text)):
+                    # .sql fixtures are only read through tests/helpers, which drop empty
+                    # lines and "--" comments first: nothing a test sees has changed.
+                    why.append(f"{rel}: only comments/blank lines changed -> nothing")
+                    continue
+                if (FIXTURE_COMMENTS and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
+                        and self.map.line_loaded is not None and rel not in self.map.line_loaded):
+                    # Pair-loaded fixtures: '# title:' only names a subtest.
+                    po, pn = _load_pairs(old), _load_pairs(new_text)
+                    if po is not None and pn is not None and _strip_titles(po) == _strip_titles(pn):
+                        why.append(f"{rel}: only fixture titles changed -> nothing")
+                        continue
+                self.data_changes[rel] = new_text
                 m = self.map.opens.get(rel)
                 fm = self.map.masks[m] if m is not None else 0
                 fm = self.refine_fixture(rel, old, self.data_changes[rel], fm, why)
@@ -427,6 +442,15 @@ def flipped_bool(stmt, before, after):
     if line[:value.col_offset] + flipped + line[value.end_col_offset:] == after.encode():
         return targets[0].id
     return None
+
+
+def _filter_comments(s):
+    """tests/helpers._filter_comments, the first step of both fixture loaders."""
+    return "\n".join([line for line in s.splitlines() if line and not line.startswith("--")])
+
+
+def _strip_titles(pairs):
+    return [(tuple(kv for kv in meta if kv[0] != "title"), sql, exp) for meta, sql, exp in pairs]
 
 
 def _load_pairs(text):
@@ -524,6 +548,7 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
+FIXTURE_COMMENTS = os.environ.get("RWX_FIXTURE_COMMENTS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
 BET_CLEAN = os.environ.get("RWX_BET_CLEAN") == "1"
