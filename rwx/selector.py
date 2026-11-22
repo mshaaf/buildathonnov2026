@@ -1085,7 +1085,80 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
             rel = [n for n in rest if FILE_OF.get(n) == FILE_OF.get(g)]
             if not rel or not all(n in allpass for n in rel):
                 final.add(g)
+    if SETTLE_GIANT_MS > 0:
+        final = yield from _settle_giants(C, final, seen | settled, known)
     return final
+
+
+# Giants in settle (RWX_SETTLE_GIANT_MS > 0, default off): run a printed slow test (est CPU
+# above SETTLE_MAX_MS, at most SETTLE_GIANT_MS) when ratio x CPU < pass chance x the worker
+# time it adds. Never a bet: the test runs. The guards only avoid spending CPU on a giant that
+# probably fails: no failure seen in its own test file, at most BET_BREADTH of runs failed.
+SETTLE_GIANT_MS = int(os.environ.get("RWX_SETTLE_GIANT_MS", "0"))
+SETTLE_GIANT_BUDGET_MS = int(os.environ.get("RWX_SETTLE_GIANT_BUDGET_MS", "110000"))  # per batch (~3 giants)
+HEAVY_BATCH: set = set()  # test numbers settle may run as a giant batch (the scheduler may serialize these)
+GIANT_GRANT: dict = {}  # commit key -> est ms of giant runs granted (set by main, in job order)
+EXEC_VERIFIABLE: set = set()  # commit keys whose TPC-DS the scheduler checks per query (cheaper)
+EXECUTOR_TEST = [None]
+
+
+def commit_key(C) -> tuple:
+    return (len(C), hash(tuple(sorted(C))))
+
+
+def giant_candidates(C) -> list:
+    return [g for g in C if g not in NO_RUN and SETTLE_MAX_MS < batch_cost([g]) <= SETTLE_GIANT_MS]
+
+
+def grant_giants(job_sets) -> None:
+    """Split the giant budget in job order by each commit's potential giant runs, before any
+    run, so no commit's decisions depend on scheduling order."""
+    left = SETTLE_GIANT_BUDGET_MS
+    for C in job_sets:
+        need = sum(batch_cost([g]) for g in giant_candidates(C))
+        if not need:
+            continue
+        grant = min(need, left)
+        GIANT_GRANT[commit_key(C)] = grant
+        left -= grant
+
+
+def _settle_giants(C, final, seen, known):
+    key = commit_key(C)
+    allowance = GIANT_GRANT.get(key, float("inf") if not GIANT_GRANT else 0)
+    while True:
+        nfail = sum(st != "P" for st in seen.values())
+        if nfail > BET_BREADTH * max(1, len(seen)):
+            return final
+        keep = 1 - (nfail + 1) / (len(seen) + 2) if nfail else 1.0
+        bad_files = {FILE_OF.get(n) for n, st in seen.items() if st != "P"}
+        eligible = []
+        for g in giant_candidates(C):
+            if g not in final or g in seen or g in (known or ()) or FILE_OF.get(g) in bad_files:
+                continue
+            if g == EXECUTOR_TEST[0] and key in EXEC_VERIFIABLE:
+                continue  # the per-query TPC-DS check after the policy is cheaper
+            eligible.append(g)
+        # Worker time is not additive (one giant can hide another): value whole subsets.
+        best = None
+        base = _pack_lb(final)
+        for mask in range(1, 1 << len(eligible)):
+            group = [g for i, g in enumerate(eligible) if mask >> i & 1]
+            cost = sum(batch_cost([g]) for g in group)
+            if cost > allowance:
+                continue
+            value = keep ** len(group) * (base - _pack_lb(final - set(group))) - SETTLE_RATIO * cost
+            if value > 0 and (best is None or value > best[0]):
+                g = min(group, key=lambda n: (batch_cost([n]), n))
+                best = (value, g, batch_cost([g]))
+        if best is None:
+            return final
+        _, g, cost = best
+        allowance -= cost
+        res = yield [g], False
+        seen = seen | {g: res.get(g, "F")}
+        if res.get(g) == "P":
+            final = final - {g}
 
 
 SETTLE_CHUNK_MS = int(os.environ.get("RWX_SETTLE_CHUNK_MS", "2000"))  # first settle batch size (est), doubling
@@ -1546,6 +1619,8 @@ class Scheduler:
                     continue
                 try:
                     sess = self.engine.session(py, data, case_site)
+                    if getattr(sess, "executor_ms", None) is not None and getattr(sess, "executor_partial", True) is False:
+                        EXEC_VERIFIABLE.add(commit_key(C))
                     a = [cid, C, gen, sess, batch, None,
                          {"py": py, "data": data, "site": case_site, "restarts": 0, "hung": False}]
                     self._submit(a, batch, stop_first)
@@ -1870,6 +1945,9 @@ def main() -> None:
             log(f"{cid}: job error {e!r} -> ALL")
             jobs.append((cid, sorted(dur), {}, {}, True, {}, set(), None))
     set_settle_scale(len(jobs), [C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
+    if SETTLE_GIANT_MS > 0:
+        grant_giants([C for _, C, _, _, data_only, *_ in jobs if C and not data_only])
+        HEAVY_BATCH.update(n for n in dur if n not in NO_RUN and SETTLE_MAX_MS < batch_cost([n]) <= SETTLE_GIANT_MS)
     need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
     results = {}
     if need_engine:
@@ -1887,6 +1965,7 @@ def main() -> None:
                          needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:
                 CLS_SETUP[exec_cls] = 0
+            EXECUTOR_TEST[0] = eng.executor_test
             log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
             budget = min(140.0, 3.2 * len(jobs) + 10)
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)

@@ -162,6 +162,7 @@ def load_truth(L):
 
 def main():
     rows, drops = [], {}
+    giant_stats = {}
     unknown_drops = [0]
     skipped = [0]
     any_engine = False
@@ -181,10 +182,17 @@ def main():
             if an.py_changes and m & valid:
                 verifiable.append([n for n in dur if m >> n & 1])
         sel.set_settle_scale(len(truth), verifiable)
+        sel.GIANT_GRANT.clear()
+        if sel.SETTLE_GIANT_MS > 0:
+            sel.grant_giants(verifiable)
+        sel.EXECUTOR_TEST[0] = exec_n
         for cid, (F, tcpu, unreliable, tcand, skipped_t) in sorted(truth.items()):
             mask, why = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             C = [n for n in dur if mask >> n & 1]
             if not covered(C, tcand):
+                skipped[0] += 1
+                continue
+            if os.environ.get("SKIPPED_MODE") == "exclude" and skipped_t & set(C):
                 skipped[0] += 1
                 continue
             py, data = dict(an.py_changes), dict(an.data_changes)
@@ -196,6 +204,9 @@ def main():
                     known |= {n for n in C if M.masks[mid] >> n & 1}
             focus = sel.commit_focus(M, C, py)
             info = exec_info(eng, py, data, an.case_site) if (eng and py) else ("swap", None, None)
+            sel.EXEC_VERIFIABLE.discard(sel.commit_key(C))
+            if info[1] is not None and info[2] is False:
+                sel.EXEC_VERIFIABLE.add(sel.commit_key(C))
             cost = (lambda n: tcpu.get(n, sel.CPU_EST[n])) if CPU_SRC == "truth" else (lambda n: sel.CPU_EST[n])
             deferred = getattr(an, "deferred", 0) & valid
             out, cpu, ran, note, batches = replay(C, F, data_only, focus, known, cost, info, exec_n)
@@ -208,7 +219,7 @@ def main():
                     note += " +importers"
             any_engine |= bool(cpu)
             # tests the truth run skipped have no known outcome: always printed, never dropped
-            forced = (skipped_t & set(C)) - out
+            forced = (skipped_t & set(C)) - out - ran  # a skipped test that ran is assumed to pass
             if forced and os.environ.get("SKIPPED_MODE") == "policy":
                 unknown_drops[0] += len(forced)  # left out by the policy; truth has no outcome
                 note += f" dropped {len(forced)} unknown-outcome"
@@ -216,6 +227,13 @@ def main():
                 out |= forced
                 note += f" +{len(forced)} unknown-outcome"
             sim = sel._pack_cost(out)
+            for g in ran:
+                if sel.batch_cost([g]) > sel.SETTLE_MAX_MS:
+                    st = giant_stats.setdefault(names[g], [0, 0, 0, 0])  # runs, fails, est ms, sim saved
+                    st[0] += 1
+                    st[1] += g in F
+                    st[2] += cost(g) + sel.CLS_SETUP.get(sel.CLS_OF[g], 0)
+                    st[3] += 0 if g in F else sel._pack_cost(out | {g}) - sim
             orc = sel._pack_cost(F)
             miss = bool(F - out)
             for n in C:
@@ -228,6 +246,9 @@ def main():
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
+    for k, (n, f, ms, saved) in sorted(giant_stats.items()):
+        print(f"giant runs {k}: {n} runs, {f} failed, est CPU {ms / 1000:.1f} s, sim saved {saved / 1000:.1f} s, "
+              f"break-even ratio {saved / max(ms, 1):.2f}")
     if unknown_drops[0]:
         print(f"unknown-outcome tests left out by the policy (SKIPPED_MODE=policy): {unknown_drops[0]}")
     print(f"records skipped (current candidates not a subset of the truth run's): {skipped[0]}")
