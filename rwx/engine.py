@@ -251,6 +251,38 @@ class _SessionSuite(unittest.TestSuite):
         super()._tearDownPreviousClass(test, result)
 
 
+def _max_nodes_proxy(self):
+    """Stand-in for TestParser.test_max_nodes: the same statements with the big query scaled
+    down (100 columns instead of 10,000, node limits 10,000 and 500 instead of 1,000,000 and
+    50,000), so the limit still trips a third of the way into the query."""
+    import sys as _sys
+
+    m = _sys.modules[type(self).__module__]
+    parse_one, exp, ParseError = m.parse_one, m.exp, m.ParseError
+    self.assertIsInstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select)
+    cols = [f"col{i}" for i in range(500)]
+    sql = f"SELECT {','.join(cols)} FROM t"
+    self.assertIsInstance(parse_one(sql, max_nodes=1_000_000), exp.Select)
+    width = 100
+    depth = 100
+    expr = "x" + "=x" * depth
+    cols = [expr for _ in range(width)]
+    sql = f"SELECT {','.join(cols)}"
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=10_000)
+    self.assertIn("Maximum number of AST nodes", str(ctx.exception))
+    with self.assertRaises(ParseError) as ctx:
+        parse_one(sql, max_nodes=500)
+    self.assertIn("(500)", str(ctx.exception))
+    with self.assertRaises(ParseError):
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+    self.assertIsInstance(parse_one("SELECT 1, 2, 3"), exp.Select)
+
+
+# Stand-in tests the selector may run instead of a test that is too slow to run here.
+PROXIES = {"test_max_nodes__rwx_proxy": _max_nodes_proxy}
+
+
 class _StopTest(Exception):
     """Raised from addSubTest to end a test at its first failing subtest."""
 
@@ -668,6 +700,9 @@ class Engine:
                 for meth in meths:
                     os.write(wfd, f"{ids[f'{mod}.{cls}.{meth}']} F\n".encode())
                 continue
+            for meth in meths:
+                if meth in PROXIES and not hasattr(klass, meth):
+                    setattr(klass, meth, PROXIES[meth])
             suite = _SessionSuite([klass(meth) for meth in meths])
             result = StreamResult(wfd, ids)
             result.stop_first = stop_first
