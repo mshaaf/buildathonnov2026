@@ -852,21 +852,26 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     if SETTLE_RATIO <= 0 or data_only or not seen:
         return final
     ratio = SETTLE_RATIO
-    if any(st != "P" for st in seen.values()):
+    nfail = sum(st != "P" for st in seen.values())
+    keep = 1.0  # chance an unproven test passes, so that running it removes it
+    if nfail:
         if SETTLE_FAIL_MULT <= 0:
             return final
         ratio *= SETTLE_FAIL_MULT
+        keep = 1 - (nfail + 1) / (len(seen) + 2)  # Laplace estimate from this commit's runs
+    # Tests sharing a class with a seen failure usually fail too: running them buys nothing.
+    bad_cls = {CLS_OF.get(n) for n, st in seen.items() if st != "P"}
     unproven = [n for n in final if n not in seen and n not in NO_RUN and n not in (known or ())
-                and (not is_heavy(n) or batch_cost([n]) <= SETTLE_MAX_MS)]
+                and (not is_heavy(n) or batch_cost([n]) <= SETTLE_MAX_MS) and CLS_OF.get(n) not in bad_cls]
     if not unproven:
         return final
     order = sorted(unproven, key=lambda n: (-DUR[n] / (batch_cost([n]) + 1), n))
-    best, best_j = _pack_cost(final), 0
-    steps = list(range(1, min(SETTLE_PREFIX, len(order)) + 1))
-    if len(order) > SETTLE_PREFIX:
-        steps.append(len(order))
+    best0 = best = _pack_cost(final)
+    best_j = 0
+    steps = sorted(set(range(1, min(SETTLE_PREFIX, len(order)) + 1))
+                   | {len(order) * i // 10 for i in range(1, 11) if len(order) * i // 10 > SETTLE_PREFIX})
     for j in steps:
-        c = ratio * batch_cost(order[:j]) + _pack_cost(final - set(order[:j]))
+        c = ratio * batch_cost(order[:j]) + keep * _pack_cost(final - set(order[:j])) + (1 - keep) * best0
         if c < best:
             best, best_j = c, j
     if not best_j:
@@ -1212,6 +1217,13 @@ class Scheduler:
                         nxt, stop_first = gen.send(res)
                         if time.monotonic() > self.deadline or not sess.alive:
                             raise GeneratorExit
+                        if time.monotonic() + batch_cost(nxt) / 1000 > self.deadline:
+                            # No time for this batch: the policy settles with it unreported.
+                            final = _drain(gen)
+                            sess.close()
+                            active.remove(a)
+                            yield cid, final if final is not None else set(C), "cut: no time for the next batch"
+                            continue
                         sess.submit(nxt, timeout=batch_timeout(nxt), stop_first=stop_first)
                         a[4] = nxt
                     except StopIteration as e:
@@ -1248,6 +1260,20 @@ class Scheduler:
                     if a in active:
                         active.remove(a)
                     yield a[0], set(a[1]), "scheduler error"
+
+def _drain(gen):
+    """Answer every further batch with no results (all unproven); the policy's final set,
+    or None if it keeps asking."""
+    try:
+        for _ in range(20):
+            gen.send({})
+    except StopIteration as e:
+        return set(e.value)
+    except Exception:  # noqa: BLE001
+        return None
+    gen.close()
+    return None
+
 
 DUR: dict = {}
 LIVE: set = set()  # commits where some run reported a failure

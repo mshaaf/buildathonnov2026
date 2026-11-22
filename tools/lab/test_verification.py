@@ -142,6 +142,18 @@ class VerificationTests(unittest.TestCase):
                 gen.send({0: "F"})
             self.assertEqual(done.exception.value, {0, 1, 2})
 
+    def test_a_batch_cut_for_time_prints_everything_unproven(self):
+        durations = {0: 1, 1: 3000, 2: 9000}
+        cpu = {0: 1, 1: 100, 2: 9000}
+        with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5):
+            gen = selector.policy([0, 1, 2], durations, False)
+            next(gen)
+            self.assertEqual(selector._drain(gen), {0, 1, 2})
+            gen = selector.policy([0, 1, 2], durations, False)
+            next(gen)
+            gen.send({0: "P"})  # settle asks for 1; the cut leaves it (and the heavy test) printed
+            self.assertEqual(selector._drain(gen), {1, 2})
+
     def test_final_batch_uses_the_giants_own_probe_evidence(self):
         # v4 rule: a giant is cleared only by ALL runnable candidates from its own test
         # file (here the executor tests 1-4 left after probe 1), then the final batch
