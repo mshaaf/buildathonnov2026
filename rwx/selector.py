@@ -138,6 +138,7 @@ class Analyzer:
         self.lazy_mask = lazy_mask
         self.file_tests = file_tests or {}  # test file -> mask of its tests
         self._trees: dict = {}
+        self._code_nodes: dict = {}
         profile = SRC / ".rwx-tokenizer.json"
         self.tokenizer = json.loads(profile.read_text()) if ATTR_NARROW and not BROAD and profile.is_file() else {}
 
@@ -173,7 +174,10 @@ class Analyzer:
                 mask = m.file_mask(rel)
             else:
                 mask = m.code_mask(rel, own)
-                if not mask and site.scope_path and site.scope_path[-1][0] == "class":
+                const_defaults = DEFAULT_CONST and self.only_constant_defaults(rel, site)
+                if const_defaults:
+                    why.append("only constant defaults changed: callers only")
+                if not mask and site.scope_path and site.scope_path[-1][0] == "class" and not const_defaults:
                     mask = m.span_mask(rel, site.code_key, *site.lines)
                 first = stmt.decorator_list[0].lineno if stmt.decorator_list else stmt.lineno
                 if not isinstance(site.scope_node, (ast.Module, ast.ClassDef)):
@@ -231,7 +235,16 @@ class Analyzer:
             for name in site.names or ():
                 rr, _ = m.ref_mask(m.name_refs.get(name, ()))
                 readers |= rr
-            narrowed = users & readers if (readers and ATTR_NARROW) else users
+            if REF_LINES and readers:
+                # same references, but only tests that executed a line where the name appears
+                rmask = self.ref_line_mask(refs, site.names)
+                line_readers = 0
+                for name in site.names or ():
+                    line_readers |= self.ref_line_mask(m.name_refs.get(name, ()), (name,))
+                readers = line_readers
+                narrowed = users & readers if ATTR_NARROW else users
+            else:
+                narrowed = users & readers if (readers and ATTR_NARROW) else users
             why.append(f"class {ck} users={bin(users).count('1')} readers={bin(narrowed).count('1')} refs={bin(rmask).count('1')}")
             return narrowed | rmask
         # module level: whoever references the bound names, anywhere
@@ -245,6 +258,112 @@ class Analyzer:
             refs.extend(m.name_refs.get(name, ()))
         rmask, _ = m.ref_mask(refs)
         return rmask | lazy
+
+    def only_constant_defaults(self, rel, site) -> bool:
+        """The def statement differs only in default values, each a constant before and after.
+        Evaluating a constant default cannot fail or touch anything, and no code in sqlglot or
+        its tests reads __defaults__, so only calls (which enter the function) observe it."""
+        old_stmt = site.stmt
+        new_src = self.py_changes.get(rel, (None, None))[1]
+        if new_src is None or not isinstance(old_stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        try:
+            new_tree = ast.parse(new_src)
+        except SyntaxError:
+            return False
+        twins = [n for n in ast.walk(new_tree) if isinstance(n, type(old_stmt)) and n.name == old_stmt.name
+                 and n.lineno == old_stmt.lineno]
+        if len(twins) != 1:
+            return False
+        new_stmt = twins[0]
+        od = old_stmt.args.defaults + [d for d in old_stmt.args.kw_defaults if d is not None]
+        nd = new_stmt.args.defaults + [d for d in new_stmt.args.kw_defaults if d is not None]
+        if len(od) != len(nd) or [d is None for d in old_stmt.args.kw_defaults] != [d is None for d in new_stmt.args.kw_defaults]:
+            return False
+        changed = [(a, b) for a, b in zip(od, nd) if ast.dump(a) != ast.dump(b)]
+        if not changed or not all(isinstance(a, ast.Constant) and isinstance(b, ast.Constant) for a, b in changed):
+            return False
+
+        def strip(fn):
+            clone = ast.parse(ast.unparse(fn)).body[0]
+            clone.args.defaults = []
+            clone.args.kw_defaults = [None] * len(clone.args.kw_defaults)
+            return ast.dump(clone)
+
+        return strip(old_stmt) == strip(new_stmt)
+
+    def ref_line_mask(self, refs, names) -> int:
+        """Like Map.ref_mask, but for references inside functions only the tests that executed
+        a line on which one of the names appears (Name, .attr or "string"). Import-time
+        references (class/module bodies) and anything not located keep the code-object mask."""
+        m = self.map
+        out = 0
+        for f, key, kind in refs:
+            lines = self._ref_lines(f, key, names) if kind == "func" else None
+            if lines is None:
+                out |= m.ref_mask([(f, key, kind)])[0]
+                continue
+            for ln, mid in m.code(f, key).items():
+                if ln in lines:
+                    out |= m.masks[mid]
+        return out
+
+    def _ref_lines(self, f, key, names):
+        from patchlib import _code_key
+
+        idx = self._code_nodes.get(f)
+        if idx is None:
+            text = self.old_source(f)
+            idx = {}
+            if text is not None:
+                try:
+                    tree = ast.parse(text)
+                except SyntaxError:
+                    tree = None
+                for node in ast.walk(tree) if tree is not None else ():
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        k = _code_key(node)
+                        idx[k] = None if k in idx else node  # duplicate keys: cannot tell them apart
+            self._code_nodes[f] = idx
+        node = idx.get(key)
+        if node is None:
+            return None
+        wanted = set(names)
+        lines: set = set()
+
+        def hit(n):
+            return ((isinstance(n, ast.Name) and n.id in wanted) or (isinstance(n, ast.Attribute) and n.attr in wanted)
+                    or (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in wanted))
+
+        def visit(n):
+            for ch in ast.iter_child_nodes(n):
+                if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    # decorators, defaults and bases run in this scope; the body is another code object
+                    extra = list(getattr(ch, "decorator_list", []))
+                    if isinstance(ch, ast.ClassDef):
+                        extra += ch.bases + [k.value for k in ch.keywords]
+                    else:
+                        extra += ch.args.defaults + [d for d in ch.args.kw_defaults if d]
+                    for e in extra:
+                        if hit(e):
+                            lines.update(range(e.lineno, e.end_lineno + 1))
+                        visit(e)
+                    continue
+                if isinstance(ch, ast.GeneratorExp):
+                    return_none[0] = True  # generator bodies are separate code objects: stay coarse
+                if hit(ch):
+                    lines.update(range(ch.lineno, ch.end_lineno + 1))
+                visit(ch)
+
+        return_none = [False]
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for st in body:
+            if hit(st):
+                lines.update(range(st.lineno, st.end_lineno + 1))
+            visit(st)
+        if return_none[0] or not lines:
+            return None
+        return lines
 
     def refine_fixture(self, rel, old, new, fm, why):
         """A fixture a test class loads in setUpClass (into cls.ATTR) only reaches the
@@ -1007,6 +1126,8 @@ USE_ENGINE = os.environ.get("RWX_ENGINE", "1") == "1"
 BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowing
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
+REF_LINES = os.environ.get("RWX_REF_LINES", "0") == "1"
+DEFAULT_CONST = os.environ.get("RWX_DEFAULT_CONST", "0") == "1"  # constant default-value edits: callers only  # class-attribute readers by line, not code object
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
