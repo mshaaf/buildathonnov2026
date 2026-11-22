@@ -341,3 +341,48 @@ tests still have to be printed); stand-ins for the giants (tiny gain).
 - Rejected on evidence: live bet (5 sample misses), skipping mid-weight tests under the
   narrow rule (6 new lab misses for 23 s), lowering the bet's finishing threshold (brings
   back Astra's miss).
+
+## 12. Where things stand (Nov 22, ~03:45 UTC) and how to keep going
+
+**Board:** our best is **144.8** (`d44ba30`, branch `bet-narrow`), about 43rd. The leader
+is at 103. The board keeps the best submission automatically.
+
+**Branches that matter** (always paste the full hash on the submit form; an empty box
+scores the newest commit on `main`, which is old):
+
+| Branch | Commit | What it is |
+|---|---|---|
+| `rwx` | latest | development line, all flags off by default |
+| `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
+| `bet-narrow-mid` | `bec9335` | experiment: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
+| `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
+| `diag-*` | | diagnostics only, never pick these |
+
+Submission variants are just `rwx` plus an `ENV` line in the Dockerfile. The switches
+(all in `rwx/selector.py`, read from the environment):
+
+| Variable | Effect |
+|---|---|
+| `RWX_BET_CLEAN=1` | after both probes pass, finish verifying if cheap, else treat the commit as clean |
+| `RWX_NARROW=1` | live commits: verify the runnable candidates fully, then drop slow tests when failures are narrow (< 25%) and none is in that test's file |
+| `RWX_NARROW_SKIP_MS` | which slow tests the narrow rule may drop (3000 = giants; 1000 = mid-weight too) |
+| `RWX_DIAG_MODE=live/static`, `RWX_DIAG_MIN/MAX` | diagnostics: print nothing for a category; misses = how many in it break |
+| `RWX_PROBE_ORDER=rare` | rarity-ranked probes (tested, not better) |
+
+**What practice looks like** (from the diagnostics on the bet version, 40 commits):
+16 live commits, 13 static commits (all of them break something: fixture edits), 11 that
+break nothing. Since the leader is at 103, roughly 25-30 s of our 129.7 s simulated must be
+tests we print on breaking commits that do not actually fail (most likely mid-weight tests
+included blind), plus about 15 s CPU.
+
+**How to try an idea safely:**
+1. Implement it behind an environment switch in `rwx/selector.py`.
+2. `python3 tools/lab/simulate.py RWXblast-radius-sample/sample` must show 0 misses (the
+   samples are the real generator; the lab sets are harsher than reality).
+3. Build the real image (`tools/lab/build_local.sh` here, or `docker build .`) and run it
+   with the scorer flags from the `Makefile` on the samples twice: same output, 0 misses.
+4. Branch from `rwx`, add the `ENV` line, push, submit the full hash.
+
+**Ideas not yet tried:** making the slow optimizer tests cheaper to verify (run only the
+fixture entries that reach the changed code, like Astra's per-query TPC-DS check);
+cutting CPU in the bet's finishing step for large clean commits.
