@@ -939,6 +939,21 @@ class Analyzer:
                 if old is None:
                     raise ValueError(f"missing base fixture: {rel}")
                 new_text = apply_hunks(old, locate_hunks(old, fp.hunks))
+                try:
+                    new_text.encode("utf-8")
+                except UnicodeEncodeError:
+                    # Bytes that are not UTF-8 (kept as surrogates): tests/helpers opens
+                    # fixtures with encoding="utf-8" and would raise, even on a comment line,
+                    # while a session's patched open() would hand the text over. Every reader
+                    # statically, no shortcut and no session.
+                    m = self.map.opens.get(rel)
+                    fm = self.map.masks[m] if m is not None else 0
+                    if fm == 0:
+                        fm = self.data_mask(rel, why)
+                    why.append(f"{rel}: not UTF-8 -> readers {fm.bit_count()}")
+                    blind |= fm
+                    mask |= fm
+                    continue
                 if (FIXTURE_COMMENTS and rel.startswith("tests/fixtures/") and rel.endswith(".sql")
                         and _filter_comments(old) == _filter_comments(new_text)):
                     # .sql fixtures are only read through tests/helpers, which drop empty
