@@ -235,6 +235,11 @@ class Analyzer:
         if len(old_pairs) == len(new_pairs):
             sql_changed = any(o[:2] != n[:2] for o, n in zip(old_pairs, new_pairs))
             exp_changed = any(o[2] != n[2] for o, n in zip(old_pairs, new_pairs))
+            self.fixture_runs[rel] = {
+                "attrs": [(class_id, attr) for class_id, attr in fa],
+                "edited": [i for i, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o != n],
+                "count": len(new_pairs),
+            }
         else:
             sql_changed = exp_changed = True
         for class_id, attr in fa:
@@ -385,6 +390,7 @@ class Analyzer:
         self.sites: set = set()
         self.case_site = None
         self.data_masks: dict = {}
+        self.fixture_runs: dict = {}  # setup-loaded fixture rel -> [class attr] when pairs line up
         files = parse_patch(text)
         if any(fp.binary or fp.old_path != fp.new_path for fp in files):
             return self.all, ["file creation, removal, rename or binary change -> ALL"]
@@ -548,6 +554,9 @@ BROAD = os.environ.get("RWX_BROAD") == "1"  # lab ground truth: no class narrowi
 ATTR_NARROW = os.environ.get("RWX_ATTR_NARROW", "1") == "1"
 ARG_FLIPS = os.environ.get("RWX_ARG_FLIPS", "1") == "1"
 FIXTURE_REFINE = os.environ.get("RWX_FIXTURE_REFINE", "1") == "1"
+# Fixture-only commits editing a setup-loaded fixture (tpc-h.sql, tpc-ds.sql): run the
+# loading class's tests on the edited queries instead of printing them unrun.
+FIXTURE_RUN = os.environ.get("RWX_FIXTURE_RUN", "0") == "1"
 FIXTURE_COMMENTS = os.environ.get("RWX_FIXTURE_COMMENTS", "1") == "1"
 PRESETUP = os.environ.get("RWX_PRESETUP", "1") == "1"
 WARM_NEEDED_ONLY = os.environ.get("RWX_WARM_NEEDED_ONLY", "0") == "1"
@@ -594,6 +603,13 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
             return {n for n in heavy if n in NO_RUN}
         return {n for n in heavy if dur[n] < SKIP_MIN_MS}
     return (yield from _probe_then_decide(C, rest, heavy, dur, focus or {}))
+
+
+def fixture_policy(C: list[int], runnable: list[int]):
+    """Fixture-only commit: run the loading class's tests on the edited queries; the
+    other readers stay in unrun. A test that does not report a pass stays in."""
+    res = yield sorted(runnable), False
+    return {n for n in C if n not in runnable or res.get(n) != "P"}
 
 
 FILE_OF: dict = {}
@@ -833,8 +849,11 @@ class Scheduler:
         active = []  # [cid, C, gen, session, batch, selected before executor verification]
         while queue or active:
             while queue and len(active) < self.lanes:
-                cid, C, py, data, data_only, focus, known, case_site = queue.pop(0)
-                gen = policy(C, DUR, data_only, focus, known)
+                cid, C, py, data, data_only, focus, known, case_site, fixture = queue.pop(0)
+                if fixture:
+                    gen = fixture_policy(C, fixture[1])
+                else:
+                    gen = policy(C, DUR, data_only, focus, known)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -844,8 +863,9 @@ class Scheduler:
                     gen.close()
                     yield cid, set(C), "out of time"
                     continue
-                sess = self.engine.session(py, data, case_site)
-                sess.submit(batch, timeout=batch_timeout(batch), stop_first=stop_first)
+                sess = self.engine.session(py, data, case_site, fixture[0] if fixture else None)
+                limit = fixture_timeout(fixture, self.engine) if fixture else batch_timeout(batch)
+                sess.submit(batch, timeout=limit, stop_first=stop_first)
                 active.append([cid, C, gen, sess, batch, None])
             if not active:
                 continue
@@ -924,6 +944,7 @@ LIVE: set = set()  # commits where some run reported a failure
 CPU_EST: dict = {}  # per-test body CPU (ms), class setup excluded
 CLS_OF: dict = {}  # test number -> "file::Class"
 CLS_SETUP: dict = {}  # "file::Class" -> setup CPU (ms)
+TEST_ID_OF: dict = {}  # test number -> full test id
 
 
 def class_masks(tests) -> dict:
@@ -976,6 +997,29 @@ def batch_timeout(batch) -> float:
     return 10.0 + 4.0 * batch_cost(batch) / 1000
 
 
+EXEC_CLS = "tests/test_executor.py::TestExecutor"
+PER_QUERY = {"test_execute_tpch": "tpch_sqls", "test_optimized_tpch": "tpch_sqls", "test_execute_tpcds": "tpcds_sqls"}
+
+
+def fixture_timeout(fixture, engine) -> float:
+    """Expected CPU of the edited queries, with slack. An edit can make a query far slower
+    (a dropped join condition); a timeout leaves the unreported tests in."""
+    spec, runnable, edits = fixture
+    by_attr = {attr: edits[fx] for fx, attr in spec}
+    ms = (engine.executor_profile or {}).get("ms") or []
+    est = CLS_SETUP.get(EXEC_CLS, 0)
+    for n in runnable:
+        attr = PER_QUERY.get(TEST_ID_OF.get(n, "").rsplit("::", 1)[-1])
+        e = by_attr.get(attr)
+        if e is None:
+            est += CPU_EST.get(n, DUR.get(n, 0))
+        elif attr == "tpcds_sqls" and len(ms) == e["count"]:
+            est += sum(ms[i] for i in e["edited"])
+        else:
+            est += 3 * CPU_EST.get(n, DUR.get(n, 0)) * max(1, len(e["edited"])) / max(1, e["count"])
+    return 3.0 + 3.0 * est / 1000
+
+
 def main() -> None:
     t0 = time.monotonic()
     out = os.fdopen(os.dup(1), "w")
@@ -992,6 +1036,7 @@ def main() -> None:
     cmap = Map(MAP)
     CPU_EST.update({n: cmap.cpu_ms.get(n, dur[n]) for n in dur})
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
+    TEST_ID_OF.update({t["number"]: t["id"] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
     lazy = 0
     for t in tests:
@@ -1006,8 +1051,10 @@ def main() -> None:
         try:
             mask, why = an.analyze(patch.read_text(errors="replace"))
             py, data, case_site = dict(an.py_changes), dict(an.data_changes), an.case_site
+            fruns = dict(an.fixture_runs)
         except Exception as e:  # never crash: run everything for this commit
             mask, why, py, data, case_site = valid, [f"analyzer error {e!r} -> ALL"], {}, {}, None
+            fruns = {}
         mask &= valid
         C = [n for n in dur if mask >> n & 1]
         # No patched Python to verify, including analysis failures and unsupported diffs.
@@ -1018,20 +1065,29 @@ def main() -> None:
             dm = an.data_masks.get(rel, 0)
             known |= {n for n in C if dm >> n & 1}
         score = commit_rarity(cmap, C, an.sites) if (C and not data_only and PROBE_ORDER == "rare") else commit_focus(cmap, C, py)
-        jobs.append((cid, C, py, data, data_only, score, known, case_site))
-    need_engine = USE_ENGINE and any(C and not data_only for _, C, _, _, data_only, *_ in jobs)
+        fixture = None
+        if FIXTURE_RUN and data_only and data and C and set(data) <= set(fruns):
+            runnable = [n for n in C if CLS_OF.get(n) == EXEC_CLS and n not in NO_RUN]
+            spec = sorted({(rel.removeprefix("tests/fixtures/"), attr)
+                           for rel in data for cls_id, attr in fruns[rel]["attrs"] if cls_id == EXEC_CLS})
+            if runnable and spec and _pack_cost(C) > _pack_cost([n for n in C if n not in runnable]):
+                fixture = (spec, runnable, {rel.removeprefix("tests/fixtures/"): fruns[rel] for rel in data})
+                log(f"{cid}: fixture run: {len(runnable)} {EXEC_CLS} tests on the edited queries")
+        jobs.append((cid, C, py, data, data_only, score, known, case_site, fixture))
+    need_engine = USE_ENGINE and any((job[1] and not job[4]) or job[8] for job in jobs)
     results = {}
     if need_engine:
         try:
             from engine import Engine
 
-            exec_cls = "tests/test_executor.py::TestExecutor"
+            exec_cls = EXEC_CLS
             runnable_exec = any(
                 CLS_OF.get(n) == exec_cls and n not in NO_RUN and CPU_EST.get(n, dur[n]) <= RUN_MAX_MS
                 for _, C, _, _, data_only, *_ in jobs if not data_only for n in C
-            )
+            ) or any(job[8] for job in jobs)
             # Warm up only the test modules some commit may actually run.
             needed = {n for _, C, _, _, data_only, *_ in jobs if not data_only for n in C}
+            needed |= {n for job in jobs if job[8] for n in job[8][1]}
             eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else (),
                          needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:

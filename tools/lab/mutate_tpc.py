@@ -18,7 +18,20 @@ for rel in ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimi
         words = [j for j, w in enumerate(parts) if w]
         j = rng.choice(words)
         r = rng.random()
-        if any(c.isdigit() for c in parts[j]) and r < 0.4:
+        style = os.environ.get("STYLE", "")
+        if style == "sample":
+            # the sample generator's kinds: a stray token (NULL, 0, 42) or a moved letter
+            r = rng.random()
+            if r < 0.6:
+                parts.insert(j, rng.choice(["NULL", "0", "42"]))
+            elif len(parts[j]) > 1:
+                w = parts[j]
+                parts[j] = w[0] + w[2:] if len(w) > 2 else w
+                parts.insert(j + 1, w[1]) if False else None
+                parts[j] = w[:1] + w[2:] + " " + w[1] if len(w) > 2 else w + "x"
+            else:
+                parts[j] = parts[j] + "1"
+        elif any(c.isdigit() for c in parts[j]) and r < 0.4:
             parts[j] = "".join(str((int(c) + 1) % 10) if c.isdigit() else c for c in parts[j])
         elif r < 0.7:
             parts.insert(j, "x")

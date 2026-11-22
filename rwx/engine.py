@@ -415,11 +415,11 @@ class Engine:
             results.setdefault(n, "F")
         return results, {"mode": mode, "why": swaps if mode == "reimport" else len(swaps), "timeout": timed_out, "crash": crash}
 
-    def session(self, py_changes: dict, data_changes: dict, case_site=None):
-        return Session(self, py_changes, data_changes, case_site)
+    def session(self, py_changes: dict, data_changes: dict, case_site=None, fixture=None):
+        return Session(self, py_changes, data_changes, case_site, fixture)
 
-    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices):
-        self._apply(mode, swaps, py_changes, data_changes)
+    def _child_loop(self, mode, swaps, py_changes, data_changes, cmd_fd, wfd, executor_indices, fixture=None):
+        self._apply(mode, swaps, py_changes, data_changes, fixture)
         rbuf = b""
         while True:
             while b"\n" not in rbuf:
@@ -443,7 +443,7 @@ class Engine:
         self._apply(mode, swaps, py_changes, data_changes)
         self._run_tests(numbers, wfd)
 
-    def _apply(self, mode, swaps, py_changes, data_changes):
+    def _apply(self, mode, swaps, py_changes, data_changes, fixture=None):
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
@@ -468,7 +468,13 @@ class Engine:
         difflib.unified_diff = lambda *a, **k: iter(())
         difflib.context_diff = lambda *a, **k: iter(())
         if data_changes:
+            if fixture:
+                import fixture_run
+
+                before = fixture_run.load(fixture)
             self._patch_open({f"{self.root}/{rel}": new for rel, new in data_changes.items()})
+            if fixture:
+                fixture_run.install(before, fixture_run.load(fixture))
         elif (
             mode == "swap"
             and py_changes
@@ -571,7 +577,7 @@ class _LazyDuckModule:
 class Session:
     """One forked child holding one commit's patched tree; runs test batches on request."""
 
-    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None):
+    def __init__(self, engine: Engine, py_changes: dict, data_changes: dict, case_site=None, fixture=None):
         self.mode, swaps = engine.plan(py_changes)
         self.info = swaps if self.mode == "reimport" else len(swaps)
         executor_indices = None
@@ -611,7 +617,7 @@ class Session:
             os.close(res_r)
             code = 0
             try:
-                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w, executor_indices)
+                engine._child_loop(self.mode, swaps, py_changes, data_changes, cmd_r, res_w, executor_indices, fixture)
             except BaseException as e:  # noqa: BLE001
                 try:
                     os.write(res_w, f"X {e!r}\n".encode())

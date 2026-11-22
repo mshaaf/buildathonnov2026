@@ -77,6 +77,7 @@ def main():
             if t["id"] in sel.NO_RUN_IDS:
                 lazy |= 1 << t["number"]
         an = sel.Analyzer(sel.Map(sel.MAP), valid, lazy)
+        an.class_masks = sel.class_masks(tests)
         if os.path.exists(f"{L}/answers.json"):
             truth = {c: (set(v["failing"]), None) for c, v in json.load(open(f"{L}/answers.json"))["commits"].items()}
         else:
