@@ -358,7 +358,9 @@ scores the newest commit on `main`, which is old):
 | `bet-narrow` | `d44ba30` | **current best, 144.8** (bet + narrow-live giants) |
 | `bet-narrow-mid` | `bec9335` | **141.8**: narrow rule also skips mid-weight tests (>= 1 s) + fixture comment/title rules |
 | `fast-v1` | `8849616` | **candidate**: 141.0 settings + `RWX_PRESETUP_CACHE=1` (build-time setUpClass snapshot, ~0.5 s less parent CPU; -1.3 s CPU on samples in paired runs) + `RWX_LAZY_RUN=1` (test_lazy_load runs on the patched tree). Sample output identical |
-| `diag-heavy` | `9fac365` | DIAGNOSTIC ONLY: 141.0 output minus unrun heavy tests on engine commits (see RESEARCH.md) |
+| `fast-v2` | see git | **candidate**: fast-v1 + `RWX_STANDINS=1` (test_max_nodes stand-in, 0.26 s instead of 34 s, agrees on 66/66 lab commits) + `RWX_LIVE_HEAVY=1` + TPC-DS check budget 10 s at 2x saving. Sample output identical, same CPU |
+| `diag-heavy` | `9fac365` | DIAGNOSTIC ONLY. **Practice: 397.708 s with 1 miss (97.7 s + 300), CPU ~20.9.** Unrun heavy tests cost us ~28 s on practice, and one commit really needs one of them |
+| `diag-heavy-py`, `diag-maxnodes`, `diag-tpcds` | `ef942af`, `d9110e0`, `00ee4e8` | DIAGNOSTIC ONLY: the same, restricted to commits with Python changes / to test_max_nodes / to test_execute_tpcds |
 | `bet-narrow-mid-fx` | `2ac5328` | **141.0 (current best)**: bet-narrow-mid + `RWX_FIXTURE_RUN=1` (TPC fixture edits run on the edited queries), `RWX_NARROW_CHUNKS=0`. Practice: 125.762 s simulated (unchanged: no practice fixture commit benefits), CPU 15.09 / 15.19 / 15.42 |
 | `bet`, `bet-clean` | `e539940`, `53171bc` | earlier bets (160.7, 159.8) |
 | `diag-*` | | diagnostics only, never pick these |

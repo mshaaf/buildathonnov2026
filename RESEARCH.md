@@ -94,6 +94,12 @@ commits. From its result:
 
 A large drop with few misses means stand-ins for the heavy tests are the next win.
 
+**Result:** 397.708 s with 1 miss, so 97.7 s simulated without the penalty, against
+125.762 s: unrun heavy tests cost 28 s on practice. One commit really needs one of them,
+so the true waste is between about 3 s and 26 s. `fast-v2` adds the `test_max_nodes`
+stand-in (`rwx/proxies.py`, checked on 66 lab commits) and a larger budget for the
+TPC-DS affected-query check. The three narrower diagnostics split the 28 s by test.
+
 ## Ideas not yet built
 - A cheap stand-in for `test_max_nodes`: the same parse checks on 100 columns instead of
   10,000 (about 0.3 s). Only worth building if `diag-heavy` shows heavy tests cost us.
