@@ -34,6 +34,8 @@ from pathlib import Path
 
 PKG_PREFIXES = ("sqlglot", "tests")
 TPCDS_SAMPLE_MS = int(os.environ.get("RWX_TPCDS_SAMPLE_MS", "0"))
+TPCDS_BLIND_MS = int(os.environ.get("RWX_TPCDS_BLIND_MS", "0"))  # gate when affected queries are unknown: cheapest queries up to this est CPU
+TPC_DATA = ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")  # fixtures the executor tests read
 TPCDS_VERIFY_MS = int(os.environ.get("RWX_TPCDS_VERIFY_MS", "5000"))  # most affected-query CPU (est ms) a session prepares to verify
 CPU_DUMP = os.environ.get("RWX_CPU_DUMP", "")  # lab only: per-session CPU breakdown file
 WATCH_MIN_S = 4.0  # progress watchdog: shortest wait for the next result line
@@ -764,6 +766,7 @@ class Session:
         executor_indices = None
         self.executor_ms = None
         self.executor_partial = None
+        known_big = False
         if (engine.executor_profile and not data_changes and len(py_changes) == 1
                 and self.mode == "swap" and swaps
                 and next(iter(py_changes)).startswith("sqlglot/")):
@@ -780,9 +783,12 @@ class Session:
                 elif case_indices:
                     # Too many to verify: keep the cheapest affected queries as a gate
                     # for the case where the policy would leave TPC-DS out unrun.
+                    # The affected queries are known here, so the blind gate below (cheapest
+                    # queries overall, possibly none of them affected) must not replace it.
+                    known_big = True
                     picked, used = [], 0
                     for i in sorted(case_indices, key=lambda i: (ms[i], i)):
-                        if used + ms[i] > TPCDS_SAMPLE_MS:
+                        if used + ms[i] > max(TPCDS_SAMPLE_MS, TPCDS_BLIND_MS):
                             break
                         picked.append(i)
                         used += ms[i]
@@ -790,6 +796,28 @@ class Session:
                         executor_indices = sorted(picked)
                         self.executor_ms = used
                         self.executor_partial = True
+        self.executor_blind = False
+        if (executor_indices is None and self.executor_ms is None and TPCDS_BLIND_MS > 0
+                and not known_big and engine.executor_profile and py_changes
+                and not any(rel.startswith("tests/") for rel in py_changes)
+                and not any(rel.startswith(TPC_DATA) for rel in data_changes)):
+            # The queries the change reaches are unknown (re-import session, several files,
+            # code that also runs outside the queries). Evidence only: the cheapest queries
+            # up to a budget stand in for the whole test. Data edits are fine as long as
+            # they are not in the TPC fixtures the executor tests read (an edited query
+            # outside the cheap subset would go unseen).
+            ms = engine.executor_profile["ms"]
+            picked, used = [], 0
+            for i in sorted(range(len(ms)), key=lambda i: (ms[i], i)):
+                if used + ms[i] > TPCDS_BLIND_MS:
+                    break
+                picked.append(i)
+                used += ms[i]
+            if picked:
+                executor_indices = sorted(picked)
+                self.executor_ms = used
+                self.executor_partial = True
+                self.executor_blind = True
         cmd_r, cmd_w = os.pipe()
         res_r, res_w = os.pipe()
         pid = os.fork()
