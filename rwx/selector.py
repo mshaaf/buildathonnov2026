@@ -1471,7 +1471,7 @@ class Scheduler:
         self.lanes = lanes
         self.deadline = deadline
 
-    def _windows(self, nums):
+    def _windows(self, nums, sess=None):
         """Per-test watchdog windows, or None (plain batch timeout) for engines without
         run_order (test doubles)."""
         from engine import WATCH_MIN_S
@@ -1479,10 +1479,18 @@ class Scheduler:
         run_order = getattr(self.engine, "run_order", None)
         if run_order is None:
             return None
-        # Class setup counts for every test of the class: a deferred setup (TestExecutor
-        # in re-import sessions) runs inside whichever test first reads its data.
-        return {n: max(WATCH_MIN_S, WATCH_FACTOR * (CPU_EST.get(n, DUR.get(n, 0))
-                                                   + WATCH_SETUP.get(CLS_OF.get(n), 0)) / 1000)
+        # Class setup counts for every test of the class: a deferred setup runs inside
+        # whichever test first reads its data. A re-import session builds the classes
+        # afresh, so it may pay the map's full setup (WATCH_SETUP). A swap session uses
+        # the parent's shared setup where there is one (CLS_SETUP 0) but still opens its
+        # duckdb connections lazily (about half of that setup): count half of what was shared.
+        swap = getattr(sess, "mode", None) == "swap"
+
+        def setup(c):
+            full = WATCH_SETUP.get(c, 0)
+            return (CLS_SETUP.get(c, 0) + full) / 2 if swap else full
+
+        return {n: max(WATCH_MIN_S, WATCH_FACTOR * (CPU_EST.get(n, DUR.get(n, 0)) + setup(CLS_OF.get(n))) / 1000)
                 for n in run_order(nums)}
 
     def _submit(self, a, nums, stop_first):
@@ -1514,7 +1522,7 @@ class Scheduler:
                 self._submit(a, nxt, stop_first)
 
     def _send(self, sess, nums, stop_first):
-        windows = self._windows(nums)
+        windows = self._windows(nums, sess)
         if windows is None:
             sess.submit(nums, timeout=batch_timeout(nums), stop_first=stop_first)
         else:
@@ -1725,6 +1733,7 @@ class Scheduler:
                             continue
                         sess.close()
                         active.remove(a)
+                        _dump_cpu(cid, sess)
                         yield cid, e.value, f"ran {sess.mode} body {sum(sess.cpu.values()):.2f}s total {sess.total_cpu:.2f}s rss {sess.maxrss_mb:.0f}MB batches {len(batch)}{' CRASH ' + str(sess.crash)[:80] if sess.crash else ''}"
                     except GeneratorExit:
                         gen.close()
@@ -1742,6 +1751,20 @@ class Scheduler:
                     if a in active:
                         active.remove(a)
                     yield a[0], set(a[1]), "scheduler error"
+
+def _dump_cpu(cid, sess):
+    """Lab diagnostics (RWX_CPU_DUMP=file): one JSON line per finished session."""
+    from engine import CPU_DUMP
+
+    if not CPU_DUMP:
+        return
+    try:
+        with open(CPU_DUMP, "a") as f:
+            f.write(json.dumps({"cid": cid, "mode": sess.mode, "total": sess.total_cpu,
+                                "startup": sess.startup_cpu, "tests": sess.cpu}) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log(f"cpu dump failed {e!r}")
+
 
 def _is_heavy(nums) -> bool:
     return len(nums) == 1 and nums[0] in HEAVY_BATCH
