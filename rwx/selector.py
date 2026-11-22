@@ -1371,8 +1371,32 @@ SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may a
 SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
 
+MAXNODES_PROXY = os.environ.get("RWX_MAXNODES_PROXY", "0") == "1"
+PROXY_IDS = {"tests/test_parser.py::TestParser::test_max_nodes": "tests/test_parser.py::TestParser::test_max_nodes__rwx_proxy"}
+PROXY_OF: dict = {}  # slow test number -> number of its stand-in (filled by main)
+
+
 def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
-           dropped=None):
+           dropped=None, proxy_ok: bool = True):
+    """The settled policy, then (RWX_MAXNODES_PROXY) a stand-in run for a slow test that is
+    still printed unrun: when the scaled-down copy of the test passes on the patched tree,
+    the slow test is left out. Evidence, not proof (like the other bets)."""
+    final = yield from _policy_settled(C, dur, data_only, focus, known, dropped)
+    if not (MAXNODES_PROXY and proxy_ok and PROXY_OF) or data_only:
+        return final
+    final = set(final)
+    todo = [(real, p) for real, p in sorted(PROXY_OF.items()) if real in final and real not in (known or ())]
+    if not todo:
+        return final
+    res = yield [p for _, p in todo], False
+    for real, p in todo:
+        if res.get(p) == "P":
+            final.discard(real)
+    return final
+
+
+def _policy_settled(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, known: set | None = None,
+                    dropped=None):
     """Generator: the batches of _policy, then (RWX_SETTLE_RATIO) a last batch of the printed
     runnable tests whose estimated CPU is worth less than the worker time they add."""
     gen = _policy(C, dur, data_only, focus, known)
@@ -2113,7 +2137,10 @@ class Scheduler:
                     gen = fixture_policy(C, fixture[1])
                 else:
                     extra = [job[9]] if len(job) > 9 and job[9] else []
-                    gen = policy(C, DUR, data_only, focus, known, *extra)
+                    kw = {}
+                    if MAXNODES_PROXY and any(rel.startswith("tests/") for rel in (py or ())):
+                        kw["proxy_ok"] = False  # the patch edits test code: the stand-in copies the pinned test
+                    gen = policy(C, DUR, data_only, focus, known, *extra, **kw)
                 try:
                     batch, stop_first = next(gen)
                 except StopIteration as e:
@@ -2465,6 +2492,19 @@ def main() -> None:
             if t["id"] in NO_RUN_IDS:
                 CPU_EST[t["number"]] = max(CPU_EST.get(t["number"], 0), LAZY_RUN_MS)
     CLS_OF.update({t["number"]: t["id"].rsplit("::", 1)[0] for t in tests})
+    proxy_tests: list = []
+    if MAXNODES_PROXY:
+        by_id = {t["id"]: t["number"] for t in tests}
+        nxt = max(dur) + 1
+        for real_id, proxy_id in PROXY_IDS.items():
+            real = by_id.get(real_id)
+            if real is None:
+                continue
+            PROXY_OF[real] = nxt
+            DUR[nxt], CPU_EST[nxt] = 300, 400
+            FILE_OF[nxt], CLS_OF[nxt] = FILE_OF[real], CLS_OF[real]
+            proxy_tests.append({"number": nxt, "id": proxy_id, "file": FILE_OF[real], "seconds": 0.3})
+            nxt += 1
     TEST_ID_OF.update({t["number"]: t["id"] for t in tests})
     CLS_SETUP.update(cmap.cls_setup_ms)
     WATCH_SETUP.update(cmap.cls_setup_ms)
@@ -2543,7 +2583,7 @@ def main() -> None:
             # Warm up only the test modules some commit may actually run.
             needed = {n for _, C, _, _, data_only, *_ in jobs if not data_only for n in C}
             needed |= {n for job in jobs if job[8] for n in job[8][1]}
-            eng = Engine(str(SRC), tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else (),
+            eng = Engine(str(SRC), tests + proxy_tests, log=log, presetup=(exec_cls,) if (runnable_exec and PRESETUP) else (),
                          needed=needed if WARM_NEEDED_ONLY else None)
             if eng.presetup_done:
                 CLS_SETUP[exec_cls] = 0

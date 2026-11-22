@@ -419,3 +419,49 @@ Other things measured this round:
   code setUpClass runs (as warm keys). Not built yet.
 - The largest sample session is 2haz (6 s): `is` -> `==` on an enum, which breaks
   nothing. The bet's finishing step verifies its 64 runnable candidates.
+
+## 13. Merged line `opt-merge` (Nov 22, ~06:00 EST): team rwx + the `opt` work
+
+`opt-merge` = `rwx` (through af47052) merged with the `opt` branch. Submission builds are
+`opt-merge` plus one `ENV` line in the Dockerfile, like the `rwx` variants.
+
+**Board (practice, 40 commits), all 0 misses:**
+
+| Commit (branch) | Simulated | CPU | Score | What |
+|---|---|---|---|---|
+| `d17c048` (opt-merge-bet, older) | 123.394 | 7.3 | **130.7** | team switches (BET_CLEAN, NARROW 1000, FIXTURE_RUN, PRESETUP_CACHE, LAZY_RUN) on the merged code |
+| `9168129` (exp-settle-deep) | 121.024 | 11.4 | 132.5 | same + deep settling: not worth it |
+| `e715cb2` (opt-merge-narrow, older) | 123.394 | 32.8 | 156.2 | no BET_CLEAN: clean commits verified instead of bet |
+| `132624f` (diag-blind-merge) | 2490.2 (8 misses) | 7.2 | diagnostic | observed failures only: 90.2 s + 8 of 16 live commits need more |
+
+Not yet scored (screen was locked, nobody could submit): `4acf4a6` (opt-merge-bet, current),
+`fb9f612` (opt-merge-bet2 = + REF_LINES, META_STATIC), `ca468a7` (opt-merge-bet-probe =
+bet2 + PROBE_MS 1000 / PROBE2_MS 2000), `8a119cc` (opt-merge-narrow = no BET_CLEAN).
+
+**What `opt` added to the team line**
+- Soundness: one-line lambdas/defs had no coverage (LINE events never fire on a code
+  object's first line): the map now has code-object entries (`tools/lab/startrun.py`,
+  `merge_starts.py`); unknown code objects fall back to the creating statement or importers.
+  Import-time statements that may raise are checked by importing the patched module in the
+  session (failure selects every importer). File-level and malformed patches no longer
+  crash or select blindly. Hung tests: progress watchdog. Hard wall-clock guard.
+- Precision: operand-relation profiles for comparison sites (`cmp_sites` in the map, fresh
+  and shared-process runs unioned; `tools/lab/cmprun.py`, `merge_cmp.py`), also inside
+  multi-change patches. `RWX_PROFILE_SENTINEL` (on): when a profile narrows to a non-empty
+  set, dropped candidates from the same classes/files run after the infected tests in the
+  same session; a failure restores the dropped set (cross-test pollution, found on an
+  and/or flip). Flags, off by default: `RWX_REF_LINES`, `RWX_META_STATIC` (class attributes),
+  `RWX_TPCDS_VERIFY_MS`/`RWX_TPCDS_SETTLE`. and/or profiles exist in the lab but are OFF
+  (pollution violation on `boolx/b009`).
+- Settle step (`RWX_SETTLE_RATIO`, default 0.5): runs printed-unverified tests when cheaper.
+- **Rebuilding the map:** `tools/build_map.py` alone drops the supplements. Re-run
+  `merge_starts.py` (data: lab `scratch-robust/starts`) and `merge_cmp.py`
+  (`scratch-robust/cmp,scratch-robust/cmp_shared`) on top.
+
+**Measured risk of the bets** (lab corpus: samples + 375 synthetic commits with engine truth,
+8 of 8 full-suite pytest spot checks agree): `RWX_BET_CLEAN` misses 20 of 405 commits (when
+it bets after running under 20% of the candidates it is wrong 20 times out of 25);
+`RWX_NARROW` (any threshold) 0 misses. Practice and samples: 0 misses in 70 commits. So the
+synthetic mutants differ from the organizers' (theirs break broadly or not at all), and the
+final adds kinds not in practice. Larger probes (1000/2000 ms) halve the lab misses for
+about +0.25 s est CPU per commit.
