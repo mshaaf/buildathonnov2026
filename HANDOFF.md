@@ -573,10 +573,9 @@ after an affected test ran in the same process).
 
 Kept current by Ali's session through the morning. Newest entries at the bottom of each list.
 
-**FINAL ENTRY (09:30 EST):** the page now marks **BB-A0EE91C1, `343cf5a` (113.3)** as
-"Entered in the final", picked by hand; the blind 109.6 diagnostic is no longer the entry.
-A better-protected build is being prepared (see the 09:30 update below); re-pick only a
-build that has scored on the board with 0 misses.
+**FINAL ENTRY (09:45 EST):** the page marks **BB-1BF787EF, `f3c6e42` (C3, 116.1)** as
+"Entered in the final" (picked by hand; before that `343cf5a`, 113.3). Re-pick only a build
+that has scored on the board with 0 misses. Candidates are in the 09:45 update below.
 
 ### What the gate is
 
@@ -711,3 +710,28 @@ Expected at 500 ms: about 111.5; parse-only (280 ms): about 110.
     from an ordering/membership operator to another family).
 - Plan: C5 = C3 + both fix sets, validated on samples + corpora, into the 9:40/9:44 slots
   (held for it); 10:25 onward are spare.
+
+### Update 09:45 EST
+
+- Board: **C4 `2dc87c2` scored 130.2** = 101.94 + 28.3 CPU. `RWX_BET_FINISH_FRAC=2` on every
+  commit costs 14 s of practice CPU: too much, dropped as a global setting.
+- Submission slots are a rolling hour per submission, not per clock hour: used at about 8:44,
+  9:25, 9:33, 9:45; the next ones free up at about 10:25, 10:33 and 10:45.
+- All eight non-bet review findings are fixed. `opt-fix-a` (digger) + `opt-fix-b` (simdig)
+  merged on C3 as **C6 `185b7c7` (branch `opt-c6`, pushed)**. Real selector: output identical
+  to C3 on s1, s2, s3, multi, multix, cmpx, boolx and to `f3c6e42` on the 81 odd patches;
+  samples identical (94.581 s, 0 misses). An extra and/or guard (`RWX_BOOL_RHS_GUARD`) is in
+  the code but OFF: end to end it turned boolx/b035 into a miss.
+- Lab misses over 483 commits, same code (bool profiles + fixes + 500 ms gate), by probe size:
+  150/250 ms 24; 400/800 17; 1000/2000 14.
+- **C7 `8192e1c` (branch `opt-c7`, pushed, submitted 9:45): C6 + `RWX_KIND_PROBES=1`.** A commit
+  whose Python edits are all one-token mutations of the pinned source (operator flipped,
+  `not` added or dropped, literal changed; comments and layout ignored; `one_token_edit` in
+  `rwx/selector.py`) keeps the 150/250 ms probes and finishing share 1. Every other kind of
+  edit gets 1000/2000 ms probes and finishing share 2 (`RWX_STRICT_*`). Reason: all 22 code
+  edits in the samples are one-token mutations and the clean bet was never wrong on the 70
+  practice + sample commits, while the final adds kinds not in practice. Samples: output
+  identical to the small-probe run of C6; no sample classified as unfamiliar. With the switch
+  off the output equals C6. Expected on practice: about 111.7 if every practice commit is a
+  one-token kind.
+- If C7 does not hold up, C6 is the fallback for the 10:25 slot (expected 116.1, like C3).
