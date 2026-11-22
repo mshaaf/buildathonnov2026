@@ -147,6 +147,7 @@ def load_truth(L):
 
 def main():
     rows, drops = [], {}
+    settle_peak = [0.0]
     any_engine = False
     for L in sys.argv[1:]:
         tests = json.load(open(f"{L}/tests.json"))["tests"]
@@ -157,7 +158,10 @@ def main():
         valid = sum(1 << n for n in dur)
         lazy = sum(1 << n for n in sel.NO_RUN)
         an = sel.Analyzer(M, valid, lazy)
-        for cid, (F, tcpu, unreliable) in sorted(load_truth(L).items()):
+        truth = load_truth(L)
+        sel.SETTLE_BUDGET[0] = sel.SETTLE_BUDGET_PER_COMMIT_MS * len(truth)
+        sel.SETTLE_SPENT[0] = 0
+        for cid, (F, tcpu, unreliable) in sorted(truth.items()):
             mask, why = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             C = [n for n in dur if mask >> n & 1]
             py, data = dict(an.py_changes), dict(an.data_changes)
@@ -172,6 +176,7 @@ def main():
             cost = (lambda n: tcpu.get(n, sel.CPU_EST[n])) if CPU_SRC == "truth" else (lambda n: sel.CPU_EST[n])
             out, cpu, ran, note = replay(C, F, data_only, focus, known, cost, info, exec_n)
             any_engine |= bool(cpu)
+            settle_peak[0] = max(settle_peak[0], sel.SETTLE_SPENT[0] / max(1, len(truth)))
             sim = sel._pack_cost(out)
             orc = sel._pack_cost(F)
             miss = bool(F - out)
@@ -185,6 +190,7 @@ def main():
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
+    print(f"settle est CPU per commit (largest dir): {settle_peak[0]:.0f} ms (budget {sel.SETTLE_BUDGET_PER_COMMIT_MS} ms)")
 
 
 def report(rows, drops, warm):

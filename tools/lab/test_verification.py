@@ -186,6 +186,17 @@ class VerificationTests(unittest.TestCase):
                     gen.send(response)
                 self.assertEqual(done.exception.value, expected)
 
+    def test_settle_stops_when_the_batch_budget_is_spent(self):
+        durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
+        cpu = {0: 1, 1: 1, 2: 100, 3: 9000}
+        with patch.multiple(selector, DUR=durations, CPU_EST=cpu, CLS_SETUP={}, CLS_OF={}, FILE_OF={}, SETTLE_RATIO=0.5,
+                            SETTLE_BUDGET=[150], SETTLE_SPENT=[100]):
+            gen = selector.policy([0, 1, 2, 3], durations, False)
+            next(gen)
+            with self.assertRaises(StopIteration) as done:
+                gen.send({0: "P"})  # settling [2, 1] would cost 101 ms, 51 left
+            self.assertEqual(done.exception.value, {1, 2, 3})
+
     def test_settle_after_a_failure(self):
         durations = {0: 1, 1: 1, 2: 3000, 3: 9000}
         cpu = {0: 1, 1: 1, 2: 1500, 3: 9000}
@@ -218,6 +229,60 @@ class VerificationTests(unittest.TestCase):
             next(gen)
             gen.send({0: "P"})  # settle asks for 1; the cut leaves it (and the heavy test) printed
             self.assertEqual(selector._drain(gen), {1, 2})
+
+    def test_hard_deadline_kills_a_batch_that_never_finishes(self):
+        import time
+
+        class StuckSession:
+            def __init__(self):
+                self.r, self.w = os.pipe()
+                self.deadline = time.monotonic() + 3600
+                self.results = {0: "P"}
+                self.killed = False
+
+            def fileno(self):
+                return self.r
+
+            def submit(self, numbers, timeout, stop_first=False, executor_only=False):
+                pass
+
+            def read(self):
+                return False
+
+            def expired(self):
+                return False
+
+            def kill(self):
+                self.killed = True
+
+            def close(self):
+                os.close(self.r)
+                os.close(self.w)
+
+        class StuckEngine:
+            executor_test = None
+
+            def __init__(self):
+                self.sessions = []
+
+            def session(self, py, data, case_site):
+                self.sessions.append(StuckSession())
+                return self.sessions[-1]
+
+        durations = {0: 1, 1: 1, 2: 9000}
+        jobs = [(c, [0, 1, 2], {"x.py": ("a", "b")}, {}, False, {}, set(), None) for c in ("a", "b", "c")]
+        with patch.multiple(selector, DUR=durations, CPU_EST=durations, CLS_SETUP={}, CLS_OF={}, FILE_OF={},
+                            HARD_GRACE_S=0.2):
+            engine = StuckEngine()
+            start = time.monotonic()
+            sched = selector.Scheduler(engine, lanes=2, deadline=start + 0.3)
+            out = {cid: (final, note) for cid, final, note in sched.run(jobs)}
+            self.assertLess(time.monotonic() - start, 2.0)
+        self.assertTrue(all(sess.killed for sess in engine.sessions))
+        # in-flight: the reported pass counts, the rest is printed; queued: static set
+        self.assertEqual(out["a"], ({1, 2}, "killed at the hard deadline"))
+        self.assertEqual(out["b"], ({1, 2}, "killed at the hard deadline"))
+        self.assertEqual(out["c"], ({0, 1, 2}, "out of time"))
 
     def test_final_batch_uses_the_giants_own_probe_evidence(self):
         # v4 rule: a giant is cleared only by ALL runnable candidates from its own test

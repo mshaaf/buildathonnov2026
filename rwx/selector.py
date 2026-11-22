@@ -833,6 +833,9 @@ def is_heavy(n) -> bool:
 
 SETTLE_RATIO = float(os.environ.get("RWX_SETTLE_RATIO", "0.5"))  # assumed scorer CPU per estimated CPU ms; 0: off
 SETTLE_PREFIX = 40
+SETTLE_BUDGET_PER_COMMIT_MS = int(os.environ.get("RWX_SETTLE_BUDGET_MS", "6000"))  # est CPU settle may spend, per commit in the batch
+SETTLE_BUDGET = [float("inf")]  # set by main(): per-commit budget x commits
+SETTLE_SPENT = [0]
 SETTLE_MAX_MS = int(os.environ.get("RWX_SETTLE_MAX_MS", "4500"))  # settle may also run tests this costly (e.g. generator_memory)
 SETTLE_FAIL_MULT = float(os.environ.get("RWX_SETTLE_FAIL_MULT", "1"))  # ratio multiplier once something failed; 0: no settling then
 
@@ -878,6 +881,9 @@ def policy(C: list[int], dur: dict, data_only: bool, focus: dict | None = None, 
     if not best_j:
         return final
     batch = order[:best_j]
+    if SETTLE_SPENT[0] + batch_cost(batch) > SETTLE_BUDGET[0]:
+        return final  # batch-wide settle budget exhausted: print the unproven tests
+    SETTLE_SPENT[0] += batch_cost(batch)
     res = yield batch, False
     ok = {n for n, st in res.items() if st == "P"}
     bad = {n for n in batch if res.get(n) != "P"}
@@ -1148,11 +1154,31 @@ def _live_evidence(C, rest, heavy, passed, failed):
     return selected
 
 
+HARD_GRACE_S = 8.0  # after the scheduling deadline, in-flight batches get this long, then die
+
+
 class Scheduler:
     def __init__(self, engine, lanes: int, deadline: float):
         self.engine = engine
         self.lanes = lanes
         self.deadline = deadline
+
+    def _abandon(self, a):
+        """Kill an active commit's session; its final set treats the in-flight batch as
+        unproven (reported passes still count)."""
+        cid, C, gen, sess, batch, selected = a
+        partial = {n: st for n, st in getattr(sess, "results", {}).items() if st == "P"}
+        try:
+            sess.kill()
+            sess.close()
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"{cid}: killed at the hard deadline after {len(partial)}/{len(batch)} tests")
+        if selected is not None:  # TPC-DS check in flight: keep TPC-DS
+            final = selected[1] | {self.engine.executor_test}
+        else:
+            final = _drain(gen, partial)
+        return cid, final if final is not None else set(C), "killed at the hard deadline"
 
     def run(self, jobs):
         """jobs: list of (cid, C, py_changes, data_changes, data_only). Yields (cid, final_set, note)."""
@@ -1184,7 +1210,14 @@ class Scheduler:
                 active.append([cid, C, gen, sess, batch, None])
             if not active:
                 continue
-            timeout = max(0.05, min(a[3].deadline for a in active) - time.monotonic())
+            hard = self.deadline + HARD_GRACE_S
+            if time.monotonic() > hard:
+                # Past the hard limit: kill what is still running and print what is unproven.
+                for a in list(active):
+                    yield self._abandon(a)
+                    active.remove(a)
+                continue
+            timeout = max(0.05, min(min(a[3].deadline for a in active), hard) - time.monotonic())
             ready, _, _ = _sel.select([a[3] for a in active], [], [], timeout)
             for a in list(active):
                 try:
@@ -1272,10 +1305,11 @@ class Scheduler:
                         active.remove(a)
                     yield a[0], set(a[1]), "scheduler error"
 
-def _drain(gen):
-    """Answer every further batch with no results (all unproven); the policy's final set,
-    or None if it keeps asking."""
+def _drain(gen, first=None):
+    """Answer the pending batch with `first` (default: nothing reported) and every further
+    batch with no results; the policy's final set, or None if it keeps asking."""
     try:
+        gen.send(dict(first or {}))
         for _ in range(20):
             gen.send({})
     except StopIteration as e:
@@ -1389,6 +1423,7 @@ def main() -> None:
         file_tests[t["file"]] = file_tests.get(t["file"], 0) | 1 << t["number"]
     an = Analyzer(cmap, valid, lazy, file_tests)
     patches = list_patches(DATA / "commits")
+    SETTLE_BUDGET[0] = SETTLE_BUDGET_PER_COMMIT_MS * len(patches)
     jobs, final = [], {}
     for patch in patches:
         cid = patch.name[: -len(".patch")]
@@ -1427,7 +1462,7 @@ def main() -> None:
             if eng.presetup_done:
                 CLS_SETUP[exec_cls] = 0
             log(f"engine warm in {time.monotonic() - t0:.1f}s, parent cpu {time.process_time():.2f}s")
-            budget = min(150.0, 3.2 * len(jobs) + 10)
+            budget = min(140.0, 3.2 * len(jobs) + 10)
             sched = Scheduler(eng, lanes=2, deadline=t0 + budget)
             for cid, final_set, note in sched.run(jobs):
                 results[cid] = (final_set, note)
