@@ -1046,7 +1046,7 @@ def _import_time(site) -> bool:
 
 CMP_PROFILE = os.environ.get("RWX_CMP_PROFILE", "1") == "1"
 BOOL_PROFILE = os.environ.get("RWX_BOOL_PROFILE", "0") == "1"  # and/or flips (needs bool_sites)
-BOOL_RHS_GUARD = os.environ.get("RWX_BOOL_RHS_GUARD", "1") == "1"  # and/or: no narrowing when the right operand may raise
+BOOL_RHS_GUARD = os.environ.get("RWX_BOOL_RHS_GUARD", "0") == "1"  # and/or: no narrowing when the right operand may raise (off: see commit message)
 CMP_OPS = {ast.Lt: "<", ast.LtE: "<=", ast.Gt: ">", ast.GtE: ">=", ast.Eq: "==", ast.NotEq: "!=",
            ast.Is: "is", ast.IsNot: "is not", ast.In: "in", ast.NotIn: "not in"}
 _ORD, _IDE, _MEM = ("<", "<=", ">", ">=", "==", "!="), ("is", "is not", "==", "!="), ("in", "not in")
