@@ -2618,6 +2618,14 @@ def main() -> None:
             final_set = {n for n in final_set if n in seen or not (
                 n in NO_RUN or CPU_EST.get(n, dur[n]) + CLS_SETUP.get(CLS_OF.get(n), 0) > RUN_MAX_MS)}
             note = "diagnostic (heavy): unrun slow tests left out"
+        if diag_mode == "heavy_all":
+            # diagnostic: on every commit, leave out printed tests recorded at 3 s or more
+            # that no run saw failing
+            seen = OBSERVED.get(cid, set())
+            final_set = {n for n in (set(C) if final_set is None else final_set) if n in seen or dur[n] < 3000}
+            note = "diagnostic (heavy_all): unobserved tests of 3 s or more left out"
+        if diag_mode == "static_big" and note == "static" and len(final_set if final_set is not None else C) > 20:
+            final_set, note = set(), "diagnostic (static_big): printed nothing"
         dropped = job[9] if len(job) > 9 else None
         if dropped and C and commit_key(C) not in SENTINEL_CLEARED:
             # profile-dropped candidates whose sentinels did not all pass (or never ran)
