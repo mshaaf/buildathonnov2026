@@ -131,9 +131,15 @@ def replay(C, F, data_only, focus, known, cost, info, exec_n):
     return out, cpu, ran, note
 
 
+def covered(C, tcand):
+    """The truth run only ran its own candidates: a record is ground truth for the current
+    analyzer only when the current candidates are a subset of them."""
+    return tcand is None or set(C) <= tcand
+
+
 def load_truth(L):
     if os.path.exists(f"{L}/answers.json"):
-        return {c: (set(v["failing"]), {}, False) for c, v in json.load(open(f"{L}/answers.json"))["commits"].items()}
+        return {c: (set(v["failing"]), {}, False, None) for c, v in json.load(open(f"{L}/answers.json"))["commits"].items()}
     last = {}
     for f in sorted(glob.glob(f"{L}/truth.*.jsonl")):
         for line in open(f):
@@ -144,7 +150,7 @@ def load_truth(L):
         bad = bool(r.get("timeout") or r.get("crash"))
         if bad and os.environ.get("KEEP_UNRELIABLE") != "1":
             continue  # unreported tests were marked failing: not ground truth
-        truth[cid] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()}, bad)
+        truth[cid] = (set(r["fail"]), {int(k): int(v * 1000) for k, v in r.get("cpu", {}).items()}, bad, set(r["cand"]))
     if os.path.exists(f"{L}/pytest.jsonl"):  # real-pytest failing sets override the engine's
         for line in open(f"{L}/pytest.jsonl"):
             r = json.loads(line)
@@ -156,6 +162,7 @@ def load_truth(L):
 def main():
     rows, drops = [], {}
     settle_peak = [0.0]
+    skipped = [0]
     any_engine = False
     for L in sys.argv[1:]:
         tests = json.load(open(f"{L}/tests.json"))["tests"]
@@ -169,9 +176,12 @@ def main():
         truth = load_truth(L)
         sel.SETTLE_BUDGET[0] = sel.SETTLE_BUDGET_PER_COMMIT_MS * len(truth)
         sel.SETTLE_SPENT[0] = 0
-        for cid, (F, tcpu, unreliable) in sorted(truth.items()):
+        for cid, (F, tcpu, unreliable, tcand) in sorted(truth.items()):
             mask, why = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             C = [n for n in dur if mask >> n & 1]
+            if not covered(C, tcand):
+                skipped[0] += 1
+                continue
             py, data = dict(an.py_changes), dict(an.data_changes)
             data_only = not py
             known = set()
@@ -198,6 +208,7 @@ def main():
                              unreliable=unreliable, why="; ".join(why)[:80]))
     warm = (WARM_MS + (PRESETUP_MS if SIM_EXEC else 0)) if any_engine else 0
     report(rows, drops, warm)
+    print(f"records skipped (current candidates not a subset of the truth run's): {skipped[0]}")
     print(f"settle est CPU per commit (largest dir): {settle_peak[0]:.0f} ms (budget {sel.SETTLE_BUDGET_PER_COMMIT_MS} ms)")
 
 

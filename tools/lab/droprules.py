@@ -32,11 +32,13 @@ def main():
         names = {t["number"]: t["id"].rsplit("::", 1)[-1] for t in tests}
         dur = E.setup_tests(tests)
         an = sel.Analyzer(E.M, sum(1 << n for n in dur), sum(1 << n for n in sel.NO_RUN))
-        for cid, (F, _, unreliable) in sorted(E.load_truth(L).items()):
+        for cid, (F, _, unreliable, tcand) in sorted(E.load_truth(L).items()):
             mask, _ = an.analyze(open(f"{L}/commits/{cid}.patch").read())
             if not an.py_changes:
                 continue
             C = [n for n in dur if mask >> n & 1]
+            if not E.covered(C, tcand):
+                continue
             heavy = {n for n in C if sel.is_heavy(n)}
             rest = [n for n in C if n not in heavy]
             rf = [n for n in rest if n in F]
