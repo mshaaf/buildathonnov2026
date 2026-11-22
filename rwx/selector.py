@@ -2198,6 +2198,17 @@ TPCDS_BLIND = int(os.environ.get("RWX_TPCDS_BLIND_MS", "0")) > 0  # evidence gat
 # failing TPC-DS passes on 9 of 12, with 4 or more it fails on 24 of 29; and on
 # s1/m41010113 (11 failing) every query passes when the test runs alone.
 TPCDS_BLIND_GUARD = int(os.environ.get("RWX_TPCDS_BLIND_GUARD", "4"))
+# Commits with an unfamiliar kind of edit (RWX_KIND_PROBES) keep the guard even when the
+# build turns it off: the gate has only been seen clearing TPC-DS correctly on one-token
+# mutations (practice, samples, lab).
+STRICT_BLIND_GUARD = int(os.environ.get("RWX_STRICT_BLIND_GUARD", "4"))
+STRICT_CIDS: set = set()  # commits whose policy runs with the strict settings
+
+
+def _blind_guard(cid) -> int:
+    if cid in STRICT_CIDS and STRICT_BLIND_GUARD:
+        return min(TPCDS_BLIND_GUARD, STRICT_BLIND_GUARD) if TPCDS_BLIND_GUARD else STRICT_BLIND_GUARD
+    return TPCDS_BLIND_GUARD
 
 
 TPCDS_GATE_MS = int(os.environ.get("RWX_TPCDS_GATE_MS", "5000"))
@@ -2321,6 +2332,7 @@ class Scheduler:
                         kw["proxy_ok"] = False  # the patch edits test code: the stand-in copies the pinned test
                     if KIND_PROBES and py and not familiar_edit(py):
                         kw["strict"] = True
+                        STRICT_CIDS.add(cid)
                         log(f"{cid}: unfamiliar kind of edit -> strict probes")
                     gen = policy(C, DUR, data_only, focus, known, *extra, cid=cid, **kw)
                 try:
@@ -2455,9 +2467,9 @@ class Scheduler:
                     except StopIteration as e:
                         if (TPCDS_BLIND and executor in e.value and sess.executor_ms is not None
                                 and sess.executor_partial
-                                and not (TPCDS_BLIND_GUARD and sum(
+                                and not (_blind_guard(cid) and sum(
                                     FILE_OF.get(n) == FILE_OF.get(executor) for n in OBSERVED.get(cid, ())
-                                ) >= TPCDS_BLIND_GUARD)
+                                ) >= _blind_guard(cid))
                                 and sess.alive and executor not in res and time.monotonic() < self.deadline):
                             # Bet with evidence: the cheapest TPC-DS queries run on the patched
                             # tree; a pass leaves the full test out.
